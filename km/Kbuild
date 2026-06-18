@@ -1,0 +1,20 @@
+# raidkm.ko — md personality at level 71, fork of raid5.c.
+#
+# Same object set as raid456.ko in mdraid: raid5.c + raid5-cache.c
+# + raid5-ppl.c (just renamed).  Journal/PPL paths are present but
+# dormant unless an array is created with --write-journal or
+# --consistency-policy=ppl, which we don't do in the redesign tests.
+
+# md.h / md-bitmap.h live in mdraid's md/ — exposed here as ../md
+# via the top-level Makefile's symlink.
+ccflags-y += -I$(src)/../md
+
+# Opt-in debug fault injection for the COW-staged reshape (the
+# raidkm_reshape_inject sysfs knob exercised by tools/raidkm-test-reshape-crash.sh).
+# Off by default; build with `make RAIDKM_FAULT_INJECT=1` to enable.
+ifeq ($(RAIDKM_FAULT_INJECT),1)
+ccflags-y += -DRAIDKM_FAULT_INJECT
+endif
+
+obj-m            += raidkm.o
+raidkm-y         := raid_km.o raid_km-cache.o raid_km-ppl.o raid_km-reshape.o

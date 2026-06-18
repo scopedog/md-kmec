@@ -1,0 +1,16 @@
+# build symlinks to mdraid's md/ and isa-l/ for "../md/..." and "../isa-l/..." includes
+/md
+/isa-l
+
+# kbuild artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.tmp_versions/
+.*.cmd
+modules.order
+Module.symvers
+*.o.d

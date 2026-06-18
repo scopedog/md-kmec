@@ -1,0 +1,19 @@
+# Debian 6.12 private md headers (drivers/md/)
+#
+# EXACT copy of the running Debian kernel's drivers/md/ headers, extracted from
+# the linux-source-6.12 package (6.12.90-2) — NOT a torvalds v6.12.0 snapshot.
+#
+# Why exact: Debian's 6.12.90 backported the upstream bitmap_ops rework
+# (3-arg bitmap_ops->startwrite/endwrite + separate start_behind_write/
+# end_behind_write ops), which shifts bitmap_operations->start_sync to a
+# different vtable offset (120) than torvalds v6.12.0 has.  Built against the
+# v6.12.0 headers, raidkm called the WRONG bitmap_ops slot -> NULL-pointer oops
+# in bitmap_start_sync during any bitmap resync (dm-raid, or mdadm --bitmap=
+# internal).  struct mddev offsets happened to match, so the struct check alone
+# did not catch it.  Lesson: vendor the *target kernel's* exact drivers/md/
+# headers (extract from linux-source-<ver>), don't approximate with mainline.
+#
+# raidkm on Debian/mainline builds against these (compat/compat-vanilla.h);
+# RHEL builds use the mdraid fork's md/ headers (selected by Makefile TARGET).
+#
+# Files: md.h md-bitmap.h md-cluster.h raid1.h raid5.h raid10.h
