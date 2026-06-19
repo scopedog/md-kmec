@@ -125,7 +125,7 @@ the full SIMD spectrum to separate the structural win from the ISA-L GFNI encode
 (IOPS, mean of 3 runs; Test 6 = post-run integrity check, `mismatch_cnt=0`
 everywhere):
 
-| Test | base / no-GFNI<br>(AMD Ryzen 5800X) | AVX2-GFNI<br>(Intel i5-1340P) | AVX-512-GFNI<br>(Xeon 8481C / GCP c3) |
+| Test | base / no-GFNI<br>(AMD Ryzen 5800X) | AVX2-GFNI<br>(Intel i5-1340P) | AVX-512-GFNI<br>(Xeon 8481C / GCP **c3-standard-8, 8 vCPU**) |
 |---|---|---|---|
 | 1 Random 4K Write         | 239,211 vs 124,327 (**1.92×**) | 107,728 vs 46,615 (**2.31×**) | 305,853 vs 72,767 (**4.20×**) |
 | 2 DB Mixed 8K (75/25)     | 420,982 vs 275,658 (**1.53×**) | 182,964 vs 96,838 (**1.89×**) | 504,563 vs 157,899 (**3.20×**) |
@@ -134,18 +134,60 @@ everywhere):
 | 5 Partial Stripe Write 8K | 179,735 vs 73,994 (**2.43×**) | 59,135 vs 24,053 (**2.46×**) | 159,960 vs 43,837 (**3.65×**) |
 
 (Each cell is *raidkm vs stock raid6* IOPS and the speedup.)  **raidkm wins every
-workload at every tier** — ~1.35-2.4× even with a **scalar** GF(2⁸) encode (no
-GFNI), widening to **3.2-4.2× on AVX-512-GFNI**, at ~2-4× lower latency.  The
-baseline win is structural (the forked raid5.c carries our post-fork mdraid
-optimizations — worker-groups auto-default, `STRIPE_ON_INACTIVE_LIST` lock-skip
-— and a faster write/RMW/partial-stripe path); GFNI then widens the gap as the
-SIMD lanes get wider, since raidkm's ISA-L syndrome encode scales with lane width.
+workload at every tier**, at ~2-4× lower latency.  The win is **structural**: the
+forked raid5.c carries our post-fork mdraid optimizations — worker-groups
+auto-default, `STRIPE_ON_INACTIVE_LIST` lock-skip, and a faster write/RMW/
+partial-stripe path.
 
-> ⚠️ **Absolute IOPS are not comparable across the three machines** (different
-> CPUs, core counts, RAM/ramdisk sizes) — only the per-machine raidkm-vs-raid6
-> **ratio** is.  Reproduce the stock raid6 column by `xzcat`ing
+> ⚠️ **The ratio scales with vCPU/core count — it is *not* a fixed per-machine
+> constant.**  raidkm's worker groups parallelize stripe handling across cores
+> (total worker threads auto-default to `nproc/2`; see [Tuning](#tuning) to change
+> it), so raidkm throughput rises with cores, while stock raid6's RMW path is
+> largely serialized and barely scales.  Measured on the **same `main` build, same
+> GCP c3 / Xeon 8481C**, varying only the vCPU count (Random-4K-Write, 2026-06-19):
+>
+> | instance | raidkm IOPS | stock raid6 IOPS | ratio |
+> |---|---|---|---|
+> | c3-standard-4 (4 vCPU) | 178,934 | 72,041 | **2.48×** |
+> | c3-standard-8 (8 vCPU) | 324,958 | 83,852 | **3.88×** |
+>
+> So the three columns above differ as much by **core count** as by SIMD tier (the
+> `Xeon 8481C` column was a **c3-standard-8 / 8 vCPU** box).  **At m=2 parity is the
+> `raid6_call` P+Q fast path, *not* the ISA-L GFNI encoder — GFNI does not change
+> the m=2 numbers** (verified 2026-06-19: loading the GFNI `raid6_call` override
+> moved m=2 IOPS <1%; the 8-vCPU column reproduces with GFNI *off*).  GFNI's encode
+> advantage shows at **m ≥ 3**.  **raidkm keeps scaling with cores; stock raid6
+> does not.**
+>
+> **Absolute IOPS are not comparable across the three machines** (different CPUs,
+> core counts, RAM/ramdisk sizes).  Reproduce the stock raid6 column by `xzcat`ing
 > `/lib/modules/$(uname -r)/kernel/drivers/md/raid456.ko.xz` into a writable file
 > and `insmod`ing it instead of `raid_km.ko`.
+
+#### Rebuild / resync speed
+
+raidkm also rebuilds a failed disk **substantially faster** than stock raid6,
+because its resync path **fans multiple stripes per `sync_request`** instead of
+walking them one stripe-window at a time.  Single-disk recovery, 6 × brd, k=4
+m=2, 3 GiB/disk, on a GCP `c3-standard-8` (8 vCPU, Xeon 8481C), with the global
+resync governor (`/proc/sys/dev/raid/speed_limit_max`) raised so neither side is
+throttled:
+
+| `group_thread_cnt` | stock raid6 | raidkm m=2 |
+|---|---|---|
+| 0 (stock default) | ~200 MB/s | **1178 MB/s** (5.9×) |
+| 4 (matched) | ~585 MB/s | **1178 MB/s** (2.0×) |
+
+Two things to read here.  **raidkm's rebuild rate is independent of
+`group_thread_cnt`** (1178 MB/s at both 0 and 4) — the parallelism is in the
+sync path itself, not the worker pool; stock raid6's recovery is serialized at
+the default `gtc=0` and only speeds up once worker groups are enabled.  So the
+honest gap is **~2× apples-to-apples** (matched `gtc=4`) and **~6× out of the
+box** (stock ships worker groups off, raidkm's parallel sync is always on).
+Rebuild is a streaming, fully-parallelizable scan, so the gap is wider than the
+random-I/O table above.  *(brd is RAM-backed and compute-bound; on real disks
+the rebuild is capped by disk write bandwidth, so the gap narrows — the full win
+shows on fast NVMe or when the rebuild is CPU/EC-bound.)*
 
 #### Worker-thread tuning detail (single box, RHEL 10.1)
 
