@@ -47,6 +47,21 @@ These are load-bearing for the design and not up for negotiation:
    uses ISA-L directly.  Verified byte-for-byte: see the EC-verifier
    milestone below.
 
+   **Encode and decode are asymmetric.**  The m=2 *encode* above runs raid6's
+   XOR + shift P+Q (`raid6_call.gen_syndrome` — AVX `VPXOR` for P, the shift/
+   mask GF(×2) for Q).  *Decode* (degraded read, rebuild, degraded-write
+   reconstruct) instead routes through **one unified path for every m**
+   (`ops_run_compute_km`): build the survivors' decode matrix, invert it with
+   `gf_invert_matrix`, and apply it with ISA-L's `ec_encode_data_*` — GFNI
+   (`ec_encode_data_avx512_gfni` / `avx2_gfni`) when the CPU has it, else the
+   scalar `ec_encode_data_base` table lookup.  Decode is deliberately
+   **PSHUFB-free**: it never uses raid6's `*_recov` (the inherited 2-failure
+   path raidkm doesn't reach) nor ISA-L's PSHUFB kernels, avoiding the
+   StreamScale patent surface.  The two SIMD selections are independent: GFNI
+   decode comes straight from `isal_lib` (gated on `isal_have_*gfni()`), so it
+   needs **no** `raid_isal.ko` — that optional override only swaps the m=2
+   *encode* `raid6_call` to a GFNI P+Q and does not touch decode.
+
 2. **Forked from raid5.c**, not patched in place.  `raid_km.c` is
    a copy + modify of `raid5.c`.  Stock raid4/5/6 stay untouched
    in the kernel; we accept the maintenance cost of porting
