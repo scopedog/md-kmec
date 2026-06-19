@@ -32,8 +32,7 @@ fork-and-extend approach this branch takes.
 
 ## Architectural commitments
 
-These are load-bearing for the design and not up for negotiation
-within this redesign:
+These are load-bearing for the design and not up for negotiation:
 
 1. **k+m semantics from the start**, including m=2, with an
    on-disk format that stays reshape-compatible to arbitrary m.
@@ -63,7 +62,7 @@ within this redesign:
 | Milestone | State |
 |---|---|
 | Prototype preserved at `v0-proto` tag / `proto` branch | ✅ done (2026-05-23) |
-| Master cleared, redesign scaffolding committed | ✅ done (2026-05-23) |
+| Master cleared, scaffolding committed | ✅ done (2026-05-23) |
 | Fork `raid5.c` → `km/raid_km.c`, symbols renamed, builds clean | ✅ done (2026-05-23) |
 | Loads as a personality at level 71, coexists with stock raid456 | ✅ done (2026-05-23) |
 | m=2 array activates natively at level 71, no shim | ✅ done (2026-05-23) |
