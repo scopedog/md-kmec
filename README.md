@@ -1,4 +1,4 @@
-# md-kmec (redesign)
+# md-kmec
 
 > **Build note:** This is one component of the raidkm mdraid stack and is not
 > meant to be built on its own. Please use
@@ -53,11 +53,7 @@ within this redesign:
    in the kernel; we accept the maintenance cost of porting
    upstream raid5 fixes manually.
 
-3. **Greenfield on-disk format.**  No compatibility with prototype
-   kmec SBs or with stock raid6 SBs.  Format is whatever's cleanest
-   for the new design.
-
-4. **m=2 AND m=3 validated** before declaring any milestone done.
+3. **m=2 AND m=3 validated** before declaring any milestone done.
    m=2 because it's the most-tested case and lets us cross-check
    against stock raid6 behavior; m=3 because it's the first case
    that stock raid6 can't do at all.
