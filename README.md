@@ -2,14 +2,14 @@
 
 > **Build note:** This is one component of the raidkm mdraid stack and is not
 > meant to be built on its own. Please use
-> [mdraid-super](https://github.com/scopedog/mdraid-super) to build the entire
-> package — it assembles this repo together with the other components in the
-> correct order.
+> [mdraid-super](https://github.com/TheLustreCollective/mdraid-super) to build
+> the entire package — it assembles this repo together with the other
+> components in the correct order.
 
 A Linux md personality implementing arbitrary *k+m* Reed-Solomon
 erasure coding, built as a fork of [our optimized
-mdraid](https://github.com/scopedog/mdraid)'s `raid5.c`
-plus [our ISA-L fork](https://github.com/scopedog/isa-l)'s
+mdraid](https://github.com/TheLustreCollective/mdraid)'s `raid5.c`
+plus [our ISA-L fork](https://github.com/TheLustreCollective/isa-l)'s
 EC primitives (GFNI when the CPU has it, table-lookup
 GF_REGION_MUL fallback otherwise).
 
@@ -86,7 +86,7 @@ These are load-bearing for the design and not up for negotiation:
 | Rotating parity layout (balance disk usage; parity-last is dedicated-parity) | ✅ done (2026-05-26) — selected via **`--layout=rotating`** (generalized left-symmetric: the m-slot parity block rotates one disk per stripe so parity — and normal-read traffic — spread across all members instead of the tail m). One slot mapping serves both layouts (`pd_idx` is the only layout-specific value; parity-last is the `pd_idx==k` case), so encode/decode/scrub/PPL are layout-agnostic. Layout packed into the superblock `layout` field (low byte = m, bit 0x100 = rotating). Rotating later became the create default (2026-06-01); the parity-last placement is bit-for-bit unchanged. Validated: m=2/3/4 create/read/scrub=0, degraded read+write (2- and 3-disk loss), stop→assemble persistence, PPL+rotating partial-write scrub=0, rotation confirmed by raw-disk compare. Add-parity is supported on **both** layouts but at different cost: PARITY_N appends a parity disk cheaply (offline grow-via-resync, no data movement), while rotating must relocate every block, so its add-parity drives a full **online COW reshape** (journaled, out-of-place per band, no backup file; an earlier in-place online reshape was withdrawn for a location-aliasing race) — see the `--add-parity` row above |
 | Degraded *write* + degraded-array scrub (any m ≥ 2, up to m failures) | ✅ done (2026-05-25) — reconstruct failed data from k survivors, re-encode all parity, write the surviving members; data correct + no deadlock across m=2/3/4/5 × 1–m failures (data-only / parity-only / mixed / max-degraded) |
 | GFNI cross-validation of degraded write + recovery | ✅ done (2026-05-25) — degraded-write matrix + hot-replace rebuilds repeated on an i5-1340P (GFNI): 10/10 pass, exercising the `ec_encode_data_avx2_gfni` path. The KVM testbed has no GFNI, so this is the only coverage of the GFNI EC variants under the new write/recovery scheduling |
-| **Device-mapper: drive raidkm via the kernel `dm-raid` target** (`dmsetup`) | ✅ done (2026-06-05) — level 71 is reachable through the in-tree `dm-raid` target with **no new dm target** (`dmsetup create … raid raidkm <chunk> parity_count <m> …`); m + rotating ride in the dm table, a `FEATURE_FLAG_RAIDKM` superblock bit keeps stock dm-raid from touching a raidkm SB. Phase 1 (create + I/O + degraded + scrub + reassembly) and Phase 2 (rebuild via reload + `rebuild <idx>`) validated 21/21 base + 51/51 GFNI, m=2..6. Reshape via dm is **gated off** (a hand-driven dmsetup grow corrupts — needs LVM's data-offset positioning). The `dm-raid.c` changes live in the [mdraid](https://github.com/scopedog/mdraid) fork. See `notes/dm-raid-design.md` |
+| **Device-mapper: drive raidkm via the kernel `dm-raid` target** (`dmsetup`) | ✅ done (2026-06-05) — level 71 is reachable through the in-tree `dm-raid` target with **no new dm target** (`dmsetup create … raid raidkm <chunk> parity_count <m> …`); m + rotating ride in the dm table, a `FEATURE_FLAG_RAIDKM` superblock bit keeps stock dm-raid from touching a raidkm SB. Phase 1 (create + I/O + degraded + scrub + reassembly) and Phase 2 (rebuild via reload + `rebuild <idx>`) validated 21/21 base + 51/51 GFNI, m=2..6. Reshape via dm is **gated off** (a hand-driven dmsetup grow corrupts — needs LVM's data-offset positioning). The `dm-raid.c` changes live in the [mdraid](https://github.com/TheLustreCollective/mdraid) fork. See `notes/dm-raid-design.md` |
 | **LVM-managed raidkm** (`lvcreate --type raidkm`) | ✅ done (2026-06-05) — the lvm2 raidkm fork provisions level-71 LVs via two segtypes `raidkm` (rotating) / `raidkm_n` (parity-last) carrying `parity_count` (m). Validated base + GFNI, m=2/3/4: create/activate/I/O/reassembly/degraded; `lvconvert --repair` (raidkm-aware leg replacement + rebuild); and **dmeventd** monitoring + auto-repair (level-agnostic plugin, no code change). Reshape via dm/LVM is out of scope (the data-offset out-of-place reshape doesn't fit raidkm — mdadm-only); the kernel reshape gate stays on. See `notes/dm-raid-design.md` |
 
 ### How level 71 is integrated into raid5.c
@@ -351,7 +351,7 @@ md-kmec/
 
 ## Building
 
-Requires built [mdraid](https://github.com/scopedog/mdraid)
+Requires built [mdraid](https://github.com/TheLustreCollective/mdraid)
 in a sibling directory for `isal_lib.ko`'s exports.
 
 ```sh
@@ -387,7 +387,7 @@ tree is branch **`raidkm-level71`**, currently at commit
 **`d86ac2b1`** ("raidkm: split parity count from layout; default to
 rotating").  When you advance one repo, rebuild the other from
 its matching commit.  The fork will be wired in as a git submodule once it has a
-published remote (`scopedog/mdadm`); until then it lives in
+published remote (`TheLustreCollective/mdadm`); until then it lives in
 the sibling [`mdadm`](../mdadm) checkout and the pairing is tracked
 here by hand.
 
@@ -587,7 +587,7 @@ directly with `dmsetup` (the kernel `dm-raid` target), or, the managed way, as
 **LVM logical volumes**. This needs no new dm target: `dm-raid` already stands up
 an `mddev` and runs whatever personality `md_run()` selects by level, so level 71
 rides the existing target. (The enabling `dm-raid.c` changes live in the
-[mdraid](https://github.com/scopedog/mdraid) fork; full design and
+[mdraid](https://github.com/TheLustreCollective/mdraid) fork; full design and
 validation are in [`notes/dm-raid-design.md`](notes/dm-raid-design.md).)
 
 ### dmsetup (raw device-mapper)
@@ -623,7 +623,8 @@ raidkm's layout, **growing/shrinking a raidkm LV is not supported via LVM** — 
 
 An LVM raidkm LV is an ordinary cache origin, so it can be fronted by **lvmcache**
 (`lvconvert --type cache`) — e.g. a fast tier over the EC capacity tier under a
-filesystem.
+filesystem. See `notes/rhel9-lvmcache-ost.md` (on the `rhel9-port` branch) for an
+end-to-end `Lustre OST → ldiskfs → dm-cache → dm-raid(raidkm)` validation.
 
 ## License
 
