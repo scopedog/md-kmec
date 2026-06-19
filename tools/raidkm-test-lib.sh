@@ -109,7 +109,10 @@ rk_load_modules() {
 	fi
 	if ! lsmod | grep -q '^raidkm '; then
 		local m
-		for m in async_tx async_memcpy async_xor async_pq \
+		# md_mod + libcrc32c: builtin on RHEL (these modprobes no-op), but a
+		# loadable module on mainline/Debian — raidkm pulls md_*/crc32c symbols
+		# from them, so they must be loaded first or insmod fails Unknown-symbol.
+		for m in md_mod libcrc32c async_tx async_memcpy async_xor async_pq \
 			 async_raid6_recov raid6_pq xor; do
 			sudo modprobe "$m" 2>/dev/null || true
 		done
