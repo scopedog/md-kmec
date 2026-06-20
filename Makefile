@@ -2,7 +2,7 @@ KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 
 # md-kmec depends on isal_lib.ko's exported symbols. Point MDRAID_BUILD at a
-# built mdraid tree (https://github.com/TheLustreCollective/mdraid) to pick up
+# built mdraid tree (https://github.com/scopedog/mdraid) to pick up
 # its isa-l/Module.symvers; default looks for a sibling checkout.
 MDRAID_BUILD ?= $(CURDIR)/../mdraid
 

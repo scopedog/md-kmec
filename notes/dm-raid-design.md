@@ -13,10 +13,10 @@ it).  Validated `tools/raidkm-test-dm-reshape.sh` 34/34 + dm-rebuild 23/23
 (base).  Historical Phase-3 "out of scope" text below kept as written.
 Phase 1
 (create/IO/degraded/scrub/reassembly) IMPLEMENTED, validated, and SHIPPED
-(mdraid master `baa4cdc`, TheLustreCollective/mdraid, 2026-06-04). Phase 2
+(mdraid master `baa4cdc`, scopedog/mdraid, 2026-06-04). Phase 2
 (rebuild onto a replacement member) validated 2026-06-05 with **no further
 dm-raid.c change** (see §7). **Phase 4 (LVM2 userspace) done 2026-06-05** in the
-`TheLustreCollective/lvm2` fork (branch `raidkm`): `lvcreate --type raidkm
+`scopedog/lvm2` fork (branch `raidkm`): `lvcreate --type raidkm
 --paritycount N` provisions a level-71 LV, `lvconvert --repair` rebuilds a leg,
 and dmeventd auto-monitors/auto-repairs — all validated on base + GFNI (see §7
 Phase 4). Phase 3 (reshape) is **out of scope**: dm-raid's `data_offset`
@@ -322,7 +322,7 @@ params (matching how dm-raid handles other levels).
     plain table reload is silently resolved to the SB *before* this guard
     (no-op, not corruption) — same class as Phase-1 hardening item 3.
 - **Phase 4 — LVM2 userspace** (`lvcreate --type raidkm`): ✅ **DONE 2026-06-05**
-  in the `TheLustreCollective/lvm2` fork (branch `raidkm`, forked at tag
+  in the `scopedog/lvm2` fork (branch `raidkm`, forked at tag
   `v2_03_32` = the VMs' deployed 2.03.32). Build userspace from tree; **never
   `make install`** over system lvm (VM root is on LVM); test against a scratch VG
   on brd/dm-linear PVs with an isolated `--config` device filter so the system
