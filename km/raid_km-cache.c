@@ -805,10 +805,22 @@ static struct r5l_io_unit *r5l_new_meta(struct r5l_log *log)
 	return io;
 }
 
-static int r5l_get_meta(struct r5l_log *log, unsigned int payload_size)
+static int r5l_get_meta(struct r5l_log *log, unsigned int payload_size,
+			unsigned int pages)
 {
+	/*
+	 * Rotate to a new io_unit (and a fresh bio) when either the meta page
+	 * is full OR the current bio cannot hold this entry's data/parity
+	 * pages.  The meta page can describe more pages than a single bio
+	 * holds (BIO_MAX_VECS): the write-back writing-out phase logs only the
+	 * m parity pages per stripe (a few meta bytes, but m bio pages each),
+	 * so ~PAGE_SIZE/entry stripes overflow the bio and trip the BUG() in
+	 * r5l_append_payload_page.  raidkm's larger stripe batch makes this
+	 * reachable; bounding by bio capacity keeps it safe.
+	 */
 	if (log->current_io &&
-	    log->current_io->meta_offset + payload_size > PAGE_SIZE)
+	    (log->current_io->meta_offset + payload_size > PAGE_SIZE ||
+	     log->current_io->current_bio->bi_vcnt + pages > BIO_MAX_VECS))
 		r5l_submit_current_io(log);
 
 	if (!log->current_io) {
@@ -879,7 +891,7 @@ static void r5l_append_flush_payload(struct r5l_log *log, sector_t sect)
 	mutex_lock(&log->io_mutex);
 	meta_size = sizeof(struct r5l_payload_flush) + sizeof(__le64);
 
-	if (r5l_get_meta(log, meta_size)) {
+	if (r5l_get_meta(log, meta_size, 0)) {
 		mutex_unlock(&log->io_mutex);
 		return;
 	}
@@ -914,7 +926,7 @@ static int r5l_log_stripe(struct r5l_log *log, struct stripe_head *sh,
 		sizeof(struct r5l_payload_data_parity) +
 		sizeof(__le32) * parity_pages;
 
-	ret = r5l_get_meta(log, meta_size);
+	ret = r5l_get_meta(log, meta_size, data_pages + parity_pages);
 	if (ret)
 		return ret;
 
@@ -1116,7 +1128,7 @@ int r5l_handle_flush_request(struct r5l_log *log, struct bio *bio)
 		/* write back (with cache) */
 		if (bio->bi_iter.bi_size == 0) {
 			mutex_lock(&log->io_mutex);
-			r5l_get_meta(log, 0);
+			r5l_get_meta(log, 0, 0);
 			bio_list_add(&log->current_io->flush_barriers, bio);
 			log->current_io->has_flush = 1;
 			log->current_io->has_null_flush = 1;
