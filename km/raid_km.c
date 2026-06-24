@@ -8458,7 +8458,18 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	if (mddev->bitmap)
 		mddev->bitmap_ops->cond_end_sync(mddev, sector_nr, false);
 
-	/* Check once whether array will still be degraded after recovery/resync.
+	/* First stripe: block if stripe cache is full, then throttle. */
+	sh = raid5_get_active_stripe(conf, NULL, sector_nr, R5_GAS_NOBLOCK);
+	if (sh == NULL) {
+		sh = raid5_get_active_stripe(conf, NULL, sector_nr, 0);
+		schedule_timeout_uninterruptible(1);
+	}
+
+	/* Check whether the array will still be degraded after recovery/resync.
+	 * This must be evaluated *after* the (possibly sleeping) stripe
+	 * allocation above: a drive that fails while we wait has to be reflected
+	 * here, or md_bitmap could wrongly clear the NEEDED bit for a region
+	 * that is in fact still degraded.
 	 * Note in case of > 1 drive failures it's possible we're rebuilding
 	 * one drive while leaving another faulty drive in array.
 	 */
@@ -8467,13 +8478,6 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 
 		if (rdev == NULL || test_bit(Faulty, &rdev->flags))
 			still_degraded = true;
-	}
-
-	/* First stripe: block if stripe cache is full, then throttle. */
-	sh = raid5_get_active_stripe(conf, NULL, sector_nr, R5_GAS_NOBLOCK);
-	if (sh == NULL) {
-		sh = raid5_get_active_stripe(conf, NULL, sector_nr, 0);
-		schedule_timeout_uninterruptible(1);
 	}
 	if (mddev->bitmap)
 		mddev->bitmap_ops->start_sync(mddev, sector_nr, &sync_blocks,
@@ -8504,9 +8508,22 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 					     R5_GAS_NOBLOCK);
 		if (!sh)
 			break;
-		if (mddev->bitmap)
-			mddev->bitmap_ops->start_sync(mddev, win_sector,
-						      &sync_blocks, still_degraded);
+		/*
+		 * Honor the bitmap: only queue stripes whose region actually
+		 * needs syncing.  start_sync() returns false for an already
+		 * in-sync region and, for a clean counter, makes no state
+		 * change -- so stop extending the window at the dirty/clean
+		 * boundary instead of forcing a needless resync of clean
+		 * stripes.  (Without a bitmap every region is synced, as before;
+		 * the next sync_request call skips a clean run via the bitmap
+		 * check at the top of this function.)
+		 */
+		if (mddev->bitmap &&
+		    !mddev->bitmap_ops->start_sync(mddev, win_sector,
+						   &sync_blocks, still_degraded)) {
+			raid5_release_stripe(sh);
+			break;
+		}
 		set_bit(STRIPE_SYNC_REQUESTED, &sh->state);
 		set_bit(STRIPE_HANDLE, &sh->state);
 		raid5_release_stripe(sh);
@@ -9139,8 +9156,15 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 			conf->worker_groups = new_groups;
 			spin_unlock_irq(&conf->device_lock);
 
-			if (old_groups)
-				kfree(old_groups[0].workers);
+			if (old_groups) {
+				int node;
+
+				/* each node-ID slot owns its own workers
+				 * allocation (alloc_thread_groups sizes by
+				 * nr_node_ids); free them all, not just [0] */
+				for (node = 0; node < nr_node_ids; node++)
+					kfree(old_groups[node].workers);
+			}
 			kfree(old_groups);
 		}
 	}
@@ -9227,8 +9251,15 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 			conf->worker_groups = new_groups;
 			spin_unlock_irq(&conf->device_lock);
 
-			if (old_groups)
-				kfree(old_groups[0].workers);
+			if (old_groups) {
+				int node;
+
+				/* each node-ID slot owns its own workers
+				 * allocation (alloc_thread_groups sizes by
+				 * nr_node_ids); free them all, not just [0] */
+				for (node = 0; node < nr_node_ids; node++)
+					kfree(old_groups[node].workers);
+			}
 			kfree(old_groups);
 		}
 	}
@@ -9668,7 +9699,16 @@ static int alloc_thread_groups(struct r5conf *conf, int cnt, int *group_cnt,
 		*worker_groups = NULL;
 		return 0;
 	}
-	*group_cnt = num_possible_nodes();
+	/*
+	 * Size the array by the node-ID *range* (nr_node_ids), not the node
+	 * *count* (num_possible_nodes()): worker_groups is indexed by
+	 * cpu_to_group()==cpu_to_node(), a raw node ID, which on systems with
+	 * sparse node IDs (e.g. nodes 0 and 8) exceeds the count and would walk
+	 * off a count-sized array.  Each online node's workers are placed on
+	 * that node; unused node-ID slots are allocated with NUMA_NO_NODE so
+	 * every slot is valid for the iterate/free paths below.
+	 */
+	*group_cnt = nr_node_ids;
 	*worker_groups = kcalloc(*group_cnt, sizeof(struct r5worker_group),
 				 GFP_NOIO);
 	if (!*worker_groups)
@@ -9678,8 +9718,9 @@ static int alloc_thread_groups(struct r5conf *conf, int cnt, int *group_cnt,
 	for (i = 0; i < *group_cnt; i++) {
 		struct r5worker_group *group = &(*worker_groups)[i];
 		struct r5worker *workers;
+		int node = node_online(i) ? i : NUMA_NO_NODE;
 
-		workers = kzalloc_node(size, GFP_NOIO, i);
+		workers = kzalloc_node(size, GFP_NOIO, node);
 		if (!workers)
 			goto out_free;
 
