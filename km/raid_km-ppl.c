@@ -861,7 +861,8 @@ static int ppl_recover_entry_km(struct ppl_log *log, struct ppl_header_entry *e,
 	unsigned int pp_size = le32_to_cpu(e->pp_size);
 	unsigned int data_size = le32_to_cpu(e->data_size);
 	unsigned int pp_per = m ? pp_size / m : pp_size;  /* per-parity PP bytes */
-	struct page *dpage[RAIDKM_MAX_STRIPE_DISKS] = { NULL };
+	struct page **dpage;
+	void **src;
 	struct page *ppage[RAIDKM_MAX_M] = { NULL };
 	struct page *scratch = NULL;
 	sector_t r_sector_first, r_sector_last;
@@ -869,6 +870,10 @@ static int ppl_recover_entry_km(struct ppl_log *log, struct ppl_header_entry *e,
 
 	if (WARN_ON_ONCE(k > RAIDKM_MAX_STRIPE_DISKS || m > RAIDKM_MAX_M))
 		return -EINVAL;
+
+	dpage = kcalloc(k, sizeof(*dpage), GFP_KERNEL);
+	src = kmalloc_array(k, sizeof(*src), GFP_KERNEL);
+	if (!dpage || !src) { ret = -ENOMEM; goto out_km; }
 
 	scratch = alloc_page(GFP_KERNEL);
 	for (j = 0; j < m; j++)
@@ -913,7 +918,6 @@ static int ppl_recover_entry_km(struct ppl_log *log, struct ppl_header_entry *e,
 		int b = i / (block_size >> 9);	/* block index within strip */
 		sector_t parity_sector;
 		struct stripe_head sh;
-		void *src[RAIDKM_MAX_STRIPE_DISKS];
 		void *cod[RAIDKM_MAX_M];
 		int disk, c, pd;
 
@@ -1014,9 +1018,13 @@ out_km:
 	for (j = 0; j < m; j++)
 		if (ppage[j])
 			__free_page(ppage[j]);
-	for (i = 0; i < k; i++)
-		if (dpage[i])
-			__free_page(dpage[i]);
+	if (dpage) {
+		for (i = 0; i < k; i++)
+			if (dpage[i])
+				__free_page(dpage[i]);
+		kfree(dpage);
+	}
+	kfree(src);
 	return ret;
 }
 

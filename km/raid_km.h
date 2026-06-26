@@ -39,7 +39,9 @@ static inline bool is_raid6_math(int level)
  * Above RAIDKM_MAX_M is rejected at create time.  Capped so k + m stays
  * within RAIDKM_MAX_STRIPE_DISKS.
  */
-#define RAIDKM_MAX_M	8
+#define RAIDKM_MAX_M	16	/* parity cap; kept small by design — it sizes the
+				 * per-stripe [RAIDKM_MAX_M] arrays (ppl_pages in
+				 * struct stripe_head, failed_num in stripe_head_state) */
 #define RAIDKM_VANDERMONDE_MAX_M	3
 
 /*
@@ -74,11 +76,15 @@ static inline bool raidkm_layout_is_rotating(int layout)
 }
 
 /*
- * Upper bound on disks per stripe (data + parity) for raidkm.  Used to
- * size on-stack source/dest pointer arrays in the synchronous ISA-L
- * paths (encode, RMW update, scrub).  Stripes well below this in practice.
+ * Upper bound on disks per stripe (k data + m parity) for raidkm.  Set to the
+ * GF(2^8) Reed-Solomon field limit: ISA-L needs k + m <= 255 distinct generator
+ * points (Vandermonde for m <= 3, Cauchy for m >= 4), so this is the widest an
+ * MDS code over one byte can stripe.  Sizes the per-cpu decode scratch and the
+ * heap working arrays in the synchronous ISA-L paths (the large temporaries are
+ * off-stack: per-cpu under conf->percpu->lock, or kmalloc'd on the rare
+ * reshape/geometry paths).
  */
-#define RAIDKM_MAX_STRIPE_DISKS	32
+#define RAIDKM_MAX_STRIPE_DISKS	255
 
 /*
  *

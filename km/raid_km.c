@@ -1893,6 +1893,8 @@ struct raidkm_decode_scratch {
 	unsigned char inv[RAIDKM_MAX_STRIPE_DISKS * RAIDKM_MAX_STRIPE_DISKS];
 	unsigned char row1[RAIDKM_MAX_STRIPE_DISKS];		/* one decode row */
 	unsigned char dtbls1[RAIDKM_MAX_STRIPE_DISKS * 32];	/* one-row table */
+	int srcsl[RAIDKM_MAX_STRIPE_DISKS];			/* survivor slot list */
+	unsigned char *src[RAIDKM_MAX_STRIPE_DISKS];		/* survivor data ptrs */
 };
 
 static struct dma_async_tx_descriptor *
@@ -1903,10 +1905,11 @@ ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
 	int disks = sh->disks, m = raidkm_sh_m(sh), k = disks - m;
 	size_t bytes = RAID5_STRIPE_SIZE(conf);
 	int miss[RAIDKM_MAX_M], nmiss = 0;
-	int srcsl[RAIDKM_MAX_STRIPE_DISKS], nsrc = 0;
+	int nsrc = 0;
 	struct raidkm_decode_scratch *ks = percpu->km_decode;
 	unsigned char *b = NULL, *inv = NULL, *row1 = NULL, *dtbls1 = NULL;
-	unsigned char *src[RAIDKM_MAX_STRIPE_DISKS];
+	int *srcsl = NULL;
+	unsigned char **src = NULL;
 	int i, j, p;
 	bool have_parity_miss = false;
 
@@ -1914,6 +1917,7 @@ ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
 	if (WARN_ON_ONCE(!ks))
 		goto complete;
 	b = ks->b; inv = ks->inv; row1 = ks->row1; dtbls1 = ks->dtbls1;
+	srcsl = ks->srcsl; src = ks->src;
 
 	/* slots to reconstruct (flagged by fetch_block) */
 	for (i = 0; i < disks; i++)
@@ -2015,7 +2019,8 @@ ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
 
 	/* missing PARITY slots: all data is present now, re-encode each */
 	if (have_parity_miss) {
-		unsigned char *data[RAIDKM_MAX_STRIPE_DISKS];
+		unsigned char **data = src;	/* reuse the decode survivor buffer
+						 * (the decode is finished here) */
 
 		for (i = 0; i < k; i++) {
 			int slot = raidkm_data_slot(sh, i);
@@ -2594,12 +2599,13 @@ again:
  * ops_complete_reconstruct directly after this returns.
  */
 static void isal_gen_syndrome_m(struct stripe_head *sh,
+				struct raid5_percpu *percpu,
 				struct page **blocks, unsigned int *offs,
 				int k, size_t bytes)
 {
-	/* Bounded to avoid VLA; raidkm caps disks per stripe well
-	 * below RAIDKM_MAX_STRIPE_DISKS.  WARN_ON_ONCE if exceeded. */
-	unsigned char *src[RAIDKM_MAX_STRIPE_DISKS];
+	/* src reuses the per-cpu decode scratch (we run under conf->percpu->lock,
+	 * sequentially with the other ops that use it). */
+	unsigned char **src = ((struct raidkm_decode_scratch *)percpu->km_decode)->src;
 	unsigned char *dst[RAIDKM_MAX_M];
 	int m = raidkm_sh_m(sh);
 	int i;
@@ -2892,7 +2898,7 @@ again:
 					       count,
 					       RAID5_STRIPE_SIZE(sh->raid_conf));
 		else
-			isal_gen_syndrome_m(sh, blocks, offs,
+			isal_gen_syndrome_m(sh, percpu, blocks, offs,
 					    count,
 					    RAID5_STRIPE_SIZE(sh->raid_conf));
 		if (last_stripe) {
@@ -3004,7 +3010,7 @@ static void ops_run_check_pq(struct stripe_head *sh, struct raid5_percpu *percpu
 		int k = count, m = raidkm_sh_m(sh), i, p, result = 0;
 		size_t bytes = RAID5_STRIPE_SIZE(conf);
 		bool repair = !test_bit(MD_RECOVERY_CHECK, &conf->mddev->recovery);
-		unsigned char *data[RAIDKM_MAX_STRIPE_DISKS];
+		unsigned char **data = ((struct raidkm_decode_scratch *)percpu->km_decode)->src;
 		unsigned char *spare = page_address(percpu->spare_page);
 
 		if (!WARN_ON_ONCE(k > RAIDKM_MAX_STRIPE_DISKS || m > RAIDKM_MAX_M)) {
@@ -5523,7 +5529,7 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 			 */
 			int kk = disks - raidkm_sh_m(sh), i, ndata = 0;
 			size_t bytes = RAID5_STRIPE_SIZE(conf);
-			unsigned char *data[RAIDKM_MAX_STRIPE_DISKS];
+			unsigned char **data;
 
 			/* too many members gone to reconstruct — give up on this
 			 * stripe rather than spin (md will fail the recovery). */
@@ -5542,6 +5548,11 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 			if (ndata < kk)
 				return;
 
+			data = kmalloc_array(kk, sizeof(*data), GFP_NOIO);
+			if (!data) {
+				set_bit(STRIPE_HANDLE, &sh->state);
+				return;
+			}
 			for (i = 0; i < kk; i++) {
 				int slot = raidkm_data_slot(sh, i);
 				data[i] = page_address(sh->dev[slot].page) +
@@ -5586,6 +5597,7 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 				set_bit(R5_Wantwrite, &sh->dev[i].flags);
 				s->locked++;
 			}
+			kfree(data);
 			clear_bit(STRIPE_DEGRADED, &sh->state);
 			set_bit(STRIPE_INSYNC, &sh->state);
 			return;
@@ -7619,8 +7631,9 @@ static int raidkm_reshape_migrate_band(struct r5conf *conf,
 	int chunk = conf->chunk_sectors;
 	int npages = chunk / RAIDKM_PAGE_SECTORS;
 	int total = Nnew * npages;
-	int new_ds[RAIDKM_MAX_STRIPE_DISKS], new_ps[RAIDKM_MAX_STRIPE_DISKS];
-	unsigned char *src[RAIDKM_MAX_STRIPE_DISKS], *dst[RAIDKM_MAX_STRIPE_DISKS];
+	int *new_ds, *new_ps, *old_ds, *old_ps;
+	unsigned char **src, **dst;
+	void *aux = NULL;
 	int kold = Nold - mold;		/* old data-disk count (kold == k for
 					 * add-parity; kold < k for add-data) */
 	struct page **band;
@@ -7634,11 +7647,29 @@ static int raidkm_reshape_migrate_band(struct r5conf *conf,
 
 	if (Nnew > RAIDKM_MAX_STRIPE_DISKS)
 		return -EINVAL;
+
+	/*
+	 * Off-stack the per-slot scratch: at the 255-disk field limit these six
+	 * arrays would be an ~8 KiB stack frame.  One block, pointers first for
+	 * alignment, then the ints.
+	 */
+	aux = kmalloc_array(Nnew, 2 * sizeof(*src) + 4 * sizeof(int), GFP_KERNEL);
+	if (!aux)
+		return -ENOMEM;
+	src = aux;
+	dst = src + Nnew;
+	new_ds = (int *)(dst + Nnew);
+	new_ps = new_ds + Nnew;
+	old_ds = new_ps + Nnew;
+	old_ps = old_ds + Nnew;
+
 	raidkm_reshape_row_layout(Nnew, mnew, rot, row, new_ds, new_ps);
 
 	band = kcalloc(total, sizeof(*band), GFP_KERNEL);
-	if (!band)
-		return -ENOMEM;
+	if (!band) {
+		err = -ENOMEM;
+		goto out;
+	}
 	for (j = 0; j < total; j++) {
 		band[j] = alloc_page(GFP_KERNEL);
 		if (!band[j]) { err = -ENOMEM; goto out; }
@@ -7657,7 +7688,6 @@ static int raidkm_reshape_migrate_band(struct r5conf *conf,
 	sector_div(old_rows, chunk);
 	old_data_chunks = old_rows * (u64)kold;
 	for (d = 0; d < k; d++) {
-		int old_ds[RAIDKM_MAX_STRIPE_DISKS], old_ps[RAIDKM_MAX_STRIPE_DISKS];
 		u64 chunk_no = (u64)row * k + d;
 		sector_t old_row;
 		int old_didx;
@@ -7739,6 +7769,7 @@ out:
 				__free_page(band[j]);
 		kfree(band);
 	}
+	kfree(aux);
 	return err;
 }
 
@@ -7760,15 +7791,27 @@ static int raidkm_reshape_reconstruct_band(struct r5conf *conf,
 	int Nnew = conf->raid_disks, m = conf->m, k = Nnew - m;
 	unsigned char *amat = conf->ec_a_matrix;
 	unsigned char *B = NULL, *inv = NULL, *row1 = NULL, *dt = NULL;
-	int logrow[RAIDKM_MAX_STRIPE_DISKS];	/* logical matrix row per slot */
-	int datidx[RAIDKM_MAX_STRIPE_DISKS];	/* data index per slot, -1 = parity */
-	bool ismiss[RAIDKM_MAX_STRIPE_DISKS];
-	int srcsl[RAIDKM_MAX_STRIPE_DISKS], nsrc = 0;
-	unsigned char *src[RAIDKM_MAX_STRIPE_DISKS];
+	int *logrow, *datidx, *srcsl, nsrc = 0;	/* logical row / data index / survivors */
+	bool *ismiss;
+	unsigned char **src, **din;
+	void *aux = NULL;
 	int i, j, d, p, po, s, err = 0;
 
 	if (!amat || k <= 0 || Nnew > RAIDKM_MAX_STRIPE_DISKS)
 		return -EIO;
+
+	/* Off-stack the per-slot scratch (~7 KiB frame at the 255-disk limit):
+	 * one block, the two pointer arrays first, then the ints, then the bool. */
+	aux = kmalloc_array(Nnew, 2 * sizeof(*src) + 3 * sizeof(int) + sizeof(bool),
+			    GFP_KERNEL);
+	if (!aux)
+		return -ENOMEM;
+	src    = aux;
+	din    = src + Nnew;
+	logrow = (int *)(din + Nnew);
+	datidx = logrow + Nnew;
+	srcsl  = datidx + Nnew;
+	ismiss = (bool *)(srcsl + Nnew);
 
 	for (i = 0; i < Nnew; i++) { logrow[i] = -1; datidx[i] = -1; ismiss[i] = false; }
 	for (d = 0; d < k; d++) { logrow[ds[d]] = d; datidx[ds[d]] = d; }
@@ -7779,8 +7822,10 @@ static int raidkm_reshape_reconstruct_band(struct r5conf *conf,
 	for (i = 0; i < Nnew && nsrc < k; i++)
 		if (!ismiss[i])
 			srcsl[nsrc++] = i;
-	if (nsrc < k)
-		return -EIO;			/* more than m members lost */
+	if (nsrc < k) {
+		err = -EIO;			/* more than m members lost */
+		goto out;
+	}
 
 	B   = kmalloc_array(k * k, 1, GFP_KERNEL);
 	inv = kmalloc_array(k * k, 1, GFP_KERNEL);
@@ -7824,7 +7869,7 @@ static int raidkm_reshape_reconstruct_band(struct r5conf *conf,
 	/* re-encode all m parities from the now-complete data (fills missing
 	 * parity slots; rewrites present ones with identical values) */
 	for (po = 0; po < npages; po++) {
-		unsigned char *din[RAIDKM_MAX_STRIPE_DISKS], *pout[RAIDKM_MAX_M];
+		unsigned char *pout[RAIDKM_MAX_M];
 
 		for (d = 0; d < k; d++)
 			din[d] = page_address(band[ds[d] * npages + po]);
@@ -7835,6 +7880,7 @@ static int raidkm_reshape_reconstruct_band(struct r5conf *conf,
 	}
 out:
 	kfree(B); kfree(inv); kfree(row1); kfree(dt);
+	kfree(aux);
 	return err;
 }
 
@@ -7856,8 +7902,9 @@ static int raidkm_reshape_replay_commit(struct r5conf *conf, sector_t row,
 	bool rot = conf->rotating;
 	int chunk = conf->chunk_sectors, npages = chunk / RAIDKM_PAGE_SECTORS;
 	int total = Nnew * npages;
-	int new_ds[RAIDKM_MAX_STRIPE_DISKS], new_ps[RAIDKM_MAX_STRIPE_DISKS];
+	int *new_ds, *new_ps;
 	int miss[RAIDKM_MAX_M], nmiss = 0;
+	void *aux = NULL;
 	struct page **band;
 	sector_t home = row * chunk;
 	u32 csum;
@@ -7865,10 +7912,17 @@ static int raidkm_reshape_replay_commit(struct r5conf *conf, sector_t row,
 
 	if (Nnew > RAIDKM_MAX_STRIPE_DISKS)
 		return -EINVAL;
+	aux = kmalloc_array(Nnew, 2 * sizeof(int), GFP_KERNEL);
+	if (!aux)
+		return -ENOMEM;
+	new_ds = aux;
+	new_ps = new_ds + Nnew;
 	raidkm_reshape_row_layout(Nnew, mnew, rot, row, new_ds, new_ps);
 	band = kcalloc(total, sizeof(*band), GFP_KERNEL);
-	if (!band)
-		return -ENOMEM;
+	if (!band) {
+		err = -ENOMEM;
+		goto out;
+	}
 	for (j = 0; j < total; j++) {
 		band[j] = alloc_page(GFP_KERNEL);
 		if (!band[j]) { err = -ENOMEM; goto out; }
@@ -7928,6 +7982,7 @@ out:
 				__free_page(band[j]);
 		kfree(band);
 	}
+	kfree(aux);
 	return err;
 }
 
@@ -9857,7 +9912,7 @@ static void free_scratch_buffer(struct r5conf *conf, struct raid5_percpu *percpu
 	percpu->spare_page = NULL;
 	kvfree(percpu->scribble);
 	percpu->scribble = NULL;
-	kfree(percpu->km_decode);
+	kvfree(percpu->km_decode);
 	percpu->km_decode = NULL;
 }
 
@@ -9870,8 +9925,8 @@ static int alloc_scratch_buffer(struct r5conf *conf, struct raid5_percpu *percpu
 	}
 
 	if (!percpu->km_decode) {
-		percpu->km_decode = kmalloc(sizeof(struct raidkm_decode_scratch),
-					    GFP_KERNEL);
+		percpu->km_decode = kvmalloc(sizeof(struct raidkm_decode_scratch),
+					     GFP_KERNEL);
 		if (!percpu->km_decode)
 			return -ENOMEM;
 	}
@@ -10080,6 +10135,22 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		if (rkm_m < 2 || rkm_m > RAIDKM_MAX_M) {
 			pr_warn("md/raid:%s: raidkm m=%d out of range [2..%d]\n",
 				mdname(mddev), rkm_m, RAIDKM_MAX_M);
+			return ERR_PTR(-EINVAL);
+		}
+		/*
+		 * Enforce the geometry bound at create AND assemble: k >= 1 and
+		 * k + m <= RAIDKM_MAX_STRIPE_DISKS (the GF(2^8) field limit).
+		 * raid_disks == k + m, so the single comparison covers k + m, and
+		 * raid_disks - m >= 1 rejects an all-parity geometry.  Without this
+		 * an out-of-spec array would size past the EC matrices and the
+		 * per-cpu scratch.  previous_raid_disks <= raid_disks for a grow,
+		 * so this also bounds the reshape target.
+		 */
+		if (mddev->raid_disks > RAIDKM_MAX_STRIPE_DISKS ||
+		    mddev->raid_disks - rkm_m < 1) {
+			pr_warn("md/raid:%s: invalid raidkm geometry: %d disks, m=%d (need k>=1, k+m<=%d)\n",
+				mdname(mddev), mddev->raid_disks, rkm_m,
+				RAIDKM_MAX_STRIPE_DISKS);
 			return ERR_PTR(-EINVAL);
 		}
 	} else if ((mddev->new_level == 5
