@@ -45,6 +45,7 @@
 #include <linux/seq_file.h>
 #include <linux/cpu.h>
 #include <linux/slab.h>
+#include <linux/sched/mm.h>
 #include <linux/ratelimit.h>
 #include <linux/nodemask.h>
 #include <linux/build_bug.h>
@@ -1895,7 +1896,8 @@ struct raidkm_decode_scratch {
 };
 
 static struct dma_async_tx_descriptor *
-ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu)
+ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
+		   unsigned long *ops_request)
 {
 	struct r5conf *conf = sh->raid_conf;
 	int disks = sh->disks, m = raidkm_sh_m(sh), k = disks - m;
@@ -1948,6 +1950,20 @@ ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu)
 		for (i = 0; i < disks; i++)
 			clear_bit(R5_Wantcompute, &sh->dev[i].flags);
 		clear_bit(STRIPE_COMPUTE_RUN, &sh->state);
+		/*
+		 * Drop any write-path ops latched for this same raid_run_ops
+		 * pass: without the decoded survivor they would prexor / drain /
+		 * reconstruct parity from stale pages (silent corruption).  Reset
+		 * the reconstruct state machine so the re-handle re-derives the
+		 * compute + write from a valid survivor set.
+		 */
+		if (ops_request) {
+			clear_bit(STRIPE_OP_RECONSTRUCT, ops_request);
+			clear_bit(STRIPE_OP_PREXOR, ops_request);
+			clear_bit(STRIPE_OP_BIODRAIN, ops_request);
+			clear_bit(STRIPE_OP_PARTIAL_PARITY, ops_request);
+		}
+		sh->reconstruct_state = reconstruct_state_idle;
 		set_bit(STRIPE_HANDLE, &sh->state);
 		atomic_inc(&sh->count);
 		raid5_release_stripe(sh);
@@ -3060,7 +3076,7 @@ static void raid_run_ops(struct stripe_head *sh, unsigned long ops_request)
 		if (is_raidkm(conf))
 			/* generic RS decode (PARITY_N, any m) — replaces the
 			 * raid6 P+Q compute for raidkm at every m */
-			tx = ops_run_compute_km(sh, percpu);
+			tx = ops_run_compute_km(sh, percpu, &ops_request);
 		else if (level < 6)
 			tx = ops_run_compute5(sh, percpu);
 		else {
@@ -4225,11 +4241,24 @@ schedule_reconstruction(struct stripe_head *sh, struct stripe_head_state *s,
 			if (!test_and_set_bit(STRIPE_FULL_WRITE, &sh->state))
 				atomic_inc(&conf->pending_full_writes);
 	} else {
-		BUG_ON(!(test_bit(R5_UPTODATE, &sh->dev[pd_idx].flags) ||
-			test_bit(R5_Wantcompute, &sh->dev[pd_idx].flags)));
-		BUG_ON(level == 6 &&
-			(!(test_bit(R5_UPTODATE, &sh->dev[qd_idx].flags) ||
-			   test_bit(R5_Wantcompute, &sh->dev[qd_idx].flags))));
+		if (is_raidkm(conf)) {
+			int p;
+
+			/* RMW reads or computes every parity slot before the
+			 * reconstruct, so assert all m, not just P+Q. */
+			for (p = 0; p < raidkm_sh_m(sh); p++) {
+				int pi = raidkm_parity_slot(sh, p);
+
+				BUG_ON(!(test_bit(R5_UPTODATE, &sh->dev[pi].flags) ||
+					 test_bit(R5_Wantcompute, &sh->dev[pi].flags)));
+			}
+		} else {
+			BUG_ON(!(test_bit(R5_UPTODATE, &sh->dev[pd_idx].flags) ||
+				test_bit(R5_Wantcompute, &sh->dev[pd_idx].flags)));
+			BUG_ON(level == 6 &&
+				(!(test_bit(R5_UPTODATE, &sh->dev[qd_idx].flags) ||
+				   test_bit(R5_Wantcompute, &sh->dev[qd_idx].flags))));
+		}
 
 		for (i = disks; i--; ) {
 			struct r5dev *dev = &sh->dev[i];
@@ -6297,11 +6326,25 @@ static void handle_stripe(struct stripe_head *sh)
 		/* All the 'written' buffers and the parity block are ready to
 		 * be written back to disk
 		 */
-		BUG_ON(!test_bit(R5_UPTODATE, &sh->dev[sh->pd_idx].flags) &&
-		       !test_bit(R5_Discard, &sh->dev[sh->pd_idx].flags));
-		BUG_ON(sh->qd_idx >= 0 &&
-		       !test_bit(R5_UPTODATE, &sh->dev[sh->qd_idx].flags) &&
-		       !test_bit(R5_Discard, &sh->dev[sh->qd_idx].flags));
+		if (is_raidkm(conf)) {
+			int p;
+
+			/* ops_complete_reconstruct sets R5_UPTODATE (or
+			 * R5_Discard) on every parity slot, so assert all m,
+			 * not just P+Q. */
+			for (p = 0; p < raidkm_sh_m(sh); p++) {
+				int pi = raidkm_parity_slot(sh, p);
+
+				BUG_ON(!test_bit(R5_UPTODATE, &sh->dev[pi].flags) &&
+				       !test_bit(R5_Discard, &sh->dev[pi].flags));
+			}
+		} else {
+			BUG_ON(!test_bit(R5_UPTODATE, &sh->dev[sh->pd_idx].flags) &&
+			       !test_bit(R5_Discard, &sh->dev[sh->pd_idx].flags));
+			BUG_ON(sh->qd_idx >= 0 &&
+			       !test_bit(R5_UPTODATE, &sh->dev[sh->qd_idx].flags) &&
+			       !test_bit(R5_Discard, &sh->dev[sh->qd_idx].flags));
+		}
 		for (i = disks; i--; ) {
 			struct r5dev *dev = &sh->dev[i];
 			if (test_bit(R5_LOCKED, &dev->flags) &&
@@ -7862,9 +7905,21 @@ static int raidkm_reshape_replay_commit(struct r5conf *conf, sector_t row,
 		if (!rdev || test_bit(Faulty, &rdev->flags))
 			continue;		/* failed member: rebuild restores it */
 		for (po = 0; po < npages; po++)
-			sync_page_io(rdev, home + (sector_t)po * RAIDKM_PAGE_SECTORS,
-				     PAGE_SIZE, band[j * npages + po],
-				     REQ_OP_WRITE | REQ_FUA, false);
+			if (!sync_page_io(rdev,
+					  home + (sector_t)po * RAIDKM_PAGE_SECTORS,
+					  PAGE_SIZE, band[j * npages + po],
+					  REQ_OP_WRITE | REQ_FUA, false)) {
+				/*
+				 * A committed home slot failed to (re)write:
+				 * fault the member so it gets rebuilt and abort
+				 * recovery (raidkm_reshape_recover aborts on
+				 * err != 0) so the frontier never advances over
+				 * a stale slot.
+				 */
+				md_error(conf->mddev, rdev);
+				err = -EIO;
+				goto out;
+			}
 	}
 out:
 	if (band) {
@@ -7976,6 +8031,7 @@ static sector_t raidkm_reshape_cow(struct mddev *mddev, sector_t sector_nr,
 	sector_t row = sector_nr, last_band = per_disk;
 	struct raidkm_reshape_ctx ctx;
 	int err;
+	unsigned int noio_flag;
 
 	/*
 	 * md_do_sync always (re)starts the reshape at sector_nr 0 and relies on
@@ -8032,7 +8088,16 @@ static sector_t raidkm_reshape_cow(struct mddev *mddev, sector_t sector_nr,
 	raid5_quiesce(mddev, true);
 	raid5_quiesce(mddev, false);
 
+	/*
+	 * This kthread issues writes to the array's own members; the band,
+	 * page and journal allocations inside migrate_band must not let direct
+	 * reclaim recurse into writeback of a filesystem stacked on the array
+	 * (which would block on the reshape window this very thread must
+	 * advance) -> scope them GFP_NOIO, as resize_stripes does.
+	 */
+	noio_flag = memalloc_noio_save();
 	err = raidkm_reshape_migrate_band(conf, &ctx, row, last_band);
+	memalloc_noio_restore(noio_flag);
 	if (err) {
 		/* interrupted (inject park + stop) or I/O error: no progress.
 		 * Unclaim the band (safe == progress -> empty stall window). */
@@ -10362,6 +10427,21 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	return ERR_PTR(ret);
 }
 
+static int raidkm_only_parity(struct r5conf *conf, int raid_disk, int m,
+			      int raid_disks)
+{
+	/*
+	 * conf->algorithm is the PACKED raidkm layout (m | ROTATING bit), NOT an
+	 * ALGORITHM_* value, so it must never reach only_parity()'s enum switch.
+	 * A disk holds only parity iff the layout is fixed parity-last (the tail
+	 * m slots); in the rotating layout every disk carries data in some
+	 * stripe, so none is parity-only.
+	 */
+	if (conf->rotating)
+		return 0;
+	return raid_disk >= raid_disks - m;
+}
+
 static int only_parity(int raid_disk, int algo, int raid_disks, int max_degraded)
 {
 	switch (algo) {
@@ -10679,16 +10759,26 @@ static int raid5_run(struct mddev *mddev)
 
 		if (rdev->recovery_offset < reshape_offset) {
 			/* We need to check old and new layout */
-			if (!only_parity(rdev->raid_disk,
-					 conf->algorithm,
-					 conf->raid_disks,
-					 conf->max_degraded))
+			if (is_raidkm(conf)) {
+				if (!raidkm_only_parity(conf, rdev->raid_disk,
+							conf->m,
+							conf->raid_disks))
+					continue;
+			} else if (!only_parity(rdev->raid_disk,
+						conf->algorithm,
+						conf->raid_disks,
+						conf->max_degraded))
 				continue;
 		}
-		if (!only_parity(rdev->raid_disk,
-				 conf->prev_algo,
-				 conf->previous_raid_disks,
-				 conf->max_degraded))
+		if (is_raidkm(conf)) {
+			if (!raidkm_only_parity(conf, rdev->raid_disk,
+						conf->prev_m,
+						conf->previous_raid_disks))
+				continue;
+		} else if (!only_parity(rdev->raid_disk,
+					conf->prev_algo,
+					conf->previous_raid_disks,
+					conf->max_degraded))
 			continue;
 		dirty_parity_disks++;
 	}
