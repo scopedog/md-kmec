@@ -9265,8 +9265,6 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 		err = -ENODEV;
 	else if (new != conf->worker_cnt_per_group) {
 		old_groups = conf->worker_groups;
-		if (old_groups)
-			flush_workqueue(raid5_wq);
 
 		err = alloc_thread_groups(conf, new, &group_cnt, &new_groups);
 		if (!err) {
@@ -9278,6 +9276,23 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 
 			if (old_groups) {
 				int node;
+
+				/*
+				 * Drain any worker still referencing the old
+				 * groups before freeing them.  new_groups is
+				 * already published above (under device_lock), so
+				 * raid5_wakeup_stripe_thread now queues only to
+				 * the new groups -- this flush is therefore the
+				 * point after which no work can touch the old
+				 * groups.  The previous code flushed *before* the
+				 * swap, leaving a window in which a wakeup that
+				 * had read the old worker_groups could queue work
+				 * to an old group after the flush; that worker
+				 * then ran after the free -- a use-after-free
+				 * that GP-faults in raid5_do_work
+				 * (worker->group->conf, non-canonical pointer).
+				 */
+				flush_workqueue(raid5_wq);
 
 				/* each node-ID slot owns its own workers
 				 * allocation (alloc_thread_groups sizes by
