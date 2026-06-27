@@ -9268,6 +9268,22 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 
 		err = alloc_thread_groups(conf, new, &group_cnt, &new_groups);
 		if (!err) {
+			/*
+			 * Quiesce the stripe cache across the worker_groups
+			 * swap.  Since 6.12, mddev_suspend() only drains
+			 * active_io (normal bios) and no longer calls
+			 * pers->quiesce, so an in-flight sync/check -- which
+			 * holds no active_io reference -- keeps allocating
+			 * stripes onto conf->handle_list.  In worker-group mode
+			 * that list is never serviced, so without this drain the
+			 * swap would strand every stripe still queued there:
+			 * permanently active, never released, eventually
+			 * exhausting the cache and deadlocking
+			 * raid5_get_active_stripe().  raid5_quiesce() parks the
+			 * sync thread and waits for active_stripes == 0, so
+			 * conf->handle_list is provably empty at the swap.
+			 */
+			raid5_quiesce(mddev, true);
 			spin_lock_irq(&conf->device_lock);
 			conf->group_cnt = group_cnt;
 			conf->worker_cnt_per_group = new;
@@ -9301,6 +9317,7 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 					kfree(old_groups[node].workers);
 			}
 			kfree(old_groups);
+			raid5_quiesce(mddev, false);
 		}
 	}
 	mddev_unlock_and_resume(mddev);
@@ -9374,12 +9391,16 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 
 	if (new_per_group != conf->worker_cnt_per_group) {
 		old_groups = conf->worker_groups;
-		if (old_groups)
-			flush_workqueue(raid5_wq);
 
 		err = alloc_thread_groups(conf, new_per_group,
 					  &group_cnt, &new_groups);
 		if (!err) {
+			/* Quiesce across the swap -- same rationale as
+			 * raid5_store_group_thread_cnt(): this alias performs
+			 * the identical worker_groups swap and needs the same
+			 * stripe-cache drain so an in-flight sync/check cannot
+			 * strand stripes on conf->handle_list. */
+			raid5_quiesce(mddev, true);
 			spin_lock_irq(&conf->device_lock);
 			conf->group_cnt = group_cnt;
 			conf->worker_cnt_per_group = new_per_group;
@@ -9389,6 +9410,11 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 			if (old_groups) {
 				int node;
 
+				/* Drain workers still referencing the old groups
+				 * only AFTER new_groups is published; flushing
+				 * before the swap left a use-after-free window
+				 * (see raid5_store_group_thread_cnt()). */
+				flush_workqueue(raid5_wq);
 				/* each node-ID slot owns its own workers
 				 * allocation (alloc_thread_groups sizes by
 				 * nr_node_ids); free them all, not just [0] */
@@ -9396,6 +9422,7 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 					kfree(old_groups[node].workers);
 			}
 			kfree(old_groups);
+			raid5_quiesce(mddev, false);
 		}
 	}
 out:
