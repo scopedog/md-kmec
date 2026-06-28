@@ -131,6 +131,64 @@ needed to make it land:
 
 ### Benchmark — raidkm vs stock raid6
 
+**Out of the box** — stock raid6 at its default `group_thread_cnt=0` vs md-kmec
+raidkm at *its* defaults — `tools/raidkm-standard-benchmark.sh --runs=3`, 16 × brd
+ramdisks, k=14 m=2, 64 KiB chunk, both `--assume-clean`, on a GCP
+`c3-standard-22` (22 vCPU, **RHEL 10.2** `6.12.0-211.16.1.el10_2`).  raidkm
+auto-defaults `group_thread_cnt` to `nproc/2` (= 11 here) and now enables
+zero-copy writes (`skip_copy`) by default; stock ships both off
+(IOPS, mean of 3 runs; Test 6 = post-run integrity check, `mismatch_cnt=0`):
+
+| Test | stock raid6 (`gtc=0`) | md-kmec raidkm (default) | speedup |
+|---|---|---|---|
+| 1 Random 4K Write (RMW worst case) | 54,266  | 375,269   | **6.92×** |
+| 2 Database Mixed 75/25 8K          | 106,072 | 868,263   | **8.19×** |
+| 3 High Concurrency 70/30 4K (16 j) | 177,730 | 1,210,715 | **6.81×** |
+| 4 OLTP 70/30 16K                   | 52,574  | 396,083   | **7.53×** |
+| 5 Partial Stripe Write 8K          | 31,256  | 230,669   | **7.38×** |
+
+The out-of-box gap (**~7-8×** on this wide array) is dominated by md-kmec's
+worker-group auto-default — stock raid6's RMW path is serialized at `gtc=0`,
+while raidkm parallelizes stripe handling across `nproc/2` worker threads.  This
+is a *default-vs-default* comparison; at **matched** `gtc` the structural-only
+edge is much smaller (the win is the on-by-default tuning, see the SIMD table and
+the vCPU-scaling note below).
+
+#### Zero-copy full-stripe writes (`skip_copy`, default on)
+
+md-kmec defaults `skip_copy` on (in `raid5_set_limits`): for a full-page-aligned
+write the stripe-cache page is aliased directly to the incoming bio page instead
+of being `memcpy`'d in through the biodrain step — and that copy, *not* the
+erasure-coding (EC is ~0.6 % of write-path CPU), is the dominant cost of a
+full-stripe write.  The only requirement is stable pages, which is free for the
+O_DIRECT workloads this fork targets; override per-array via the
+`skip_copy` sysfs attribute.
+
+Full-stripe sequential DIO write (16-disk wide array above, `bs=896k` = one full
+stripe, 3 reps):
+
+| `skip_copy` | throughput |
+|---|---|
+| **1 (md-kmec default)** | **13.33 GiB/s** |
+| 0 | 9.56 GiB/s |
+
+— **+39 %**, matching the +36 % measured on stock raid6 with `skip_copy` forced
+on.  The win is confined to **full-stripe** writes; on small/partial RMW writes
+the tiny copy is dwarfed by read-modify-write amplification, so `skip_copy` is
+neutral there — 8 KiB partial-stripe random write, 4 reps each:
+
+| `skip_copy` | IOPS per rep |
+|---|---|
+| 1 | 210k / 214k / 214k / 215k |
+| 0 | 210k / 210k / 212k / 209k |
+
+(no regression — within noise, marginally ahead).  Note the standard-benchmark
+suite above is entirely small random / RMW writes, so it does **not** exercise
+the regime `skip_copy` helps; the full-stripe win shows on the large-sequential-write
+path.
+
+#### Across the SIMD spectrum (6-disk, three boxes)
+
 raidkm m=2 vs stock raid6 with the canonical
 `tools/raidkm-standard-benchmark.sh --runs=3` (6-workload OLTP/IOPS suite; drops
 page cache + dentries before every test; both arrays created `--assume-clean` so
