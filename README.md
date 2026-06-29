@@ -187,6 +187,42 @@ suite above is entirely small random / RMW writes, so it does **not** exercise
 the regime `skip_copy` helps; the full-stripe win shows on the large-sequential-write
 path.
 
+#### `raid5_unplug` device_lock removal (random-write scaling)
+
+raidkm inherits raid5.c's plug/unplug path, and `raid5_unplug()` released every
+plugged stripe under the global `conf->device_lock` — one acquisition per flush,
+the dominant CPU cost under many concurrent submitters.  md-kmec now routes those
+releases through the lockless `released_stripes` llist (`raid5_release_stripe()`,
+the same path used when unplugged), coalescing all submitters' releases into
+batched drains by `raid5d` + the worker threads.  No new lock or invariant —
+functional suite **12/12**, scrub `mismatch_cnt=0`, and the change is **mirrored
+to the perf-tree `raid5.c`** (an upstream-ready md/raid5 fix that lifts stock
+raid6 identically).
+
+Throughput proof on **raid6 14+2** — the change is in shared raid5.c, so these
+numbers measure it directly on the mirrored perf tree; raidkm runs the identical
+`raid5_unplug` path — 64 KiB chunk, `group_thread_cnt=16`, fio 4 KiB random write
+`numjobs=24 iodepth=32`, base (without the change) vs patched, 3 interleaved
+rounds, on `null_blk` (device-unlimited, so the md layer is the bottleneck), GCP
+`n2-standard-32` (32 vCPU, 2 NUMA):
+
+| | IOPS (4K randwrite) | CPU busy |
+|---|---|---|
+| base    | 221,067 | 92 % |
+| **patched** | **276,478** | 84 % |
+
+→ **+25 % throughput at lower CPU**; `perf` shows `raid5_unplug →
+_raw_spin_unlock_irq` **28 % of all CPU → 0**.  Neutral at the stock default
+`group_thread_cnt=0` (single-`raid5d`-bound): **0.98×**, no regression.
+
+**On real NVMe (16 × GCP local SSD):** 4 KiB random write is device-capped at
+~199 K (≈ the lock ceiling), so IOPS ties and the win is CPU efficiency — at
+matched `group_thread_cnt`, **same ~199 K IOPS at 54 % busy vs stock raid6's
+69 %** (**+28 % IOPS per %CPU**).  The faster the storage, the more the lock
+dominates (28 % of CPU on `null_blk` vs 14 % on this NVMe), so the throughput
+win grows on storage fast enough to clear the single-lock ceiling — the
+very-wide-array (k+m ≥ 80) regime this fork targets.
+
 #### Across the SIMD spectrum (6-disk, three boxes)
 
 raidkm m=2 vs stock raid6 with the canonical
