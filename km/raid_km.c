@@ -6967,7 +6967,6 @@ again:
 struct raid5_plug_cb {
 	struct blk_plug_cb	cb;
 	struct list_head	list;
-	struct list_head	temp_inactive_list[NR_STRIPE_HASH_LOCKS];
 };
 
 static void raid5_unplug(struct blk_plug_cb *blk_cb, bool from_schedule)
@@ -7031,12 +7030,8 @@ static void release_stripe_plug(struct mddev *mddev,
 
 	cb = container_of(blk_cb, struct raid5_plug_cb, cb);
 
-	if (cb->list.next == NULL) {
-		int i;
+	if (cb->list.next == NULL)
 		INIT_LIST_HEAD(&cb->list);
-		for (i = 0; i < NR_STRIPE_HASH_LOCKS; i++)
-			INIT_LIST_HEAD(cb->temp_inactive_list + i);
-	}
 
 	if (!test_and_set_bit(STRIPE_ON_UNPLUG_LIST, &sh->state))
 		list_add_tail(&sh->lru, &cb->list);
