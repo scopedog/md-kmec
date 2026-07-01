@@ -3017,17 +3017,36 @@ static void ops_run_check_pq(struct stripe_head *sh, struct raid5_percpu *percpu
 			for (i = 0; i < k; i++)
 				data[i] = page_address(srcs[i]) + offs[i];
 			for (p = 0; p < m; p++) {
+				int pslot = raidkm_parity_slot(sh, p);
 				unsigned char *pq = page_address(srcs[k + p]) + offs[k + p];
 				unsigned char *dst[1] = { spare };
 				size_t toff = (size_t)p * k * 32;
+				bool uptodate = test_bit(R5_UPTODATE, &sh->dev[pslot].flags);
 
-				/* Skip parity on a failed disk: its page was never
-				 * read, so there is nothing to compare against and we
-				 * could not write a repair back anyway.  (Degraded
-				 * scrub still verifies the surviving parity.) */
-				if (!test_bit(R5_UPTODATE,
-					      &sh->dev[raidkm_parity_slot(sh, p)].flags))
-					continue;
+				/*
+				 * Parity page not read?  Two very different cases:
+				 *  - genuinely failed/absent disk: nothing to compare
+				 *    and no way to write a repair back -> skip (a
+				 *    degraded scrub still verifies surviving parity).
+				 *  - recoverable READ ERROR on an ONLINE disk, i.e. an
+				 *    integrity layer (dm-integrity / T10-PI) flagged a
+				 *    silently-corrupt parity block as EIO: it IS a
+				 *    detected mismatch — count it, and in repair mode
+				 *    re-encode the correct parity and force a rewrite so
+				 *    it self-heals.  Without this a corrupt parity block
+				 *    at m>2 is never repaired (m==2 heals via the stock
+				 *    path), silently leaving the array under-protected.
+				 */
+				if (!uptodate) {
+					struct md_rdev *prdev = conf->disks[pslot].rdev;
+
+					if (!test_bit(R5_ReadError, &sh->dev[pslot].flags) ||
+					    !prdev || test_bit(Faulty, &prdev->flags))
+						continue;	/* can't heal a dead disk */
+					result |= 1 << p;
+					if (!repair)
+						continue;	/* check-only: count, don't repair */
+				}
 
 				if (isal_have_avx512_gfni())
 					ec_encode_data_avx512_gfni(bytes, k, 1,
@@ -3039,7 +3058,12 @@ static void ops_run_check_pq(struct stripe_head *sh, struct raid5_percpu *percpu
 					ec_encode_data_base(bytes, k, 1,
 						raidkm_g_base(sh) + toff, data, dst);
 
-				if (memcmp(spare, pq, bytes)) {
+				if (!uptodate) {
+					/* healing a corrupt/unreadable parity on a live
+					 * disk: overwrite with the reconstructed parity
+					 * (result bit already set above). */
+					memcpy(pq, spare, bytes);
+				} else if (memcmp(spare, pq, bytes)) {
 					result |= 1 << p;
 					if (repair)
 						memcpy(pq, spare, bytes);
@@ -5678,6 +5702,20 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 
 					if (!(sh->ops.zero_sum_result & (1 << p)))
 						continue;
+					/* If this slot mismatched because its on-disk
+					 * parity was unreadable (silent corruption ->
+					 * integrity EIO), ops_run_check_pq reconstructed
+					 * the correct parity into the page; clear the read
+					 * error and mark it a rewrite so the heal write is
+					 * issued and the error state doesn't linger. */
+					if (test_and_clear_bit(R5_ReadError, &d->flags)) {
+						set_bit(R5_ReWrite, &d->flags);
+						/* corrupt parity located via integrity EIO
+						 * and rebuilt from data -> a self-heal.
+						 * (A plain parity mismatch has no R5_ReadError
+						 * and is not counted here.) */
+						atomic64_inc(&conf->healed_blocks);
+					}
 					set_bit(R5_UPTODATE, &d->flags);
 					set_bit(R5_LOCKED, &d->flags);
 					set_bit(R5_Wantwrite, &d->flags);
@@ -6531,6 +6569,9 @@ static void handle_stripe(struct stripe_head *sh)
 				if (!test_bit(R5_ReWrite, &dev->flags)) {
 					set_bit(R5_Wantwrite, &dev->flags);
 					set_bit(R5_ReWrite, &dev->flags);
+					/* located a bad block and are rewriting the
+					 * reconstructed data back -> a self-heal. */
+					atomic64_inc(&conf->healed_blocks);
 				} else
 					/* let's read it back */
 					set_bit(R5_Wantread, &dev->flags);
@@ -9227,6 +9268,27 @@ static struct md_sysfs_entry
 raid5_stripecache_active = __ATTR_RO(stripe_cache_active);
 
 static ssize_t
+healed_blocks_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf = mddev->private;
+	if (conf)
+		return sprintf(page, "%llu\n",
+			       (unsigned long long)atomic64_read(&conf->healed_blocks));
+	else
+		return 0;
+}
+
+/*
+ * Cumulative count of blocks this array has self-healed: located as
+ * corrupt/unreadable (e.g. dm-integrity / T10-PI flagged silent corruption)
+ * and repaired by reconstructing from parity and rewriting the good block.
+ * Distinct from md's mismatch_cnt (parity inconsistencies).  Covers read-path
+ * heals (any m) and m>2 scrub heals; see the r5conf.healed_blocks comment.
+ */
+static struct md_sysfs_entry
+raid5_healed_blocks = __ATTR_RO(healed_blocks);
+
+static ssize_t
 raid5_show_group_thread_cnt(struct mddev *mddev, char *page)
 {
 	struct r5conf *conf;
@@ -9831,6 +9893,7 @@ raidkm_reshape_start = __ATTR(raidkm_reshape_start, S_IWUSR,
 static struct attribute *raid5_attrs[] =  {
 	&raid5_stripecache_size.attr,
 	&raid5_stripecache_active.attr,
+	&raid5_healed_blocks.attr,
 	&raid5_preread_bypass_threshold.attr,
 	&raid5_group_thread_cnt.attr,
 	&raid5_worker_thread_cnt.attr,

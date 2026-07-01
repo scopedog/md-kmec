@@ -860,6 +860,23 @@ struct r5conf {
 
 	atomic_t		empty_inactive_list_nr;
 
+	/*
+	 * raid_km self-healing telemetry: count of blocks that were
+	 * located as corrupt/unreadable (e.g. an integrity layer flagged
+	 * silent corruption -> read error) and repaired by reconstructing
+	 * from parity and rewriting the corrected block.  Distinct from
+	 * mddev->resync_mismatches (parity inconsistencies).  Exposed
+	 * read-only via the "healed_blocks" sysfs attribute.
+	 *
+	 * Coverage: read-path heals (any m, via the handle_stripe
+	 * R5_ReadError rewrite) and m>2 scrub/repair heals (data via the
+	 * same rewrite, parity via handle_parity_checks6).  m==2
+	 * proactive-scrub heals that flow through the inherited stock raid6
+	 * repair path (check_state_compute_result) are not separately
+	 * counted -- raid6-equivalent, outside raidkm's m>2 differentiator.
+	 */
+	atomic64_t		healed_blocks;
+
 	struct llist_head	released_stripes;
 	wait_queue_head_t	wait_for_quiescent;
 	wait_queue_head_t	wait_for_stripe;
