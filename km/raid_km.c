@@ -4919,15 +4919,34 @@ static int fetch_block(struct stripe_head *sh, struct stripe_head_state *s,
 						avail++;
 
 				if (avail >= k) {
-					/* Reconstruct only missing DATA slots (idx < k).  A
-					 * read never needs parity, and marking a missing
-					 * parity slot uptodate on a failed disk would leave
-					 * it pending a write-back that can't happen and wedge
-					 * the stripe.  Parity reconstruction belongs to the
-					 * scrub/degraded-write paths, not here. */
+					/* Reconstruct missing DATA slots (a read never needs
+					 * parity, and reconstructing a parity slot on a truly
+					 * failed disk would leave it awaiting a write-back that
+					 * can't happen and wedge the stripe).
+					 *
+					 * EXCEPTION: an m == 2 SCRUB of a silently-corrupt
+					 * parity block.  m == 2 uses the stock raid6 scrub/heal
+					 * path, which can only rewrite the parity once it is
+					 * UPTODATE -- so, unlike m > 2 (which re-encodes and
+					 * rewrites corrupt parity in ops_run_check_pq), it relies
+					 * on fetch_block reconstructing the failed parity here,
+					 * exactly as stock raid6's fetch_block does.  Without it
+					 * the corrupt parity is never rebuilt and handle_stripe's
+					 * compute_result WARNs "disk not up to date" and skips the
+					 * heal.  Reconstruct only for a recoverable read error on
+					 * a LIVE disk, so the corrected parity can be written back
+					 * (the R5_ReadError rewrite in handle_stripe then heals
+					 * it). */
 					for (j = disks; j--; ) {
-						if (is_parity_disk(sh, j))
-							continue;
+						if (is_parity_disk(sh, j)) {
+							struct md_rdev *prdev =
+								sh->raid_conf->disks[j].rdev;
+
+							if (raidkm_sh_m(sh) != 2 || !s->syncing ||
+							    !test_bit(R5_ReadError, &sh->dev[j].flags) ||
+							    !prdev || test_bit(Faulty, &prdev->flags))
+								continue;
+						}
 						if (test_bit(R5_UPTODATE, &sh->dev[j].flags) ||
 						    test_bit(R5_Wantcompute, &sh->dev[j].flags))
 							continue;

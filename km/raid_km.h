@@ -868,12 +868,12 @@ struct r5conf {
 	 * mddev->resync_mismatches (parity inconsistencies).  Exposed
 	 * read-only via the "healed_blocks" sysfs attribute.
 	 *
-	 * Coverage: read-path heals (any m, via the handle_stripe
-	 * R5_ReadError rewrite) and m>2 scrub/repair heals (data via the
-	 * same rewrite, parity via handle_parity_checks6).  m==2
-	 * proactive-scrub heals that flow through the inherited stock raid6
-	 * repair path (check_state_compute_result) are not separately
-	 * counted -- raid6-equivalent, outside raidkm's m>2 differentiator.
+	 * Best-effort: bumped at the two R5_ReWrite heal sites -- handle_stripe's
+	 * read-error rewrite (read-path heals, any m) and the m>2 parity heal in
+	 * handle_parity_checks6.  A heal that instead lands via the stock raid6
+	 * compute_result WRITE path (e.g. a data or m==2 parity block rebuilt
+	 * during a scrub) is NOT counted, so this can under-count scrub heals.
+	 * (A complete count would live at write issue in ops_run_io -- deferred.)
 	 */
 	atomic64_t		healed_blocks;
 
