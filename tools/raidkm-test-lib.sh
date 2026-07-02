@@ -133,12 +133,23 @@ rk_load_modules() {
 	mkdir -p "$RK_TMP"
 }
 
-# Create $BRD_NR ramdisks if there aren't already enough block-device ram* nodes.
+# Ensure at least <need> (default $BRD_NR) block-device ram* nodes exist.
 rk_setup_brd() {
-	local need="${1:-$BRD_NR}" have
+	local need="${1:-$BRD_NR}" have want
 	have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
 	[ "$have" -ge "$need" ] && return 0
-	sudo modprobe brd rd_nr="$BRD_NR" rd_size="$BRD_SIZE_KB" 2>/dev/null || true
+	# Too few ram devices.  brd may already be loaded at a smaller rd_nr from a
+	# prior (smaller-NDISK) test -- a plain modprobe is then a no-op, the count
+	# never grows, and the caller fails "need N, found M" (e.g. mparity needs 11
+	# ram disks but a preceding NDISK=6 test left brd at 6).  Force a reload at a
+	# count covering this caller (the larger of $need and $BRD_NR).  rmmod fails
+	# harmlessly if a stale array still holds a ram dev, in which case we fall
+	# back to the plain modprobe -- no worse than before.
+	want=$need; [ "${BRD_NR:-0}" -gt "$want" ] && want=$BRD_NR
+	lsmod | grep -q '^brd ' && sudo rmmod brd 2>/dev/null
+	sudo modprobe brd rd_nr="$want" rd_size="$BRD_SIZE_KB" 2>/dev/null || true
+	have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
+	[ "$have" -ge "$need" ]
 }
 
 # Echo the first <n> working /dev/ram* block devices (skips broken nodes).

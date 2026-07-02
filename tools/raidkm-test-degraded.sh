@@ -14,7 +14,7 @@ set -u
 SZ="${SZ:-24}"
 
 rk_load_modules || exit 1
-rk_setup_brd 5 || exit 1
+rk_setup_brd 7 || exit 1     # widest geometry below is m=4,k=3 -> n=7 ram disks
 
 for layout in 2 2r 3 3r 4 4r; do
 	m=$(rk_m_of "$layout")
