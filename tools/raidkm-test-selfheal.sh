@@ -121,6 +121,16 @@ si_corrupt_n() {
 }
 
 si_repair() {
+	# Flush the md stripe cache first.  A stripe still cached clean from the
+	# preceding si_restore write would otherwise hide the on-disk corruption
+	# from the scrub: the resync trusts UPTODATE cached pages and never
+	# re-reads the (corrupt) disk, so the repair would "miss" a freshly
+	# corrupted block.  Shrinking stripe_cache_size to the minimum evicts the
+	# inactive cached stripes; restoring it re-enables normal operation.
+	local scs
+	scs=$(cat "/sys/block/$MDNAME/md/stripe_cache_size" 2>/dev/null)
+	echo 17 | sudo tee "/sys/block/$MDNAME/md/stripe_cache_size" >/dev/null 2>&1
+	[ -n "$scs" ] && echo "$scs" | sudo tee "/sys/block/$MDNAME/md/stripe_cache_size" >/dev/null 2>&1
 	echo repair | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null 2>&1
 	rk_wait_idle
 	sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
