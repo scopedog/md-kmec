@@ -447,6 +447,15 @@ enum r5dev_flags {
 				 * set, orig_page contains latest data in the
 				 * raid disk.
 				 */
+	R5_IntegrityHeal,	/* raidkm: the integrity layer (dm-integrity /
+				 * T10-PI) reported silent corruption on a live
+				 * DATA disk.  Durable heal marker: it survives the
+				 * read-error flag lifecycle (which clears
+				 * R5_ReadError once the block is reconstructed and
+				 * UPTODATE) so the on-disk block is still rewritten
+				 * even when an m>2 parity repair holds the stripe
+				 * across passes.  Cleared when the heal write is
+				 * scheduled.  See handle_stripe(). */
 };
 
 /*

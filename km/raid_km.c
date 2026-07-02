@@ -3608,6 +3608,17 @@ static void raid5_end_read_request(struct bio * bi)
 		int set_bad = 0;
 
 		clear_bit(R5_UPTODATE, &sh->dev[i].flags);
+		if (bi->bi_status == BLK_STS_PROTECTION &&
+		    !is_parity_disk(sh, i) &&
+		    !test_bit(R5_ReadRepl, &sh->dev[i].flags) &&
+		    test_bit(In_sync, &rdev->flags))
+			/* Integrity layer flagged silent corruption on a live
+			 * DATA disk.  Mark a durable heal so the reconstructed
+			 * block is rewritten even if an m>2 parity repair holds
+			 * the stripe long enough for the read-error lifecycle to
+			 * clear R5_ReadError first (mixed data+parity one-pass
+			 * heal — see the R5_IntegrityHeal loop in handle_stripe). */
+			set_bit(R5_IntegrityHeal, &sh->dev[i].flags);
 		if (!(bi->bi_status == BLK_STS_PROTECTION))
 			atomic_inc(&rdev->read_errors);
 		if (test_bit(R5_ReadRepl, &sh->dev[i].flags))
@@ -6590,10 +6601,44 @@ static void handle_stripe(struct stripe_head *sh)
 					set_bit(R5_ReWrite, &dev->flags);
 					/* located a bad block and are rewriting the
 					 * reconstructed data back -> a self-heal. */
+					clear_bit(R5_IntegrityHeal, &dev->flags);
 					atomic64_inc(&conf->healed_blocks);
 				} else
 					/* let's read it back */
 					set_bit(R5_Wantread, &dev->flags);
+				set_bit(R5_LOCKED, &dev->flags);
+				s.locked++;
+			}
+		}
+
+	/*
+	 * raidkm durable integrity-heal.  A silently-corrupt DATA block
+	 * (integrity BLK_STS_PROTECTION read error, flagged R5_IntegrityHeal)
+	 * is reconstructed by fetch_block and normally rewritten by the
+	 * R5_ReadError loop above.  But an m>2 parity repair (ops_run_check_pq)
+	 * can hold the stripe across passes during which the read-error
+	 * lifecycle clears R5_ReadError once the block is UPTODATE -- dropping
+	 * it from s.failed so the loop above never rewrites it, and the on-disk
+	 * corruption survives until a later scrub.  R5_IntegrityHeal persists
+	 * the heal intent so the reconstructed block is rewritten in THIS pass,
+	 * healing mixed data+parity corruption in one pass.  The loop above
+	 * clears R5_IntegrityHeal when it heals, so a block whose R5_ReadError
+	 * was retained (the common case) is not healed/counted twice.
+	 */
+	if (!conf->mddev->ro)
+		for (i = 0; i < disks; i++) {
+			struct r5dev *dev = &sh->dev[i];
+
+			if (test_bit(R5_IntegrityHeal, &dev->flags)
+			    && test_bit(R5_UPTODATE, &dev->flags)
+			    && !test_bit(R5_LOCKED, &dev->flags)
+			    && !test_bit(R5_ReWrite, &dev->flags)) {
+				set_bit(R5_Wantwrite, &dev->flags);
+				set_bit(R5_ReWrite, &dev->flags);
+				clear_bit(R5_IntegrityHeal, &dev->flags);
+				/* reconstructed silently-corrupt data written back
+				 * despite the lost R5_ReadError -> a self-heal. */
+				atomic64_inc(&conf->healed_blocks);
 				set_bit(R5_LOCKED, &dev->flags);
 				s.locked++;
 			}

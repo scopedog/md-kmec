@@ -329,6 +329,53 @@ for m in $MSET; do
 				   || rk_fail "m=$m $lbl: heal FAILED under concurrent I/O load"
 		rk_dmesg_clean || rk_fail "m=$m $lbl: WARN/BUG in dmesg under concurrent heal"
 
+		# --- Scenario 6: MIXED data+parity corruption in ONE stripe (parity-last) --
+		# Scenarios 1-3 corrupt only DATA, 4 only PARITY.  A real multi-failure mixes
+		# them: dc data + pc parity erasures in the SAME stripe (dc+pc<=m, correctable).
+		# This is the strongest no-parity-propagation test: if the heal rewrote parity
+		# to match the corrupt DATA block (the 5668-5688 flaw firing on an integrity-
+		# flagged data block) the recovered data would be WRONG.  Parity-last so parity
+		# members [k..k+m-1] row-0 blocks share the backing offset of a data block.
+		if [ "$suf" = p ]; then
+			pc=$(( m / 2 )); [ "$pc" -lt 1 ] && pc=1
+			dc=$(( m - pc ))
+			[ "$dc" -gt "$k" ] && { dc=$k; pc=$(( m - dc )); }
+			[ "$dc" -lt 1 ] && { dc=1; pc=$(( m - dc )); }
+			rk_dmesg_clear
+			si_restore
+			mh0=$(rk_healed)
+			if si_locate 0; then
+				row0off="$SI_OFF"                  # capture BEFORE corrupting
+				si_corrupt_n "$dc"                 # dc data erasures (stripe row 0)
+				for ((pi = 0; pi < pc; pi++)); do  # pc parity erasures, same row
+					SI_DEV="${SI_BACKING[$((k + pi))]}"; SI_OFF="$row0off"
+					si_corrupt_here
+				done
+				si_repair
+				rk_dmesg_clear; mm=$(rk_scrub)
+				c_eio=no;  si_no_eio                && c_eio=yes
+				c_rb=no;   rk_readback "$WRITE_MIB" && c_rb=yes
+				c_data=no; si_all_healed "$dc"      && c_data=yes
+				mh1=$(rk_healed)
+				if [ "$mm" = 0 ] && [ "$c_eio" = yes ] && [ "$c_rb" = yes ] && [ "$c_data" = yes ]; then
+					rk_pass "m=$m $lbl: healed MIXED $dc data + $pc parity erasures in one stripe"
+				else
+					rk_fail "m=$m $lbl: mixed heal failed (mismatch=$mm tag=$c_eio data_ok=$c_rb ondisk=$c_data; d=$dc p=$pc)"
+					sudo dmesg 2>/dev/null | grep -iE 'integrity|read error|corrected|raidkm|not up to date' | tail -6 | sed 's/^/      · /'
+				fi
+				if [ "$m" -gt 2 ]; then
+					[ "$mh1" -gt "$mh0" ] \
+						&& rk_pass "m=$m $lbl: healed_blocks counted mixed heal ($mh0->$mh1)" \
+						|| rk_fail "m=$m $lbl: healed_blocks did not advance on mixed heal ($mh0->$mh1)"
+				else
+					rk_log "m=$m $lbl: mixed heal counter $mh0->$mh1 (m=2 parity via stock path, best-effort)"
+				fi
+				rk_dmesg_clean || rk_fail "m=$m $lbl: WARN/BUG in dmesg after mixed heal"
+			else
+				rk_fail "m=$m $lbl: could not locate row-0 needle for mixed corruption"
+			fi
+		fi
+
 		si_restore                         # leave members fully readable for next --create
 		rk_stop
 	done
