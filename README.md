@@ -103,6 +103,7 @@ These are load-bearing for the design and not up for negotiation:
 | GFNI cross-validation of degraded write + recovery | ✅ done (2026-05-25) — degraded-write matrix + hot-replace rebuilds repeated on an i5-1340P (GFNI): 10/10 pass, exercising the `ec_encode_data_avx2_gfni` path. The KVM testbed has no GFNI, so this is the only coverage of the GFNI EC variants under the new write/recovery scheduling |
 | **Device-mapper: drive raidkm via the kernel `dm-raid` target** (`dmsetup`) | ✅ done (2026-06-05) — level 71 is reachable through the in-tree `dm-raid` target with **no new dm target** (`dmsetup create … raid raidkm <chunk> parity_count <m> …`); m + rotating ride in the dm table, a `FEATURE_FLAG_RAIDKM` superblock bit keeps stock dm-raid from touching a raidkm SB. Phase 1 (create + I/O + degraded + scrub + reassembly) and Phase 2 (rebuild via reload + `rebuild <idx>`) validated 21/21 base + 51/51 GFNI, m=2..6. Reshape via dm is **gated off** (a hand-driven dmsetup grow corrupts — needs LVM's data-offset positioning). The `dm-raid.c` changes live in the [mdraid](https://github.com/scopedog/mdraid) fork. See `notes/dm-raid-design.md` |
 | **LVM-managed raidkm** (`lvcreate --type raidkm`) | ✅ done (2026-06-05) — the lvm2 raidkm fork provisions level-71 LVs via two segtypes `raidkm` (rotating) / `raidkm_n` (parity-last) carrying `parity_count` (m). Validated base + GFNI, m=2/3/4: create/activate/I/O/reassembly/degraded; `lvconvert --repair` (raidkm-aware leg replacement + rebuild); and **dmeventd** monitoring + auto-repair (level-agnostic plugin, no code change). Reshape via dm/LVM is out of scope (the data-offset out-of-place reshape doesn't fit raidkm — mdadm-only); the kernel reshape gate stays on. See `notes/dm-raid-design.md` |
+| **Checksum-driven self-healing** — reconstruct silently-corrupt blocks from parity, up to m per stripe | ✅ done (2026-07-02) — stacked on a per-block integrity layer (`dm-integrity` today; T10-PI passthrough next), md-kmec turns an integrity-flagged read error into an m-erasure **reconstruction**: the corrupt block is rebuilt from parity and rewritten, on both the read path and the m-way scrub, with mixed data+parity corruption healed in a **single repair pass** (durable `R5_IntegrityHeal` marker). A read-only `healed_blocks` sysfs counter reports repairs. **Validated to m=8** — heals 8 simultaneous silent corruptions in one stripe (data-only, parity-only, and mixed 4+4), deterministically, beyond RAID-Z3's 3. The integrity layer supplies the *detection*; md-kmec supplies the *reconstruction* (it consumes checksums, it does not reinvent them). See `tools/raidkm-test-selfheal.sh` |
 
 ### How level 71 is integrated into raid5.c
 
@@ -469,6 +470,14 @@ Scope: this validates *reading through* faults during a reshape; *completing* a
 reshape after losing members mid-flight is not yet supported (`migrate_band` is
 non-degraded-read only) — see `notes/reshape-cow-design.md` §6/§9.  Without the
 fault-inject build the script auto-runs Tier 0 + a best-effort timed crash.
+
+**Self-healing suite** (`tools/raidkm-test-selfheal.sh`, needs `integritysetup` from the
+`cryptsetup` package): stacks raidkm on `dm-integrity` members, writes data, then injects
+*silent* corruption directly on the raw backing store (bit-rot the integrity layer flags as an
+EIO), and verifies md-kmec **reconstructs the flagged block from parity** — on the read path and
+the m-way scrub, for data-only, parity-only, and mixed data+parity corruption up to m per stripe,
+confirming the `healed_blocks` counter advances. **Validated to m=8** (8 silent corruptions healed
+in one stripe, beyond RAID-Z3's 3).
 
 ## Repository layout
 
