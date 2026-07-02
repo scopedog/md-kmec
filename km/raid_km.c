@@ -3741,6 +3741,13 @@ static void raid5_end_write_request(struct bio *bi)
 				set_bit(R5_ReWrite, &sh->dev[i].flags);
 		}
 	}
+	/* A successful write to a data slot restores correct on-disk contents,
+	 * satisfying any pending integrity-heal (the block was flagged silently
+	 * corrupt on read).  Drop the marker so the handle_stripe R5_IntegrityHeal
+	 * loop does not redundantly rewrite the block or over-count healed_blocks
+	 * after a user write races ahead of the heal. */
+	if (!replacement && !bi->bi_status)
+		clear_bit(R5_IntegrityHeal, &sh->dev[i].flags);
 	rdev_dec_pending(rdev, conf->mddev);
 
 	if (sh->batch_head && bi->bi_status && !replacement)
@@ -6633,11 +6640,17 @@ static void handle_stripe(struct stripe_head *sh)
 			    && test_bit(R5_UPTODATE, &dev->flags)
 			    && !test_bit(R5_LOCKED, &dev->flags)
 			    && !test_bit(R5_ReWrite, &dev->flags)) {
+				/* Schedule the heal write via R5_Wantwrite alone
+				 * (ops_run_io issues on that).  Deliberately do NOT
+				 * set R5_ReWrite: unlike the R5_ReadError loop these
+				 * blocks are not a read error being corrected, and
+				 * R5_ReWrite would linger (nothing clears it on this
+				 * path once R5_ReadError is gone) and could later bias
+				 * raid5_end_read_request toward failing the disk.
+				 * Clearing R5_IntegrityHeal already prevents re-firing;
+				 * the reconstructed data is written back -> a self-heal. */
 				set_bit(R5_Wantwrite, &dev->flags);
-				set_bit(R5_ReWrite, &dev->flags);
 				clear_bit(R5_IntegrityHeal, &dev->flags);
-				/* reconstructed silently-corrupt data written back
-				 * despite the lost R5_ReadError -> a self-heal. */
 				atomic64_inc(&conf->healed_blocks);
 				set_bit(R5_LOCKED, &dev->flags);
 				s.locked++;
