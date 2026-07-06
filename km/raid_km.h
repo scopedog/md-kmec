@@ -56,6 +56,11 @@ static inline bool is_raid6_math(int level)
  *               parity layout, RAID4-style, with the cheap add-a-parity grow);
  *               set: rotating parity (generalized left-symmetric) that spreads
  *               parity and read traffic across all disks.
+ *   bit  9      RAIDKM_LAYOUT_CSUM — native per-block CRC-32C integrity: the
+ *               array carries a reserved checksum region (mdadm --integrity) so
+ *               CRCs persist across assemble.  This is the on-disk enable; md's
+ *               core never interprets the layout word, so it needs no md-core
+ *               support (P1b).
  *
  * Stored verbatim in the superblock layout field, so the choice persists
  * across assemble.  A plain `--layout=m` (no high bits) is PARITY_N, keeping
@@ -63,8 +68,10 @@ static inline bool is_raid6_math(int level)
  */
 #define RAIDKM_LAYOUT_M_MASK	0x00ff
 #define RAIDKM_LAYOUT_ROTATING	0x0100
+#define RAIDKM_LAYOUT_CSUM	0x0200
 /* bits that carry meaning; anything else set is rejected at create time */
-#define RAIDKM_LAYOUT_KNOWN	(RAIDKM_LAYOUT_M_MASK | RAIDKM_LAYOUT_ROTATING)
+#define RAIDKM_LAYOUT_KNOWN	(RAIDKM_LAYOUT_M_MASK | RAIDKM_LAYOUT_ROTATING | \
+				 RAIDKM_LAYOUT_CSUM)
 
 static inline int raidkm_layout_m(int layout)
 {
@@ -73,6 +80,10 @@ static inline int raidkm_layout_m(int layout)
 static inline bool raidkm_layout_is_rotating(int layout)
 {
 	return !!(layout & RAIDKM_LAYOUT_ROTATING);
+}
+static inline bool raidkm_layout_has_csum(int layout)
+{
+	return !!(layout & RAIDKM_LAYOUT_CSUM);
 }
 
 /*
@@ -887,13 +898,16 @@ struct r5conf {
 	atomic64_t		healed_blocks;
 
 	/*
-	 * P1a native checksum (in-core only; see
-	 * notes/native-checksum-p1-plan-2026-07-06.md).  When non-NULL, maps
-	 * (member, block) -> u32 CRC-32C, populated at write issue and checked
-	 * at read completion.  Allocated only when the native_csum module param
-	 * was set at array setup; NULL means the feature is off.
+	 * Native checksum (see notes/native-checksum-p1-plan-2026-07-06.md).
+	 * When non-NULL, `csum` maps (member, block) -> u32 CRC-32C, populated at
+	 * write issue and checked at read completion.  Non-NULL means the feature
+	 * is on: enabled either in-core-only (native_csum module param, P1a) or
+	 * disk-backed (RAIDKM_LAYOUT_CSUM in the SB layout, P1b).  When csum_disk
+	 * is set the map is loaded from / flushed to the reserved tail region so
+	 * CRCs survive a remount.
 	 */
 	struct xarray		*csum;
+	bool			csum_disk;
 
 	struct llist_head	released_stripes;
 	wait_queue_head_t	wait_for_quiescent;

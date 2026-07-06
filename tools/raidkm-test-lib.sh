@@ -183,7 +183,16 @@ rk_create() {
 	local n=$#
 	rk_stop
 	local d
-	for d in "$@"; do sudo dd if=/dev/zero of="$d" bs=1M count=4 status=none 2>/dev/null; done
+	# With native integrity, zero the whole member so a prior array's checksum
+	# region can't leave stale CRCs behind (mdadm zeroing the reserved region at
+	# create is the product-side follow-up); otherwise just wipe the head.
+	for d in "$@"; do
+		if [[ "${RK_CREATE_EXTRA:-}" == *integrity* ]]; then
+			sudo dd if=/dev/zero of="$d" bs=1M status=none 2>/dev/null || true
+		else
+			sudo dd if=/dev/zero of="$d" bs=1M count=4 status=none 2>/dev/null
+		fi
+	done
 	# layout arg stays "N"/"Nr" for callers; translate to the current CLI
 	# (--parity-count + --layout=rotating|parity-last).
 	local m place
@@ -191,8 +200,14 @@ rk_create() {
 	[ "${layout: -1}" = r ] && place=rotating || place=parity-last
 	sudo "$MDADM" --create "$MD" --level=raidkm \
 		--parity-count="$m" --layout="$place" \
-		--raid-devices="$n" --chunk="$CHUNK_KB" "$@" --run --force \
+		--raid-devices="$n" --chunk="$CHUNK_KB" ${RK_CREATE_EXTRA:-} "$@" --run --force \
 		>/dev/null 2>&1 || return 1
+	rk_wait_idle
+}
+
+# rk_assemble <dev...> : re-assemble an existing raidkm array (persistence tests).
+rk_assemble() {
+	sudo "$MDADM" --assemble "$MD" "$@" >/dev/null 2>&1 || return 1
 	rk_wait_idle
 }
 

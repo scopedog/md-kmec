@@ -1368,6 +1368,125 @@ static bool raidkm_csum_lookup(struct r5conf *conf, int member,
 	return true;
 }
 
+/*
+ * P1b native checksum on-disk region.  CRCs persist in a reserved region at
+ * the tail of each member (from data_offset + dev_sectors to the end of the
+ * device) that mdadm carves at --create and flags with RAIDKM_LAYOUT_CSUM.
+ * The in-core conf->csum xarray is loaded from the region on assemble
+ * (raid5_run) and flushed back on a clean stop (raid5_free), so CRCs survive a
+ * remount.  Load-all/flush-all suits the region's ~0.1% size; a zero on-disk
+ * slot means "never written" (left absent -> skip-verify).  Targets the 4 KiB
+ * page/stripe build; PB-scale demand-paging is later work.
+ */
+#define RAIDKM_CSUM_PER_PAGE	(PAGE_SIZE / sizeof(__le32))
+
+/* Region [*start, *start+*sectors) on rdev->bdev, i.e. the tail after the data
+ * area.  False if the member has no room (e.g. array not created with a
+ * reserved region), in which case csum stays in-core only. */
+static bool raidkm_csum_region(struct r5conf *conf, struct md_rdev *rdev,
+			       sector_t *start, sector_t *sectors)
+{
+	sector_t region = rdev->data_offset + conf->mddev->dev_sectors;
+	sector_t dev = bdev_nr_sectors(rdev->bdev);
+
+	if (dev <= region)
+		return false;
+	*start = region;
+	*sectors = dev - region;
+	return true;
+}
+
+/* Load persisted CRCs from every member's region into the in-core xarray on
+ * assemble.  Zero on-disk slots (never-written blocks) are left absent. */
+static void raidkm_csum_load(struct r5conf *conf)
+{
+	struct page *page;
+	int i;
+
+	if (!conf || !conf->csum || !conf->csum_disk)
+		return;
+	page = alloc_page(GFP_KERNEL);
+	if (!page) {
+		pr_warn("md/raid:%s: native csum load OOM; CRCs not preloaded\n",
+			mdname(conf->mddev));
+		return;
+	}
+	for (i = 0; i < conf->raid_disks; i++) {
+		struct md_rdev *rdev = conf->disks[i].rdev;
+		sector_t rstart, rsec, pg, blk = 0;
+
+		if (!rdev || test_bit(Faulty, &rdev->flags))
+			continue;
+		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec))
+			continue;
+		for (pg = 0; pg < rsec; pg += PAGE_SIZE >> 9) {
+			__le32 *crcs;
+			int s;
+
+			if (!sync_page_io(rdev, (rstart - rdev->data_offset) + pg,
+					  PAGE_SIZE, page, REQ_OP_READ, false))
+				break;
+			crcs = page_address(page);
+			for (s = 0; s < RAIDKM_CSUM_PER_PAGE; s++, blk++) {
+				u32 c = le32_to_cpu(crcs[s]);
+
+				if (c)
+					xa_store(conf->csum,
+						 ((unsigned long)i << 40) | blk,
+						 xa_mk_value(c), GFP_KERNEL);
+			}
+		}
+	}
+	__free_page(page);
+}
+
+/* Flush the in-core CRCs back to each member's region on a clean stop, before
+ * the conf (and its rdevs) are freed, so --stop persists the map. */
+static void raidkm_csum_flush(struct r5conf *conf)
+{
+	struct page *page;
+	int i;
+
+	if (!conf || !conf->csum || !conf->csum_disk)
+		return;
+	page = alloc_page(GFP_KERNEL);
+	if (!page) {
+		pr_warn("md/raid:%s: native csum flush OOM; map NOT persisted\n",
+			mdname(conf->mddev));
+		return;
+	}
+	for (i = 0; i < conf->raid_disks; i++) {
+		struct md_rdev *rdev = conf->disks[i].rdev;
+		sector_t rstart, rsec, pg, blk = 0;
+
+		if (!rdev || test_bit(Faulty, &rdev->flags))
+			continue;
+		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec))
+			continue;
+		for (pg = 0; pg < rsec; pg += PAGE_SIZE >> 9) {
+			__le32 *crcs = page_address(page);
+			bool any = false;
+			int s;
+
+			for (s = 0; s < RAIDKM_CSUM_PER_PAGE; s++, blk++) {
+				void *e = xa_load(conf->csum,
+						  ((unsigned long)i << 40) | blk);
+				u32 c = e ? xa_to_value(e) : 0;
+
+				crcs[s] = cpu_to_le32(c);
+				any |= (c != 0);
+			}
+			if (any &&
+			    !sync_page_io(rdev, (rstart - rdev->data_offset) + pg,
+					  PAGE_SIZE, page,
+					  REQ_OP_WRITE | REQ_FUA, false))
+				pr_warn("md/raid:%s: native csum flush write failed disk %d\n",
+					mdname(conf->mddev), i);
+		}
+	}
+	__free_page(page);
+}
+
 static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
 {
 	struct r5conf *conf = sh->raid_conf;
@@ -10656,8 +10775,11 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	if (conf->level == RAID_KM_LEVEL) {
 		conf->m = raidkm_layout_m(mddev->new_layout);
 		conf->rotating = raidkm_layout_is_rotating(mddev->new_layout);
-		/* P1a native checksum: allocate the in-core CRC map if opted in. */
-		if (native_csum) {
+		/* Native checksum: disk-backed (SB layout bit, P1b) and/or in-core
+		 * (native_csum module param, P1a).  Either allocates the CRC map;
+		 * csum_disk additionally loads/persists it in raid5_run/raid5_free. */
+		conf->csum_disk = raidkm_layout_has_csum(mddev->new_layout);
+		if (native_csum || conf->csum_disk) {
 			conf->csum = kzalloc(sizeof(*conf->csum), GFP_KERNEL);
 			if (conf->csum)
 				xa_init(conf->csum);
@@ -11239,6 +11361,9 @@ static int raid5_run(struct mddev *mddev)
 	if (log_init(conf, journal_dev, raid5_has_ppl(conf)))
 		goto abort;
 
+	/* P1b native checksum: load persisted CRCs from the reserved region. */
+	raidkm_csum_load(conf);
+
 	return 0;
 abort:
 	md_unregister_thread(mddev, &mddev->thread);
@@ -11253,6 +11378,9 @@ static void raid5_free(struct mddev *mddev, void *priv)
 {
 	struct r5conf *conf = priv;
 
+	/* P1b native checksum: persist the CRC map to the reserved region on a
+	 * clean stop, before the conf and its rdevs go away. */
+	raidkm_csum_flush(conf);
 	free_conf(conf);
 	mddev->to_remove = &raid5_attrs_group;
 }

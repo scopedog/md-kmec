@@ -186,12 +186,12 @@ fi
 rk_load_modules || exit 1
 
 if [ "$NATIVE" = 1 ]; then
-	# Enable the P1a in-core native CRC (module param, read by setup_conf at
-	# --create).  It lives under whichever module carries it (raidkm).
-	np=$(find /sys/module -maxdepth 3 -path '*/parameters/native_csum' 2>/dev/null | head -1)
-	[ -n "$np" ] || { echo "ERROR: native_csum param absent — kernel lacks P1a native csum" >&2; exit 1; }
-	echo 1 | sudo tee "$np" >/dev/null || exit 1
-	rk_log "native checksum ENABLED ($np)"
+	# P1b: enable the on-disk native CRC via mdadm --integrity, which sets the
+	# SB layout bit (csum_disk) so the CRC map persists in the reserved tail
+	# region and is reloaded on assemble.  No module param needed.
+	grep -qa integrity "$MDADM" || { echo "ERROR: this mdadm lacks --integrity (rebuild the fork)" >&2; exit 1; }
+	export RK_CREATE_EXTRA="--integrity=crc32c"
+	rk_log "native checksum ENABLED (--integrity=crc32c, disk-backed region)"
 fi
 
 rk_setup_brd "$NDISK" || exit 1
@@ -414,6 +414,27 @@ for m in $MSET; do
 			else
 				rk_fail "m=$m $lbl: could not locate row-0 needle for mixed corruption"
 			fi
+		fi
+
+		# --- Scenario 7: heal after REMOUNT (P1b — CRC persisted to region) ---
+		# The in-core map is flushed to the reserved region on --stop and
+		# reloaded on --assemble; corrupting AFTER the remount proves the CRC
+		# came from disk, not RAM.  Disk-backed (NATIVE) only.
+		if [ "$NATIVE" = 1 ]; then
+			rk_dmesg_clear
+			si_restore                 # clean baseline -> CRCs (flushed on stop)
+			rk_stop                    # persist the map to the region
+			if rk_assemble "${SI_MAPPER[@]}"; then
+				si_corrupt_n 1     # silent corruption AFTER the map left RAM
+				if rk_readback "$WRITE_MIB"; then
+					rk_pass "m=$m $lbl: healed silent corruption AFTER remount (CRC from region)"
+				else
+					rk_fail "m=$m $lbl: remount heal FAILED — region persistence broken"
+				fi
+			else
+				rk_fail "m=$m $lbl: re-assemble after --stop failed"
+			fi
+			rk_dmesg_clean || rk_fail "m=$m $lbl: WARN/BUG in dmesg after remount heal"
 		fi
 
 		si_restore                         # leave members fully readable for next --create
