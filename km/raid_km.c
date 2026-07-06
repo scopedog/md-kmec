@@ -45,6 +45,9 @@
 #include <linux/seq_file.h>
 #include <linux/cpu.h>
 #include <linux/slab.h>
+#include <linux/crc32c.h>
+#include <linux/xarray.h>
+#include <linux/highmem.h>
 #include <linux/sched/mm.h>
 #include <linux/ratelimit.h>
 #include <linux/nodemask.h>
@@ -1311,6 +1314,60 @@ raid5_end_read_request(struct bio *bi);
 static void
 raid5_end_write_request(struct bio *bi);
 
+/*
+ * P1a native per-4KiB-block CRC-32C (in-core only).  When the native_csum
+ * module param is set at array setup, conf->csum is an xarray mapping
+ * (member, block) -> u32 CRC-32C.  CRCs are populated at write issue
+ * (ops_run_io) and checked at read completion (raid5_end_read_request); a
+ * mismatch feeds the shipped R5_IntegrityHeal reconstruction path.  Detection
+ * + in-core storage only -- no on-disk region yet (that is P1b).  See
+ * notes/native-checksum-p1-plan-2026-07-06.md.
+ */
+static bool native_csum;
+module_param(native_csum, bool, 0644);
+MODULE_PARM_DESC(native_csum,
+	"raidkm P1a: compute/verify in-core per-4KiB CRC-32C (no persistence)");
+
+static u32 raidkm_block_crc(struct r5conf *conf, struct page *page,
+			    unsigned int offset)
+{
+	void *addr = kmap_local_page(page);
+	u32 crc = crc32c_le(0, addr + offset, RAID5_STRIPE_SIZE(conf));
+
+	kunmap_local(addr);
+	return crc;
+}
+
+static unsigned long raidkm_csum_key(struct r5conf *conf, int member,
+				     sector_t sector)
+{
+	return ((unsigned long)member << 40) |
+	       (sector >> RAID5_STRIPE_SHIFT(conf));
+}
+
+static void raidkm_csum_store(struct r5conf *conf, int member,
+			      sector_t sector, u32 crc)
+{
+	void *old = xa_store(conf->csum,
+			     raidkm_csum_key(conf, member, sector),
+			     xa_mk_value(crc), GFP_NOIO);
+
+	if (xa_is_err(old))
+		pr_warn_ratelimited("md/raid:%s: native csum store failed (%d)\n",
+				    mdname(conf->mddev), xa_err(old));
+}
+
+static bool raidkm_csum_lookup(struct r5conf *conf, int member,
+			       sector_t sector, u32 *crc)
+{
+	void *e = xa_load(conf->csum, raidkm_csum_key(conf, member, sector));
+
+	if (!e)
+		return false;
+	*crc = xa_to_value(e);
+	return true;
+}
+
 static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
 {
 	struct r5conf *conf = sh->raid_conf;
@@ -1356,6 +1413,18 @@ again:
 		dev = &sh->dev[i];
 		bi = &dev->req;
 		rbi = &dev->rreq; /* For writing to replacement */
+
+		/*
+		 * P1a native checksum: CRC the block we are about to write.
+		 * The write bio carries dev->page for a full-stripe write, so
+		 * the stored CRC matches the on-disk bytes by construction
+		 * (RMW/journal orig_page paths are P2).  Covers data + parity
+		 * and heal-rewrites (both set R5_Wantwrite -> REQ_OP_WRITE).
+		 */
+		if (conf->csum && op == REQ_OP_WRITE)
+			raidkm_csum_store(conf, i, sh->sector,
+					  raidkm_block_crc(conf, dev->page,
+							   dev->offset));
 
 		rdev = conf->disks[i].rdev;
 		rrdev = conf->disks[i].replacement;
@@ -3603,6 +3672,41 @@ static void raid5_end_read_request(struct bio * bi)
 
 		if (atomic_read(&rdev->read_errors))
 			atomic_set(&rdev->read_errors, 0);
+
+		/*
+		 * P1a native checksum: the read succeeded at the block layer;
+		 * verify the bytes against our stored CRC.  On mismatch, inject
+		 * a logical read failure from this (success) branch -- both
+		 * branches share the STRIPE_HANDLE tail below, and R5_ReadError
+		 * makes analyse_stripe treat the slot as failed -> reconstruct
+		 * from parity, with R5_IntegrityHeal guaranteeing the rewrite.
+		 * Go straight to R5_ReadError (a CRC mismatch is deterministic,
+		 * so the error-branch reread is pointless) and stay out of the
+		 * error branch's disk-fail accounting.  W3 in the plan doc.
+		 */
+		if (conf->csum && !is_parity_disk(sh, i) &&
+		    !test_bit(R5_ReadRepl, &sh->dev[i].flags) &&
+		    test_bit(In_sync, &rdev->flags)) {
+			u32 want;
+
+			if (raidkm_csum_lookup(conf, i, sh->sector, &want)) {
+				u32 got = raidkm_block_crc(conf,
+							   sh->dev[i].page,
+							   sh->dev[i].offset);
+
+				if (got != want) {
+					pr_warn_ratelimited("md/raid:%s: native csum mismatch disk %d sector %llu (want %08x got %08x)\n",
+						mdname(conf->mddev), i,
+						(unsigned long long)s,
+						want, got);
+					clear_bit(R5_UPTODATE, &sh->dev[i].flags);
+					set_bit(R5_IntegrityHeal,
+						&sh->dev[i].flags);
+					set_bit(R5_ReadError,
+						&sh->dev[i].flags);
+				}
+			}
+		}
 	} else {
 		int retry = 0;
 		int set_bad = 0;
@@ -7551,7 +7655,15 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 	 * data on failed drives.
 	 */
 	if (rw == READ && mddev->degraded == 0 &&
-	    mddev->reshape_position == MaxSector) {
+	    mddev->reshape_position == MaxSector &&
+	    !conf->csum) {
+		/*
+		 * P1a native checksum: the chunk-aligned read bypass reads a
+		 * member directly, skipping the stripe cache and our per-block
+		 * verify -- it would return silently-corrupt data.  dm-integrity
+		 * caught it from below md; native lives in md, so gate the
+		 * bypass off when native csum is on.  W0 in the plan doc.
+		 */
 		bi = chunk_aligned_read(mddev, bi);
 		if (!bi)
 			return true;
@@ -10203,6 +10315,10 @@ static void free_conf(struct r5conf *conf)
 	bioset_exit(&conf->bio_split);
 	kfree(conf->stripe_hashtbl);
 	kfree(conf->pending_data);
+	if (conf->csum) {
+		xa_destroy(conf->csum);
+		kfree(conf->csum);
+	}
 	kfree(conf->ec_a_matrix);
 	kfree(conf->ec_g_tbls_gfni);
 	kfree(conf->ec_g_tbls_base);
@@ -10540,6 +10656,15 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	if (conf->level == RAID_KM_LEVEL) {
 		conf->m = raidkm_layout_m(mddev->new_layout);
 		conf->rotating = raidkm_layout_is_rotating(mddev->new_layout);
+		/* P1a native checksum: allocate the in-core CRC map if opted in. */
+		if (native_csum) {
+			conf->csum = kzalloc(sizeof(*conf->csum), GFP_KERNEL);
+			if (conf->csum)
+				xa_init(conf->csum);
+			else
+				pr_warn("md/raid:%s: native csum alloc failed; disabled\n",
+					mdname(mddev));
+		}
 	} else if (conf->effective_level == 6) {
 		conf->m = 2;
 	} else {

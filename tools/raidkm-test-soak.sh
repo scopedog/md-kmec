@@ -77,6 +77,16 @@ mkdir -p "$SOAK_OUTPUT"
 # --- setup ------------------------------------------------------------------
 
 rk_load_modules || exit 1
+
+# P1a native checksum: enable the in-core CRC before rk_create so the soak
+# stresses the store(ops_run_io)/verify(end_read_request) hot paths on every I/O.
+if [ "${NATIVE:-0}" = 1 ]; then
+	np=$(find /sys/module -maxdepth 3 -path '*/parameters/native_csum' 2>/dev/null | head -1)
+	[ -n "$np" ] || { rk_fail "native_csum param absent — kernel lacks P1a native csum"; exit 1; }
+	echo 1 | sudo tee "$np" >/dev/null || exit 1
+	echo "  native checksum ENABLED ($np)"
+fi
+
 rk_setup_brd "$SOAK_N" || exit 1
 
 disks=$(rk_pick_disks "$SOAK_N") || { rk_fail "not enough ramdisks"; exit 1; }

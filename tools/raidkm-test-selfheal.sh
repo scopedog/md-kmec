@@ -34,6 +34,7 @@ NDISK="${NDISK:-6}"
 MSET="${MSET:-2 3 4}"
 LAYOUTS="${LAYOUTS:-r p}"
 WRITE_MIB="${WRITE_MIB:-8}"
+NATIVE="${NATIVE:-0}"                       # 1 = raidkm native CRC (P1a), no dm-integrity
 BLK=4096                                   # corruption granularity (one page)
 : "${BRD_NR:=$NDISK}" ; export BRD_NR
 : "${BRD_SIZE_KB:=65536}" ; export BRD_SIZE_KB   # 64 MiB — keep format/wipe cheap
@@ -47,6 +48,7 @@ SI_DEV="" ; SI_OFF=""                     # si_locate() results
 si_teardown() {
 	rk_stop
 	local n
+	[ "$NATIVE" = 1 ] && return 0
 	for n in "${SI_INAME[@]:-}"; do
 		[ -n "$n" ] && sudo integritysetup close "$n" 2>/dev/null
 	done
@@ -151,29 +153,47 @@ si_all_healed() {
 
 # Print integrity/read-error evidence from dmesg (informational, not pass/fail).
 si_evidence() {
-	sudo dmesg 2>/dev/null | grep -iE 'integrity|checksum failed|read error|corrected' \
+	sudo dmesg 2>/dev/null | grep -iE 'integrity|checksum failed|read error|corrected|native csum' \
 		| tail -3 | sed 's/^/      · /'
 }
 
 # True iff NO dm-integrity checksum failure has been logged since the last
 # rk_dmesg_clear — used after a heal to prove the rewritten block's tag is now
 # valid (a re-read no longer trips the integrity check).
-si_no_eio() { ! sudo dmesg 2>/dev/null | grep -qiE 'integrity.*checksum failed'; }
+si_no_eio() {
+	if [ "$NATIVE" = 1 ]; then
+		! sudo dmesg 2>/dev/null | grep -qiE 'native csum mismatch'
+	else
+		! sudo dmesg 2>/dev/null | grep -qiE 'integrity.*checksum failed'
+	fi
+}
 
 # raidkm's cumulative self-heal counter (sysfs, per-array; 0 if the kernel
 # predates the telemetry patch — the > comparisons below then just fail loudly).
 rk_healed() { cat "/sys/block/$MDNAME/md/healed_blocks" 2>/dev/null || echo 0; }
 
 # ---- preflight ------------------------------------------------------------
-command -v integritysetup >/dev/null 2>&1 || {
-	echo "ERROR: integritysetup not found — install cryptsetup(-bin) on the test VM." >&2
-	echo "       (this Phase 0 test stacks raidkm on dm-integrity)." >&2
-	exit 1
-}
-sudo modprobe dm_integrity 2>/dev/null || true
-sudo modprobe dm_mod 2>/dev/null || true
+if [ "$NATIVE" != 1 ]; then
+	command -v integritysetup >/dev/null 2>&1 || {
+		echo "ERROR: integritysetup not found — install cryptsetup(-bin) on the test VM." >&2
+		echo "       (this Phase 0 test stacks raidkm on dm-integrity)." >&2
+		exit 1
+	}
+	sudo modprobe dm_integrity 2>/dev/null || true
+	sudo modprobe dm_mod 2>/dev/null || true
+fi
 
 rk_load_modules || exit 1
+
+if [ "$NATIVE" = 1 ]; then
+	# Enable the P1a in-core native CRC (module param, read by setup_conf at
+	# --create).  It lives under whichever module carries it (raidkm).
+	np=$(find /sys/module -maxdepth 3 -path '*/parameters/native_csum' 2>/dev/null | head -1)
+	[ -n "$np" ] || { echo "ERROR: native_csum param absent — kernel lacks P1a native csum" >&2; exit 1; }
+	echo 1 | sudo tee "$np" >/dev/null || exit 1
+	rk_log "native checksum ENABLED ($np)"
+fi
+
 rk_setup_brd "$NDISK" || exit 1
 
 DISKS=$(rk_pick_disks "$NDISK") || { echo "ERROR: need $NDISK ramdisks" >&2; exit 1; }
@@ -182,18 +202,28 @@ DISKS=$(rk_pick_disks "$NDISK") || { echo "ERROR: need $NDISK ramdisks" >&2; exi
 # Close any leftovers from an aborted run, then format+open one integrity target
 # per member.  `format` initialises tags for the whole device so it reads back as
 # zeros with valid checksums (a fresh --create resync can then read every sector).
-i=0
-for d in $DISKS; do
-	name="rkshi$i"
-	sudo integritysetup close "$name" 2>/dev/null || true
-	sudo integritysetup format --batch-mode --integrity crc32c --tag-size 4 "$d" \
-		>/dev/null 2>&1 || { echo "ERROR: integritysetup format $d failed" >&2; exit 1; }
-	sudo integritysetup open --integrity crc32c "$d" "$name" \
-		>/dev/null 2>&1 || { echo "ERROR: integritysetup open $d failed" >&2; exit 1; }
-	SI_INAME+=("$name"); SI_BACKING+=("$d"); SI_MAPPER+=("/dev/mapper/$name")
-	i=$((i + 1))
-done
-rk_log "dm-integrity stack: $NDISK crc32c members over [$DISKS]"
+if [ "$NATIVE" = 1 ]; then
+	# Native mode: the members ARE the raw ramdisks.  raidkm's own per-block
+	# CRC catches silent corruption, so there is no dm-integrity layer, and
+	# corrupting a member's backing == silently corrupting the member.
+	for d in $DISKS; do
+		SI_BACKING+=("$d"); SI_MAPPER+=("$d")
+	done
+	rk_log "native checksum stack: $NDISK raw members [$DISKS] (no dm-integrity)"
+else
+	i=0
+	for d in $DISKS; do
+		name="rkshi$i"
+		sudo integritysetup close "$name" 2>/dev/null || true
+		sudo integritysetup format --batch-mode --integrity crc32c --tag-size 4 "$d" \
+			>/dev/null 2>&1 || { echo "ERROR: integritysetup format $d failed" >&2; exit 1; }
+		sudo integritysetup open --integrity crc32c "$d" "$name" \
+			>/dev/null 2>&1 || { echo "ERROR: integritysetup open $d failed" >&2; exit 1; }
+		SI_INAME+=("$name"); SI_BACKING+=("$d"); SI_MAPPER+=("/dev/mapper/$name")
+		i=$((i + 1))
+	done
+	rk_log "dm-integrity stack: $NDISK crc32c members over [$DISKS]"
+fi
 
 # ---- the sweep ------------------------------------------------------------
 for m in $MSET; do
@@ -279,7 +309,7 @@ for m in $MSET; do
 		# follow-up `check` mismatch==0 (parity VALUE matches data — here
 		# mismatch_cnt IS meaningful, unlike the EIO-only data case), no residual
 		# integrity EIO (tag healed), data intact.
-		if [ "$suf" = p ]; then
+		if [ "$suf" = p ] && [ "$NATIVE" != 1 ]; then   # P1a: parity/mixed heal is P2 (native verifies data only)
 			rk_dmesg_clear
 			si_restore
 			if si_locate 0; then
@@ -346,7 +376,7 @@ for m in $MSET; do
 		# to match the corrupt DATA block (the 5668-5688 flaw firing on an integrity-
 		# flagged data block) the recovered data would be WRONG.  Parity-last so parity
 		# members [k..k+m-1] row-0 blocks share the backing offset of a data block.
-		if [ "$suf" = p ]; then
+		if [ "$suf" = p ] && [ "$NATIVE" != 1 ]; then   # P1a: parity/mixed heal is P2 (native verifies data only)
 			pc=$(( m / 2 )); [ "$pc" -lt 1 ] && pc=1
 			dc=$(( m - pc ))
 			[ "$dc" -gt "$k" ] && { dc=$k; pc=$(( m - dc )); }

@@ -886,6 +886,15 @@ struct r5conf {
 	 */
 	atomic64_t		healed_blocks;
 
+	/*
+	 * P1a native checksum (in-core only; see
+	 * notes/native-checksum-p1-plan-2026-07-06.md).  When non-NULL, maps
+	 * (member, block) -> u32 CRC-32C, populated at write issue and checked
+	 * at read completion.  Allocated only when the native_csum module param
+	 * was set at array setup; NULL means the feature is off.
+	 */
+	struct xarray		*csum;
+
 	struct llist_head	released_stripes;
 	wait_queue_head_t	wait_for_quiescent;
 	wait_queue_head_t	wait_for_stripe;
