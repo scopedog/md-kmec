@@ -1369,6 +1369,29 @@ static bool raidkm_csum_lookup(struct r5conf *conf, int member,
 }
 
 /*
+ * P2 crash consistency: true while an AUTOMATIC resync is in progress -- a
+ * dirty array recovering after an unclean shutdown, or the initial --create
+ * resync.  In this window the on-disk CRC region is stale (it is written only
+ * on a clean stop), so verifying a read against it would false-positive; we
+ * re-derive the CRC from the data now on disk instead (see the read path).
+ *
+ * This must be FALSE for a user check/repair scrub (MD_RECOVERY_REQUESTED) and
+ * a device rebuild (MD_RECOVERY_RECOVER): a scrub verifies against the stored
+ * CRC to LOCATE silent rot, and must never overwrite it, or rot detection is
+ * lost.  MD_RECOVERY_CHECK implies MD_RECOVERY_REQUESTED, so !REQUESTED covers
+ * both check and repair.  MD_RECOVERY_RESHAPE is a different flag (not SYNC),
+ * so reshape keeps the normal verify path.
+ */
+static bool raidkm_csum_rederive(struct r5conf *conf)
+{
+	unsigned long r = conf->mddev->recovery;
+
+	return test_bit(MD_RECOVERY_SYNC, &r) &&
+	       !test_bit(MD_RECOVERY_REQUESTED, &r) &&
+	       !test_bit(MD_RECOVERY_RECOVER, &r);
+}
+
+/*
  * P1b native checksum on-disk region.  CRCs persist in a reserved region at
  * the tail of each member (from data_offset + dev_sectors to the end of the
  * device) that mdadm carves at --create and flags with RAIDKM_LAYOUT_CSUM.
@@ -1534,11 +1557,18 @@ again:
 		rbi = &dev->rreq; /* For writing to replacement */
 
 		/*
-		 * P1a native checksum: CRC the block we are about to write.
-		 * The write bio carries dev->page for a full-stripe write, so
-		 * the stored CRC matches the on-disk bytes by construction
-		 * (RMW/journal orig_page paths are P2).  Covers data + parity
-		 * and heal-rewrites (both set R5_Wantwrite -> REQ_OP_WRITE).
+		 * Native checksum: CRC the block we are about to write.  The
+		 * write bio is built over dev->page (below), which holds the
+		 * final content for every write form -- full-stripe RCW,
+		 * sub-stripe RMW (new data, after prexor/biodrain), skip_copy
+		 * O_DIRECT (dev->page aliases the user page), WantReplace
+		 * rebuild, and heal-rewrites -- so the stored CRC matches the
+		 * on-disk bytes by construction.  Covers data + parity (both set
+		 * R5_Wantwrite -> REQ_OP_WRITE); REQ_OP_DISCARD carries no data
+		 * so op != REQ_OP_WRITE skips it.  Batch path: the `again:` loop
+		 * (below) advances sh per batched stripe, so each stores under
+		 * its own sh->sector.  RMW + skip_copy validated in P2 via the
+		 * rand-4k + O_DIRECT soak (fio --verify + clean scrubs).
 		 */
 		if (conf->csum && op == REQ_OP_WRITE)
 			raidkm_csum_store(conf, i, sh->sector,
@@ -3793,36 +3823,83 @@ static void raid5_end_read_request(struct bio * bi)
 			atomic_set(&rdev->read_errors, 0);
 
 		/*
-		 * P1a native checksum: the read succeeded at the block layer;
+		 * Native checksum: the read succeeded at the block layer;
 		 * verify the bytes against our stored CRC.  On mismatch, inject
 		 * a logical read failure from this (success) branch -- both
 		 * branches share the STRIPE_HANDLE tail below, and R5_ReadError
 		 * makes analyse_stripe treat the slot as failed -> reconstruct
-		 * from parity, with R5_IntegrityHeal guaranteeing the rewrite.
+		 * from the surviving blocks (which now EXCLUDE this corrupt one).
 		 * Go straight to R5_ReadError (a CRC mismatch is deterministic,
 		 * so the error-branch reread is pointless) and stay out of the
 		 * error branch's disk-fail accounting.  W3 in the plan doc.
+		 *
+		 * P2: verify PARITY slots too, not just data.  A per-block CRC
+		 * LOCATES a corrupt parity block, so a mixed data+parity scrub
+		 * excludes the corrupt parity as a decode source instead of
+		 * consuming it (closing the "trust-data flaw"), and
+		 * handle_parity_checks6 / ops_run_check_pq heal + count it via
+		 * the same R5_ReadError branch a dm-integrity EIO drives.
+		 * R5_IntegrityHeal stays DATA-only: it is the durable marker for
+		 * a data block whose R5_ReadError is cleared mid multi-pass
+		 * parity repair; parity heals via the check path, so setting the
+		 * marker there is unnecessary and this matches the dm-integrity
+		 * corrupt-parity signal (which is also data-only, :3835) exactly.
 		 */
-		if (conf->csum && !is_parity_disk(sh, i) &&
+		if (conf->csum &&
 		    !test_bit(R5_ReadRepl, &sh->dev[i].flags) &&
 		    test_bit(In_sync, &rdev->flags)) {
-			u32 want;
+			u32 want_csum;
 
-			if (raidkm_csum_lookup(conf, i, sh->sector, &want)) {
+			if (raidkm_csum_rederive(conf)) {
+				/*
+				 * P2 crash consistency (re-derive-on-resync).
+				 * After an unclean shutdown the on-disk CRC
+				 * region is stale, so verifying against it would
+				 * false-positive.  For the stripes the resync is
+				 * actually scrubbing (STRIPE_SYNCING) re-derive
+				 * the CRC from the data now on disk, overwriting
+				 * the stale entry so the map becomes authoritative
+				 * again.  (The resync confirms/recomputes parity;
+				 * a data slot gets its fresh CRC here, a parity
+				 * slot here and again on its rewrite via
+				 * ops_run_io.)  A normal read racing the resync
+				 * simply skips verify until it finishes.  This
+				 * inherits md's trust-data-on-resync boundary --
+				 * it cannot tell good data from silent rot inside
+				 * the resync scope; a scrub (which verifies
+				 * against the stored CRC) is the rot catcher.
+				 *
+				 * Only REFRESH an existing (stale) entry -- a
+				 * lookup miss means the block has no CRC yet, so
+				 * leave it absent rather than populate it.  That
+				 * keeps the initial --create resync (which also
+				 * looks like an automatic resync) from storing a
+				 * CRC-of-zeros for every block in the array.
+				 */
+				if (test_bit(STRIPE_SYNCING, &sh->state) &&
+				    raidkm_csum_lookup(conf, i, sh->sector,
+						       &want_csum))
+					raidkm_csum_store(conf, i, sh->sector,
+						raidkm_block_crc(conf,
+							sh->dev[i].page,
+							sh->dev[i].offset));
+			} else if (raidkm_csum_lookup(conf, i, sh->sector,
+						      &want_csum)) {
 				u32 got = raidkm_block_crc(conf,
 							   sh->dev[i].page,
 							   sh->dev[i].offset);
 
-				if (got != want) {
+				if (got != want_csum) {
 					pr_warn_ratelimited("md/raid:%s: native csum mismatch disk %d sector %llu (want %08x got %08x)\n",
 						mdname(conf->mddev), i,
 						(unsigned long long)s,
-						want, got);
+						want_csum, got);
 					clear_bit(R5_UPTODATE, &sh->dev[i].flags);
-					set_bit(R5_IntegrityHeal,
-						&sh->dev[i].flags);
 					set_bit(R5_ReadError,
 						&sh->dev[i].flags);
+					if (!is_parity_disk(sh, i))
+						set_bit(R5_IntegrityHeal,
+							&sh->dev[i].flags);
 				}
 			}
 		}

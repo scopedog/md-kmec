@@ -309,7 +309,7 @@ for m in $MSET; do
 		# follow-up `check` mismatch==0 (parity VALUE matches data — here
 		# mismatch_cnt IS meaningful, unlike the EIO-only data case), no residual
 		# integrity EIO (tag healed), data intact.
-		if [ "$suf" = p ] && [ "$NATIVE" != 1 ]; then   # P1a: parity/mixed heal is P2 (native verifies data only)
+		if [ "$suf" = p ]; then   # P2: native verifies parity too -> parity + mixed heal (was P1a data-only)
 			rk_dmesg_clear
 			si_restore
 			if si_locate 0; then
@@ -376,7 +376,7 @@ for m in $MSET; do
 		# to match the corrupt DATA block (the 5668-5688 flaw firing on an integrity-
 		# flagged data block) the recovered data would be WRONG.  Parity-last so parity
 		# members [k..k+m-1] row-0 blocks share the backing offset of a data block.
-		if [ "$suf" = p ] && [ "$NATIVE" != 1 ]; then   # P1a: parity/mixed heal is P2 (native verifies data only)
+		if [ "$suf" = p ]; then   # P2: native verifies parity too -> parity + mixed heal (was P1a data-only)
 			pc=$(( m / 2 )); [ "$pc" -lt 1 ] && pc=1
 			dc=$(( m - pc ))
 			[ "$dc" -gt "$k" ] && { dc=$k; pc=$(( m - dc )); }
