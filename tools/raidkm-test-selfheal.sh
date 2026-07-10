@@ -437,6 +437,49 @@ for m in $MSET; do
 			rk_dmesg_clean || rk_fail "m=$m $lbl: WARN/BUG in dmesg after remount heal"
 		fi
 
+		# --- Scenario 8: region self-integrity — a rotted csum-region page --
+		# Corrupt a WRITTEN page of member 0's on-disk checksum region.  With
+		# the per-page {self_crc,gen} trailer the kernel detects the rotted
+		# page on assemble and drops its CRCs (blocks re-derive) instead of
+		# comparing correct data against a corrupt stored CRC and triggering a
+		# SPURIOUS heal.  Disk-backed (NATIVE) only.
+		if [ "$NATIVE" = 1 ]; then
+			rk_dmesg_clear
+			si_restore                 # clean data -> CRCs
+			rk_stop                    # flush region (pages carry self_crc+gen)
+			rmemb="${SI_BACKING[0]}"   # member 0's raw backing device
+			# region page 0 = data_offset + avail_dev_size (sectors)
+			do_s=$(sudo "$MDADM" --examine "$rmemb" 2>/dev/null | \
+			       sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p')
+			av_s=$(sudo "$MDADM" --examine "$rmemb" 2>/dev/null | \
+			       sed -n 's/.*Avail Dev Size : \([0-9]*\) sectors.*/\1/p')
+			if [ -n "$do_s" ] && [ -n "$av_s" ]; then
+				sudo dd if=/dev/urandom of="$rmemb" bs=1 \
+					seek=$(( (do_s + av_s) * 512 )) count=64 \
+					conv=notrunc status=none 2>/dev/null
+				sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
+			else
+				rk_log "m=$m $lbl: could not derive region offset; S8 detect skipped"
+			fi
+			# Always reassemble so the outer cleanup finds the array UP.
+			if rk_assemble "${SI_MAPPER[@]}"; then
+				if [ -n "$do_s" ] && [ -n "$av_s" ]; then
+					h0=$(rk_healed); ok=1
+					rk_readback "$WRITE_MIB" || ok=0     # data intact
+					sudo dmesg 2>/dev/null | \
+						grep -qiE 'region page rotted' || ok=0
+					[ "$(rk_healed)" = "$h0" ] || ok=0    # no spurious heal
+					[ "$(rk_scrub)" = 0 ]     || ok=0     # scrub clean
+					[ "$ok" = 1 ] \
+					  && rk_pass "m=$m $lbl: rotted csum-region page detected, no false heal (data intact, scrub clean)" \
+					  || rk_fail "m=$m $lbl: region self-integrity FAILED (detect/data/heal/scrub)"
+				fi
+			else
+				rk_fail "m=$m $lbl: re-assemble after region corruption failed"
+			fi
+			rk_dmesg_clean || rk_fail "m=$m $lbl: WARN/BUG in dmesg after region-rot"
+		fi
+
 		si_restore                         # leave members fully readable for next --create
 		rk_stop
 	done

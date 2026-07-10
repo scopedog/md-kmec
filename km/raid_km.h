@@ -908,6 +908,10 @@ struct r5conf {
 	 */
 	struct xarray		*csum;
 	bool			csum_disk;
+	u32			csum_gen;	/* region self-integrity: per-array
+						 * csum-region generation, loaded as
+						 * the max on disk and bumped once
+						 * per flush */
 
 	struct llist_head	released_stripes;
 	wait_queue_head_t	wait_for_quiescent;

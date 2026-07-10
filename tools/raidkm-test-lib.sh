@@ -182,6 +182,9 @@ rk_create() {
 	local layout="$1"; shift
 	local n=$#
 	rk_stop
+	# A prior run may have left $MD as a regular file (a dd to $MD while the
+	# array was down creates one); mdadm then refuses "not an md array".
+	[ -e "$MD" ] && [ ! -b "$MD" ] && sudo rm -f "$MD"
 	local d
 	# With native integrity, zero the whole member so a prior array's checksum
 	# region can't leave stale CRCs behind (mdadm zeroing the reserved region at

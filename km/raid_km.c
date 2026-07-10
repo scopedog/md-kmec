@@ -1401,7 +1401,23 @@ static bool raidkm_csum_rederive(struct r5conf *conf)
  * slot means "never written" (left absent -> skip-verify).  Targets the 4 KiB
  * page/stripe build; PB-scale demand-paging is later work.
  */
-#define RAIDKM_CSUM_PER_PAGE	(PAGE_SIZE / sizeof(__le32))
+/*
+ * Region self-integrity: each 4 KiB csum page ends with an 8-byte trailer --
+ * a CRC-32C over the page's CRC array plus a generation.  gen == 0 marks a page
+ * that was never written (its blocks stay absent).  A non-zero gen whose
+ * self_crc does not match the page content marks a rotted page: its CRCs are
+ * dropped so the blocks it covers fall back to re-derive rather than
+ * false-positive a heal against a corrupt stored CRC.  The generation is a
+ * per-array counter (loaded as the max seen, bumped once per flush).
+ */
+struct raidkm_csum_trailer {
+	__le32	self_crc;
+	__le32	gen;
+};
+
+#define RAIDKM_CSUM_PER_PAGE \
+	((PAGE_SIZE - sizeof(struct raidkm_csum_trailer)) / sizeof(__le32))
+#define RAIDKM_CSUM_BODY	(RAIDKM_CSUM_PER_PAGE * sizeof(__le32))
 
 /* Region [*start, *start+*sectors) on rdev->bdev, i.e. the tail after the data
  * area.  False if the member has no room (e.g. array not created with a
@@ -1436,26 +1452,44 @@ static void raidkm_csum_load(struct r5conf *conf)
 	}
 	for (i = 0; i < conf->raid_disks; i++) {
 		struct md_rdev *rdev = conf->disks[i].rdev;
-		sector_t rstart, rsec, pg, blk = 0;
+		sector_t rstart, rsec, pg;
 
 		if (!rdev || test_bit(Faulty, &rdev->flags))
 			continue;
 		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec))
 			continue;
 		for (pg = 0; pg < rsec; pg += PAGE_SIZE >> 9) {
+			unsigned long base = (pg / (PAGE_SIZE >> 9)) *
+					     RAIDKM_CSUM_PER_PAGE;
+			struct raidkm_csum_trailer *tr;
 			__le32 *crcs;
+			u32 gen;
 			int s;
 
 			if (!sync_page_io(rdev, (rstart - rdev->data_offset) + pg,
 					  PAGE_SIZE, page, REQ_OP_READ, false))
 				break;
 			crcs = page_address(page);
-			for (s = 0; s < RAIDKM_CSUM_PER_PAGE; s++, blk++) {
+			tr = (void *)crcs + RAIDKM_CSUM_BODY;
+			gen = le32_to_cpu(tr->gen);
+			if (gen == 0)
+				continue;	/* page never written */
+			if (le32_to_cpu(tr->self_crc) !=
+			    crc32c_le(0, crcs, RAIDKM_CSUM_BODY)) {
+				pr_warn("md/raid:%s: native csum region page rotted (disk %d, page %llu); dropping its CRCs, will re-derive\n",
+					mdname(conf->mddev), i,
+					(unsigned long long)(pg / (PAGE_SIZE >> 9)));
+				continue;	/* rotted -> leave blocks absent */
+			}
+			if (gen > conf->csum_gen)
+				conf->csum_gen = gen;
+			for (s = 0; s < RAIDKM_CSUM_PER_PAGE; s++) {
 				u32 c = le32_to_cpu(crcs[s]);
 
 				if (c)
 					xa_store(conf->csum,
-						 ((unsigned long)i << 40) | blk,
+						 ((unsigned long)i << 40) |
+						 (base + s),
 						 xa_mk_value(c), GFP_KERNEL);
 			}
 		}
@@ -1480,27 +1514,36 @@ static void raidkm_csum_flush(struct r5conf *conf)
 	}
 	for (i = 0; i < conf->raid_disks; i++) {
 		struct md_rdev *rdev = conf->disks[i].rdev;
-		sector_t rstart, rsec, pg, blk = 0;
+		sector_t rstart, rsec, pg;
 
 		if (!rdev || test_bit(Faulty, &rdev->flags))
 			continue;
 		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec))
 			continue;
 		for (pg = 0; pg < rsec; pg += PAGE_SIZE >> 9) {
+			unsigned long base = (pg / (PAGE_SIZE >> 9)) *
+					     RAIDKM_CSUM_PER_PAGE;
 			__le32 *crcs = page_address(page);
+			struct raidkm_csum_trailer *tr;
 			bool any = false;
 			int s;
 
-			for (s = 0; s < RAIDKM_CSUM_PER_PAGE; s++, blk++) {
+			for (s = 0; s < RAIDKM_CSUM_PER_PAGE; s++) {
 				void *e = xa_load(conf->csum,
-						  ((unsigned long)i << 40) | blk);
+						  ((unsigned long)i << 40) |
+						  (base + s));
 				u32 c = e ? xa_to_value(e) : 0;
 
 				crcs[s] = cpu_to_le32(c);
 				any |= (c != 0);
 			}
-			if (any &&
-			    !sync_page_io(rdev, (rstart - rdev->data_offset) + pg,
+			if (!any)
+				continue;	/* page never written */
+			tr = (void *)crcs + RAIDKM_CSUM_BODY;
+			tr->gen = cpu_to_le32(conf->csum_gen + 1);
+			tr->self_crc =
+				cpu_to_le32(crc32c_le(0, crcs, RAIDKM_CSUM_BODY));
+			if (!sync_page_io(rdev, (rstart - rdev->data_offset) + pg,
 					  PAGE_SIZE, page,
 					  REQ_OP_WRITE | REQ_FUA, false))
 				pr_warn("md/raid:%s: native csum flush write failed disk %d\n",
