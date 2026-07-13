@@ -287,6 +287,9 @@ enum reconstruct_states {
 	reconstruct_state_result,
 };
 
+/* Native-checksum demand-paged region cache (defined in raid_km.c). */
+struct raidkm_csum_cache;
+
 #define DEFAULT_STRIPE_SIZE	4096
 struct stripe_head {
 	/*
@@ -322,6 +325,8 @@ struct stripe_head {
 	struct stripe_head	*batch_head; /* protected by stripe lock */
 	spinlock_t		batch_lock; /* only header's lock is useful */
 	struct list_head	batch_list; /* protected by head's batch lock*/
+	struct list_head	csum_list;  /* native csum: queued for deferred
+					     * verify (raidkm_csum_cache.vstripes) */
 
 	/**
 	 * struct stripe_operations
@@ -397,6 +402,8 @@ struct stripe_head_state {
 	int locked, uptodate, to_read, to_write, failed, written;
 	int to_fill, compute, req_compute, non_overwrite;
 	int injournal, just_cached;
+	int csum_pending;	/* native csum: R5_CsumPending blocks awaiting
+				 * deferred verify (gates handle_stripe) */
 	/* raidkm m > 2 can lose up to m disks and still reconstruct, so the
 	 * failed-slot list must hold RAIDKM_MAX_M entries (>= the raid5/6 2). */
 	int failed_num[RAIDKM_MAX_M];
@@ -467,6 +474,12 @@ enum r5dev_flags {
 				 * even when an m>2 parity repair holds the stripe
 				 * across passes.  Cleared when the heal write is
 				 * scheduled.  See handle_stripe(). */
+	R5_CsumPending,		/* raidkm native csum: a block read from disk is
+				 * UPTODATE but not yet verified.  Set in
+				 * raid5_end_read_request; handle_stripe holds the
+				 * stripe + queues the verify workqueue; the worker
+				 * fetches the tag (may block), verifies, and clears
+				 * this / sets R5_ReadError on mismatch. */
 };
 
 /*
@@ -906,7 +919,8 @@ struct r5conf {
 	 * is set the map is loaded from / flushed to the reserved tail region so
 	 * CRCs survive a remount.
 	 */
-	struct xarray		*csum;
+	struct raidkm_csum_cache *csum;	/* demand-paged region-page cache;
+					 * non-NULL == native checksum on */
 	bool			csum_disk;
 	u32			csum_gen;	/* region self-integrity: per-array
 						 * csum-region generation, loaded as

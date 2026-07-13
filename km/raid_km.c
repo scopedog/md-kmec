@@ -1338,35 +1338,65 @@ static u32 raidkm_block_crc(struct r5conf *conf, struct page *page,
 	return crc;
 }
 
-static unsigned long raidkm_csum_key(struct r5conf *conf, int member,
-				     sector_t sector)
-{
-	return ((unsigned long)member << 40) |
-	       (sector >> RAID5_STRIPE_SHIFT(conf));
-}
+/*
+ * Native checksum, demand-paged (P3, redesigned).  The reserved region holds one
+ * CRC-32C per 4 KiB block, packed RAIDKM_CSUM_PER_PAGE to a page.  A bounded LRU
+ * cache of region pages is faulted in on demand, so RAM does not scale with the
+ * array.  KEY RULE (learned the hard way): the md-thread stripe path NEVER does
+ * region I/O -- synchronous region I/O in ops_run_io/raid5_end_read_request
+ * strands in-flight stripes and hangs.  So ALL region I/O + verify + store runs
+ * in a dedicated workqueue (a sleepable context), exactly as dm-integrity's
+ * metadata_wq and ZFS's ZIO checksum stage do.  raid5_end_read_request only sets
+ * R5_CsumPending; handle_stripe holds the stripe and queues the work; the work
+ * fetches the tag (may block), verifies, and re-handles.  Step 1 = always-defer;
+ * a later step adds inline-verify-on-hit for read-latency.
+ */
+struct raidkm_csum_page {
+	struct page		*page;	/* the 4 KiB region page image */
+	unsigned long		key;	/* (member << 40) | page_index */
+	unsigned long		flags;	/* RAIDKM_CSUM_P_* (atomic bitops) */
+	struct list_head	lru;	/* raidkm_csum_cache.lru linkage */
+};
 
-static void raidkm_csum_store(struct r5conf *conf, int member,
-			      sector_t sector, u32 crc)
-{
-	void *old = xa_store(conf->csum,
-			     raidkm_csum_key(conf, member, sector),
-			     xa_mk_value(crc), GFP_NOIO);
+/* raidkm_csum_page.flags */
+#define RAIDKM_CSUM_P_DIRTY	0	/* modified since last write-back */
+#define RAIDKM_CSUM_P_REBUILD	1	/* rotted on load; slots absent until a
+					 * scrub/write repopulates them */
 
-	if (xa_is_err(old))
-		pr_warn_ratelimited("md/raid:%s: native csum store failed (%d)\n",
-				    mdname(conf->mddev), xa_err(old));
-}
+/* A region slot of 0 means "never written" (region is zero-initialised); a block
+ * whose real CRC-32C is 0 (e.g. an all-zero-parity page) must not read back as
+ * absent, so store a real 0 as this marker and map it back on read.  Cost: a
+ * genuine CRC == marker reads back as 0 (1-in-2^32, healed harmlessly). */
+#define RAIDKM_CSUM_ZERO_MARK	0xffffffffU
 
-static bool raidkm_csum_lookup(struct r5conf *conf, int member,
-			       sector_t sector, u32 *crc)
-{
-	void *e = xa_load(conf->csum, raidkm_csum_key(conf, member, sector));
+/* A deferred write-store: ops_run_io computes the crc inline (cheap) and queues
+ * this; the workqueue faults the page in (blocking) and applies it. */
+struct raidkm_csum_sreq {
+	struct list_head	link;
+	int			member;
+	unsigned long		blk;
+	u32			crc;
+};
 
-	if (!e)
-		return false;
-	*crc = xa_to_value(e);
-	return true;
-}
+struct raidkm_csum_cache {
+	struct r5conf		*conf;	/* back-pointer for the workqueue fn */
+	struct xarray		pages;	/* key -> raidkm_csum_page* */
+	struct mutex		lock;	/* guards pages + lru + nr (workqueue-only) */
+	struct list_head	lru;	/* head = most-recently-used */
+	unsigned int		nr;	/* resident pages */
+	unsigned int		max;	/* soft ceiling */
+	/* All region I/O + verify + store run here, off the stripe path. */
+	struct workqueue_struct	*wq;
+	struct work_struct	work;
+	spinlock_t		qlock;	/* guards vstripes + sreqs */
+	struct list_head	vstripes;	/* stripe_head.csum_list: need verify */
+	struct list_head	sreqs;		/* raidkm_csum_sreq: need store */
+};
+
+static unsigned int raidkm_csum_cache_pages = 8192;	/* ~32 MiB of 4 KiB pages */
+module_param(raidkm_csum_cache_pages, uint, 0644);
+MODULE_PARM_DESC(raidkm_csum_cache_pages,
+	"raidkm: max resident native-checksum region pages (soft ceiling)");
 
 /*
  * P2 crash consistency: true while an AUTOMATIC resync is in progress -- a
@@ -1437,120 +1467,369 @@ static bool raidkm_csum_region(struct r5conf *conf, struct md_rdev *rdev,
 
 /* Load persisted CRCs from every member's region into the in-core xarray on
  * assemble.  Zero on-disk slots (never-written blocks) are left absent. */
-static void raidkm_csum_load(struct r5conf *conf)
+/* --- addressing within a member's region ------------------------------ */
+static unsigned long raidkm_csum_blkidx(struct r5conf *conf, sector_t sector)
 {
-	struct page *page;
-	int i;
-
-	if (!conf || !conf->csum || !conf->csum_disk)
-		return;
-	page = alloc_page(GFP_KERNEL);
-	if (!page) {
-		pr_warn("md/raid:%s: native csum load OOM; CRCs not preloaded\n",
-			mdname(conf->mddev));
-		return;
-	}
-	for (i = 0; i < conf->raid_disks; i++) {
-		struct md_rdev *rdev = conf->disks[i].rdev;
-		sector_t rstart, rsec, pg;
-
-		if (!rdev || test_bit(Faulty, &rdev->flags))
-			continue;
-		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec))
-			continue;
-		for (pg = 0; pg < rsec; pg += PAGE_SIZE >> 9) {
-			unsigned long base = (pg / (PAGE_SIZE >> 9)) *
-					     RAIDKM_CSUM_PER_PAGE;
-			struct raidkm_csum_trailer *tr;
-			__le32 *crcs;
-			u32 gen;
-			int s;
-
-			if (!sync_page_io(rdev, (rstart - rdev->data_offset) + pg,
-					  PAGE_SIZE, page, REQ_OP_READ, false))
-				break;
-			crcs = page_address(page);
-			tr = (void *)crcs + RAIDKM_CSUM_BODY;
-			gen = le32_to_cpu(tr->gen);
-			if (gen == 0)
-				continue;	/* page never written */
-			if (le32_to_cpu(tr->self_crc) !=
-			    crc32c_le(0, crcs, RAIDKM_CSUM_BODY)) {
-				pr_warn("md/raid:%s: native csum region page rotted (disk %d, page %llu); dropping its CRCs, will re-derive\n",
-					mdname(conf->mddev), i,
-					(unsigned long long)(pg / (PAGE_SIZE >> 9)));
-				continue;	/* rotted -> leave blocks absent */
-			}
-			if (gen > conf->csum_gen)
-				conf->csum_gen = gen;
-			for (s = 0; s < RAIDKM_CSUM_PER_PAGE; s++) {
-				u32 c = le32_to_cpu(crcs[s]);
-
-				if (c)
-					xa_store(conf->csum,
-						 ((unsigned long)i << 40) |
-						 (base + s),
-						 xa_mk_value(c), GFP_KERNEL);
-			}
-		}
-	}
-	__free_page(page);
+	return sector >> RAID5_STRIPE_SHIFT(conf);
+}
+static unsigned long raidkm_csum_key(int member, unsigned long blk)
+{
+	return ((unsigned long)member << 40) | (blk / RAIDKM_CSUM_PER_PAGE);
+}
+static unsigned int raidkm_csum_slot(unsigned long blk)
+{
+	return blk % RAIDKM_CSUM_PER_PAGE;
 }
 
-/* Flush the in-core CRCs back to each member's region on a clean stop, before
- * the conf (and its rdevs) are freed, so --stop persists the map. */
-static void raidkm_csum_flush(struct r5conf *conf)
+/* --- region page I/O (BLOCKING; workqueue context only) ---------------- */
+static bool raidkm_csum_page_read(struct r5conf *conf, int m,
+				  unsigned long pgidx, struct page *page)
 {
-	struct page *page;
+	struct md_rdev *rdev = conf->disks[m].rdev;
+	sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
+
+	if (!rdev || test_bit(Faulty, &rdev->flags))
+		return false;
+	if (!raidkm_csum_region(conf, rdev, &rstart, &rsec))
+		return false;
+	if (off + (PAGE_SIZE >> 9) > rsec)		/* past region end */
+		return false;
+	return sync_page_io(rdev, (rstart - rdev->data_offset) + off,
+			    PAGE_SIZE, page, REQ_OP_READ, false);
+}
+
+static void raidkm_csum_page_write(struct raidkm_csum_cache *c,
+				   struct raidkm_csum_page *pg)
+{
+	struct r5conf *conf = c->conf;
+	int m = pg->key >> 40;
+	unsigned long pgidx = pg->key & ((1UL << 40) - 1);
+	struct md_rdev *rdev = conf->disks[m].rdev;
+	sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
+	struct raidkm_csum_trailer *tr;
+	void *crcs;
+	u32 g;
+
+	if (!conf->csum_disk || !rdev || test_bit(Faulty, &rdev->flags))
+		return;
+	if (!raidkm_csum_region(conf, rdev, &rstart, &rsec))
+		return;
+	crcs = page_address(pg->page);
+	tr = crcs + RAIDKM_CSUM_BODY;
+	g = conf->csum_gen + 1;
+	if (!g)
+		g = 1;
+	conf->csum_gen = g;
+	tr->gen = cpu_to_le32(g);
+	tr->self_crc = cpu_to_le32(crc32c_le(0, crcs, RAIDKM_CSUM_BODY));
+	if (!sync_page_io(rdev, (rstart - rdev->data_offset) + off, PAGE_SIZE,
+			  pg->page, REQ_OP_WRITE | REQ_FUA, false))
+		pr_warn_ratelimited("md/raid:%s: native csum page write failed disk %d\n",
+				    mdname(conf->mddev), m);
+}
+
+static void raidkm_csum_page_free(struct raidkm_csum_page *pg)
+{
+	__free_page(pg->page);
+	kfree(pg);
+}
+
+/* --- slot access within a resident page -------------------------------- */
+static bool raidkm_csum_get_slot(struct raidkm_csum_page *pg,
+				 unsigned long blk, u32 *crc)
+{
+	__le32 *crcs;
+	u32 c;
+
+	if (test_bit(RAIDKM_CSUM_P_REBUILD, &pg->flags))
+		return false;
+	crcs = kmap_local_page(pg->page);
+	c = le32_to_cpu(crcs[raidkm_csum_slot(blk)]);
+	kunmap_local(crcs);
+	if (!c)
+		return false;				/* never written */
+	*crc = (c == RAIDKM_CSUM_ZERO_MARK) ? 0 : c;
+	return true;
+}
+
+static void raidkm_csum_set_slot(struct raidkm_csum_page *pg,
+				 unsigned long blk, u32 crc)
+{
+	__le32 *crcs = kmap_local_page(pg->page);
+
+	crcs[raidkm_csum_slot(blk)] =
+		cpu_to_le32(crc ? crc : RAIDKM_CSUM_ZERO_MARK);
+	kunmap_local(crcs);
+	clear_bit(RAIDKM_CSUM_P_REBUILD, &pg->flags);
+	set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+}
+
+/* --- the cache (mutex-guarded; called ONLY from the workqueue) ---------- */
+/* Evict clean LRU pages until nr <= max; write dirty ones back first so they
+ * become evictable.  Caller holds c->lock. */
+static void raidkm_csum_evict_locked(struct raidkm_csum_cache *c)
+{
+	struct raidkm_csum_page *pg, *tmp;
+
+	list_for_each_entry_safe_reverse(pg, tmp, &c->lru, lru) {
+		if (c->nr <= c->max)
+			break;
+		if (test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags)) {
+			raidkm_csum_page_write(c, pg);
+			clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+		}
+		xa_erase(&c->pages, pg->key);
+		list_del(&pg->lru);
+		c->nr--;
+		raidkm_csum_page_free(pg);
+	}
+}
+
+/* Return the resident region page for `key`, faulting it in on a miss.  NULL on
+ * OOM (caller skips verify/store).  BLOCKING; caller holds c->lock. */
+static struct raidkm_csum_page *raidkm_csum_get(struct raidkm_csum_cache *c,
+						unsigned long key)
+{
+	struct r5conf *conf = c->conf;
+	struct raidkm_csum_page *pg;
+
+	pg = xa_load(&c->pages, key);
+	if (pg) {
+		list_move(&pg->lru, &c->lru);
+		return pg;
+	}
+	pg = kzalloc(sizeof(*pg), GFP_NOIO);
+	if (!pg)
+		return NULL;
+	pg->page = alloc_page(GFP_NOIO);
+	if (!pg->page) {
+		kfree(pg);
+		return NULL;
+	}
+	pg->key = key;
+	if (conf->csum_disk &&
+	    raidkm_csum_page_read(conf, key >> 40, key & ((1UL << 40) - 1),
+				  pg->page)) {
+		void *crcs = page_address(pg->page);
+		struct raidkm_csum_trailer *tr = crcs + RAIDKM_CSUM_BODY;
+
+		if (le32_to_cpu(tr->gen) == 0) {
+			clear_page(crcs);			/* never written */
+		} else if (le32_to_cpu(tr->self_crc) !=
+			   crc32c_le(0, crcs, RAIDKM_CSUM_BODY)) {
+			pr_warn_ratelimited("md/raid:%s: native csum region page rotted (disk %llu page %lu); slots absent, will re-derive\n",
+				mdname(conf->mddev), key >> 40,
+				key & ((1UL << 40) - 1));
+			clear_page(crcs);
+			set_bit(RAIDKM_CSUM_P_REBUILD, &pg->flags);
+		}
+	} else {
+		clear_page(page_address(pg->page));	/* in-core only / io err */
+	}
+	if (xa_err(xa_store(&c->pages, key, pg, GFP_NOIO))) {
+		raidkm_csum_page_free(pg);
+		return NULL;
+	}
+	list_add(&pg->lru, &c->lru);
+	c->nr++;
+	raidkm_csum_evict_locked(c);
+	return pg;
+}
+
+/* Verify one stripe's R5_CsumPending blocks (workqueue, sleepable).  This is the
+ * old inline raid5_end_read_request verify, moved off the completion so the tag
+ * fetch may block.  Mismatch feeds the shipped R5_ReadError/R5_IntegrityHeal
+ * heal.  Data AND parity are verified (matches the load-all path). */
+static void raidkm_csum_verify_stripe(struct r5conf *conf, struct stripe_head *sh)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	bool rederive = raidkm_csum_rederive(conf);
 	int i;
 
-	if (!conf || !conf->csum || !conf->csum_disk)
-		return;
-	page = alloc_page(GFP_KERNEL);
-	if (!page) {
-		pr_warn("md/raid:%s: native csum flush OOM; map NOT persisted\n",
-			mdname(conf->mddev));
-		return;
-	}
-	for (i = 0; i < conf->raid_disks; i++) {
-		struct md_rdev *rdev = conf->disks[i].rdev;
-		sector_t rstart, rsec, pg;
+	mutex_lock(&c->lock);
+	for (i = 0; i < sh->disks; i++) {
+		struct r5dev *dev = &sh->dev[i];
+		struct raidkm_csum_page *pg;
+		unsigned long blk;
+		u32 want, got;
 
-		if (!rdev || test_bit(Faulty, &rdev->flags))
+		if (!test_and_clear_bit(R5_CsumPending, &dev->flags))
 			continue;
-		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec))
-			continue;
-		for (pg = 0; pg < rsec; pg += PAGE_SIZE >> 9) {
-			unsigned long base = (pg / (PAGE_SIZE >> 9)) *
-					     RAIDKM_CSUM_PER_PAGE;
-			__le32 *crcs = page_address(page);
-			struct raidkm_csum_trailer *tr;
-			bool any = false;
-			int s;
-
-			for (s = 0; s < RAIDKM_CSUM_PER_PAGE; s++) {
-				void *e = xa_load(conf->csum,
-						  ((unsigned long)i << 40) |
-						  (base + s));
-				u32 c = e ? xa_to_value(e) : 0;
-
-				crcs[s] = cpu_to_le32(c);
-				any |= (c != 0);
+		if (!test_bit(R5_UPTODATE, &dev->flags))
+			continue;		/* raced with an error/reread */
+		blk = raidkm_csum_blkidx(conf, sh->sector);
+		pg = raidkm_csum_get(c, raidkm_csum_key(i, blk));
+		if (!pg)
+			continue;		/* OOM: skip verify this time */
+		if (rederive) {
+			/* resync: refresh an EXISTING stale entry; a miss stays
+			 * absent so --create resync doesn't store CRC-of-zeros. */
+			if (test_bit(STRIPE_SYNCING, &sh->state) &&
+			    raidkm_csum_get_slot(pg, blk, &want))
+				raidkm_csum_set_slot(pg, blk,
+					raidkm_block_crc(conf, dev->page, dev->offset));
+		} else if (raidkm_csum_get_slot(pg, blk, &want)) {
+			got = raidkm_block_crc(conf, dev->page, dev->offset);
+			if (got != want) {
+				pr_warn_ratelimited("md/raid:%s: native csum mismatch disk %d sector %llu (want %08x got %08x)\n",
+					mdname(conf->mddev), i,
+					(unsigned long long)sh->sector, want, got);
+				clear_bit(R5_UPTODATE, &dev->flags);
+				set_bit(R5_ReadError, &dev->flags);
+				if (!is_parity_disk(sh, i))
+					set_bit(R5_IntegrityHeal, &dev->flags);
 			}
-			if (!any)
-				continue;	/* page never written */
-			tr = (void *)crcs + RAIDKM_CSUM_BODY;
-			tr->gen = cpu_to_le32(conf->csum_gen + 1);
-			tr->self_crc =
-				cpu_to_le32(crc32c_le(0, crcs, RAIDKM_CSUM_BODY));
-			if (!sync_page_io(rdev, (rstart - rdev->data_offset) + pg,
-					  PAGE_SIZE, page,
-					  REQ_OP_WRITE | REQ_FUA, false))
-				pr_warn("md/raid:%s: native csum flush write failed disk %d\n",
-					mdname(conf->mddev), i);
 		}
 	}
-	__free_page(page);
+	mutex_unlock(&c->lock);
+}
+
+/* The workqueue: apply deferred stores, verify pending stripes, then re-handle
+ * each stripe.  Single-threaded (max_active 1), so the cache mutex is
+ * uncontended in step 1. */
+static void raidkm_csum_work_fn(struct work_struct *w)
+{
+	struct raidkm_csum_cache *c = container_of(w, struct raidkm_csum_cache, work);
+	struct r5conf *conf = c->conf;
+
+	for (;;) {
+		struct raidkm_csum_sreq *sr = NULL;
+		struct stripe_head *sh = NULL;
+
+		spin_lock(&c->qlock);
+		if (!list_empty(&c->sreqs)) {
+			sr = list_first_entry(&c->sreqs, struct raidkm_csum_sreq, link);
+			list_del(&sr->link);
+		} else if (!list_empty(&c->vstripes)) {
+			sh = list_first_entry(&c->vstripes, struct stripe_head, csum_list);
+			list_del_init(&sh->csum_list);
+		}
+		spin_unlock(&c->qlock);
+
+		if (sr) {
+			struct raidkm_csum_page *pg;
+
+			mutex_lock(&c->lock);
+			pg = raidkm_csum_get(c, raidkm_csum_key(sr->member, sr->blk));
+			if (pg)
+				raidkm_csum_set_slot(pg, sr->blk, sr->crc);
+			mutex_unlock(&c->lock);
+			kfree(sr);
+			continue;
+		}
+		if (sh) {
+			raidkm_csum_verify_stripe(conf, sh);
+			set_bit(STRIPE_HANDLE, &sh->state);
+			raid5_release_stripe(sh);	/* the ref taken at queue */
+			md_wakeup_thread(conf->mddev->thread);
+			continue;
+		}
+		break;
+	}
+}
+
+/* Called from handle_stripe when a stripe has R5_CsumPending blocks: hold a ref,
+ * queue it for the workqueue, and return so handle_stripe leaves it untouched
+ * until the verify completes. */
+static void raidkm_csum_queue_verify(struct r5conf *conf, struct stripe_head *sh)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	bool queued = false;
+
+	spin_lock(&c->qlock);
+	if (list_empty(&sh->csum_list)) {
+		atomic_inc(&sh->count);			/* hold across the verify */
+		list_add_tail(&sh->csum_list, &c->vstripes);
+		queued = true;
+	}
+	spin_unlock(&c->qlock);
+	if (queued)
+		queue_work(c->wq, &c->work);
+}
+
+/* Called from ops_run_io (write issue): crc computed inline, store deferred. */
+static void raidkm_csum_queue_store(struct r5conf *conf, int member,
+				    unsigned long blk, u32 crc)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	struct raidkm_csum_sreq *sr = kzalloc(sizeof(*sr), GFP_NOIO);
+
+	if (!sr)
+		return;					/* drop: re-derive backstop */
+	sr->member = member;
+	sr->blk = blk;
+	sr->crc = crc;
+	spin_lock(&c->qlock);
+	list_add_tail(&sr->link, &c->sreqs);
+	spin_unlock(&c->qlock);
+	queue_work(c->wq, &c->work);
+}
+
+/* Flush every dirty page to its region on a clean stop (drain the workqueue
+ * first so queued stores land), before the conf's rdevs are freed. */
+static void raidkm_csum_writeback(struct r5conf *conf)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	struct raidkm_csum_page *pg;
+	unsigned long key;
+
+	if (!c || !conf->csum_disk)
+		return;
+	flush_workqueue(c->wq);				/* apply queued stores */
+	mutex_lock(&c->lock);
+	xa_for_each(&c->pages, key, pg)
+		if (test_and_clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
+			raidkm_csum_page_write(c, pg);
+	mutex_unlock(&c->lock);
+}
+
+static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
+{
+	struct raidkm_csum_cache *c = kzalloc(sizeof(*c), GFP_KERNEL);
+
+	if (!c)
+		return NULL;
+	c->conf = conf;
+	xa_init(&c->pages);
+	mutex_init(&c->lock);
+	spin_lock_init(&c->qlock);
+	INIT_LIST_HEAD(&c->lru);
+	INIT_LIST_HEAD(&c->vstripes);
+	INIT_LIST_HEAD(&c->sreqs);
+	INIT_WORK(&c->work, raidkm_csum_work_fn);
+	c->max = max(raidkm_csum_cache_pages, 64u);
+	/* single-threaded (max_active 1): all region I/O + verify + store serialise
+	 * here, off the stripe path.  WQ_MEM_RECLAIM: it does I/O under pressure. */
+	c->wq = alloc_workqueue("raidkm_csum_%s",
+				WQ_MEM_RECLAIM | WQ_UNBOUND, 1, mdname(conf->mddev));
+	if (!c->wq) {
+		kfree(c);
+		return NULL;
+	}
+	return c;
+}
+
+/* Free the cache + workqueue + every resident page.  Called at free_conf. */
+static void raidkm_csum_cache_free(struct r5conf *conf)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	struct raidkm_csum_page *pg;
+	struct raidkm_csum_sreq *sr, *stmp;
+	unsigned long key;
+
+	if (!c)
+		return;
+	if (c->wq)
+		destroy_workqueue(c->wq);		/* drains pending work */
+	list_for_each_entry_safe(sr, stmp, &c->sreqs, link)
+		kfree(sr);
+	xa_for_each(&c->pages, key, pg) {
+		xa_erase(&c->pages, key);
+		raidkm_csum_page_free(pg);
+	}
+	xa_destroy(&c->pages);
+	kfree(c);
+	conf->csum = NULL;
 }
 
 static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
@@ -1610,13 +1889,15 @@ again:
 		 * R5_Wantwrite -> REQ_OP_WRITE); REQ_OP_DISCARD carries no data
 		 * so op != REQ_OP_WRITE skips it.  Batch path: the `again:` loop
 		 * (below) advances sh per batched stripe, so each stores under
-		 * its own sh->sector.  RMW + skip_copy validated in P2 via the
-		 * rand-4k + O_DIRECT soak (fio --verify + clean scrubs).
+		 * its own sh->sector.  The crc is computed inline (cheap CPU, no
+		 * sleep); the STORE is deferred to the csum workqueue -- ops_run_io
+		 * is the md-thread stripe path and must not touch the region cache
+		 * (a fault there would strand stripes).
 		 */
 		if (conf->csum && op == REQ_OP_WRITE)
-			raidkm_csum_store(conf, i, sh->sector,
-					  raidkm_block_crc(conf, dev->page,
-							   dev->offset));
+			raidkm_csum_queue_store(conf, i,
+				raidkm_csum_blkidx(conf, sh->sector),
+				raidkm_block_crc(conf, dev->page, dev->offset));
 
 		rdev = conf->disks[i].rdev;
 		rrdev = conf->disks[i].replacement;
@@ -3448,6 +3729,7 @@ static struct stripe_head *alloc_stripe(struct kmem_cache *sc, gfp_t gfp,
 		spin_lock_init(&sh->stripe_lock);
 		spin_lock_init(&sh->batch_lock);
 		INIT_LIST_HEAD(&sh->batch_list);
+		INIT_LIST_HEAD(&sh->csum_list);
 		INIT_LIST_HEAD(&sh->lru);
 		INIT_LIST_HEAD(&sh->r5c);
 		INIT_LIST_HEAD(&sh->log_list);
@@ -3888,64 +4170,20 @@ static void raid5_end_read_request(struct bio * bi)
 		 * marker there is unnecessary and this matches the dm-integrity
 		 * corrupt-parity signal (which is also data-only, :3835) exactly.
 		 */
+		/*
+		 * Native checksum: the read succeeded at the block layer.  Do NOT
+		 * verify here -- this is the bio completion (softirq, cannot sleep)
+		 * and the demand-paged tag may need a BLOCKING fetch.  Just mark the
+		 * block pending; handle_stripe holds the stripe and the csum
+		 * workqueue does the fetch + verify (raidkm_csum_verify_stripe),
+		 * feeding a mismatch into the shipped R5_ReadError/R5_IntegrityHeal
+		 * heal.  Data AND parity are marked (parity locates a corrupt parity
+		 * block for a mixed scrub); the worker handles rederive-on-resync.
+		 */
 		if (conf->csum &&
 		    !test_bit(R5_ReadRepl, &sh->dev[i].flags) &&
-		    test_bit(In_sync, &rdev->flags)) {
-			u32 want_csum;
-
-			if (raidkm_csum_rederive(conf)) {
-				/*
-				 * P2 crash consistency (re-derive-on-resync).
-				 * After an unclean shutdown the on-disk CRC
-				 * region is stale, so verifying against it would
-				 * false-positive.  For the stripes the resync is
-				 * actually scrubbing (STRIPE_SYNCING) re-derive
-				 * the CRC from the data now on disk, overwriting
-				 * the stale entry so the map becomes authoritative
-				 * again.  (The resync confirms/recomputes parity;
-				 * a data slot gets its fresh CRC here, a parity
-				 * slot here and again on its rewrite via
-				 * ops_run_io.)  A normal read racing the resync
-				 * simply skips verify until it finishes.  This
-				 * inherits md's trust-data-on-resync boundary --
-				 * it cannot tell good data from silent rot inside
-				 * the resync scope; a scrub (which verifies
-				 * against the stored CRC) is the rot catcher.
-				 *
-				 * Only REFRESH an existing (stale) entry -- a
-				 * lookup miss means the block has no CRC yet, so
-				 * leave it absent rather than populate it.  That
-				 * keeps the initial --create resync (which also
-				 * looks like an automatic resync) from storing a
-				 * CRC-of-zeros for every block in the array.
-				 */
-				if (test_bit(STRIPE_SYNCING, &sh->state) &&
-				    raidkm_csum_lookup(conf, i, sh->sector,
-						       &want_csum))
-					raidkm_csum_store(conf, i, sh->sector,
-						raidkm_block_crc(conf,
-							sh->dev[i].page,
-							sh->dev[i].offset));
-			} else if (raidkm_csum_lookup(conf, i, sh->sector,
-						      &want_csum)) {
-				u32 got = raidkm_block_crc(conf,
-							   sh->dev[i].page,
-							   sh->dev[i].offset);
-
-				if (got != want_csum) {
-					pr_warn_ratelimited("md/raid:%s: native csum mismatch disk %d sector %llu (want %08x got %08x)\n",
-						mdname(conf->mddev), i,
-						(unsigned long long)s,
-						want_csum, got);
-					clear_bit(R5_UPTODATE, &sh->dev[i].flags);
-					set_bit(R5_ReadError,
-						&sh->dev[i].flags);
-					if (!is_parity_disk(sh, i))
-						set_bit(R5_IntegrityHeal,
-							&sh->dev[i].flags);
-				}
-			}
-		}
+		    test_bit(In_sync, &rdev->flags))
+			set_bit(R5_CsumPending, &sh->dev[i].flags);
 	} else {
 		int retry = 0;
 		int set_bad = 0;
@@ -6385,8 +6623,15 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 		 * ops_complete_biofill is guaranteed to be inactive
 		 */
 		if (test_bit(R5_UPTODATE, &dev->flags) && dev->toread &&
-		    !test_bit(STRIPE_BIOFILL_RUN, &sh->state))
+		    !test_bit(STRIPE_BIOFILL_RUN, &sh->state) &&
+		    !test_bit(R5_CsumPending, &dev->flags))
 			set_bit(R5_Wantfill, &dev->flags);
+
+		/* native csum: a block read from disk but not yet verified holds
+		 * the whole stripe -- handle_stripe queues the verify workqueue and
+		 * returns until it clears, so we only ever act on verified blocks. */
+		if (test_bit(R5_CsumPending, &dev->flags))
+			s->csum_pending++;
 
 		/* now count some things */
 		if (test_bit(R5_LOCKED, &dev->flags))
@@ -6714,6 +6959,20 @@ static void handle_stripe(struct stripe_head *sh)
 		/* There is nothing for the blocked_rdev to block */
 		rdev_dec_pending(s.blocked_rdev, conf->mddev);
 		s.blocked_rdev = NULL;
+	}
+
+	/*
+	 * Native checksum: if any block was read from disk but not yet verified,
+	 * hold the WHOLE stripe.  Queue the csum workqueue (it takes a ref, fetches
+	 * the tag -- which may block -- verifies, then re-handles the stripe) and
+	 * return without processing.  We never return or reconstruct from an
+	 * unverified block, matching load-all's "handle_stripe sees only verified
+	 * blocks" guarantee.  STRIPE_HANDLE is intentionally NOT set here -- the
+	 * worker sets it after verifying so the stripe re-enters handle_stripe.
+	 */
+	if (s.csum_pending) {
+		raidkm_csum_queue_verify(conf, sh);
+		goto finish;
 	}
 
 	if (s.to_fill && !test_bit(STRIPE_BIOFILL_RUN, &sh->state)) {
@@ -10554,10 +10813,7 @@ static void free_conf(struct r5conf *conf)
 	bioset_exit(&conf->bio_split);
 	kfree(conf->stripe_hashtbl);
 	kfree(conf->pending_data);
-	if (conf->csum) {
-		xa_destroy(conf->csum);
-		kfree(conf->csum);
-	}
+	raidkm_csum_cache_free(conf);
 	kfree(conf->ec_a_matrix);
 	kfree(conf->ec_g_tbls_gfni);
 	kfree(conf->ec_g_tbls_base);
@@ -10895,15 +11151,14 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	if (conf->level == RAID_KM_LEVEL) {
 		conf->m = raidkm_layout_m(mddev->new_layout);
 		conf->rotating = raidkm_layout_is_rotating(mddev->new_layout);
-		/* Native checksum: disk-backed (SB layout bit, P1b) and/or in-core
-		 * (native_csum module param, P1a).  Either allocates the CRC map;
-		 * csum_disk additionally loads/persists it in raid5_run/raid5_free. */
+		/* Native checksum: disk-backed (SB layout bit) and/or in-core
+		 * (native_csum module param).  Allocate the demand-paged region
+		 * cache + its workqueue; csum_disk additionally persists via the
+		 * reserved tail region (writeback on stop). */
 		conf->csum_disk = raidkm_layout_has_csum(mddev->new_layout);
 		if (native_csum || conf->csum_disk) {
-			conf->csum = kzalloc(sizeof(*conf->csum), GFP_KERNEL);
-			if (conf->csum)
-				xa_init(conf->csum);
-			else
+			conf->csum = raidkm_csum_cache_alloc(conf);
+			if (!conf->csum)
 				pr_warn("md/raid:%s: native csum alloc failed; disabled\n",
 					mdname(mddev));
 		}
@@ -11481,8 +11736,8 @@ static int raid5_run(struct mddev *mddev)
 	if (log_init(conf, journal_dev, raid5_has_ppl(conf)))
 		goto abort;
 
-	/* P1b native checksum: load persisted CRCs from the reserved region. */
-	raidkm_csum_load(conf);
+	/* Native checksum: region pages fault in on demand (no load at assemble),
+	 * so this scales past a RAM-sized CRC map. */
 
 	return 0;
 abort:
@@ -11498,9 +11753,9 @@ static void raid5_free(struct mddev *mddev, void *priv)
 {
 	struct r5conf *conf = priv;
 
-	/* P1b native checksum: persist the CRC map to the reserved region on a
+	/* Native checksum: drain the workqueue + flush dirty region pages on a
 	 * clean stop, before the conf and its rdevs go away. */
-	raidkm_csum_flush(conf);
+	raidkm_csum_writeback(conf);
 	free_conf(conf);
 	mddev->to_remove = &raid5_attrs_group;
 }
