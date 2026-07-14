@@ -1405,6 +1405,8 @@ struct raidkm_csum_shard {
 	struct raidkm_csum_cache *cache;	/* back-ptr (conf + wq) */
 	struct xarray		pages;	/* key -> raidkm_csum_page* */
 	struct xarray		pending;	/* pkey -> xa_mk_value(crc) */
+	atomic_t		pending_nr;	/* entries in `pending` (soft cap) */
+	wait_queue_head_t	pending_waitq;	/* writers throttled at the cap */
 	struct page		*bounce;	/* flush snapshot (under lock) */
 	struct mutex		lock;	/* guards pages + lru + nr + bounce */
 	struct list_head	lru;	/* head = most-recently-used */
@@ -1414,6 +1416,14 @@ struct raidkm_csum_shard {
 	spinlock_t		qlock;	/* guards vstripes (irq-safe: endio queues) */
 	struct list_head	vstripes;	/* stripe_head.csum_list: need verify */
 };
+
+/* Soft cap on parked stores per shard.  Without it, a first-write flood over a
+ * cold array parks one entry per written block (a 48 GiB prewrite measured
+ * ~12.6M entries ≈ ~100 MB transient).  At the cap the WRITER is throttled
+ * (see raidkm_csum_store) until the worker drains -- bounding the memory to
+ * ~a few hundred KB per shard while cold pages fault in; once resident,
+ * stores land directly and never park. */
+#define RAIDKM_CSUM_PENDING_MAX	8192
 
 struct raidkm_csum_cache {
 	struct r5conf		*conf;	/* back-pointer for the workqueue fn */
@@ -1852,12 +1862,28 @@ static void raidkm_csum_store(struct r5conf *conf, int member,
 		spin_unlock(&pg->slock);
 	}
 	rcu_read_unlock();
+	/* Bounded park: at the per-shard cap, THROTTLE the writer until the
+	 * worker drains below it.  ops_run_io may sleep (GFP_NOIO below is
+	 * precedent), and the worker's progress -- region faults straight to
+	 * member devices -- does not depend on the blocked stripe path, so
+	 * this is pure backpressure, not a deadlock cycle.  The timeout is an
+	 * escape hatch: briefly exceeding a soft cap beats wedging writes if
+	 * the worker is stalled (e.g. failing-member region I/O).  The
+	 * supersede path above replaces in place and never counts. */
+	if (atomic_read(&s->pending_nr) >= RAIDKM_CSUM_PENDING_MAX) {
+		queue_work(c->wq, &s->work);
+		wait_event_timeout(s->pending_waitq,
+				   atomic_read(&s->pending_nr) <
+					RAIDKM_CSUM_PENDING_MAX,
+				   5 * HZ);
+	}
 	/* GFP_NOIO, not NOWAIT: a failed insert leaves the on-region slot
 	 * STALE (a false mismatch waiting to happen), so try as hard as the
 	 * old kzalloc(GFP_NOIO) sreq path did.  ops_run_io context may
 	 * reclaim (no fs/io recursion). */
 	if (xa_err(xa_store(&s->pending, pk, xa_mk_value(crc), GFP_NOIO)))
 		return;
+	atomic_inc(&s->pending_nr);
 	queue_work(c->wq, &s->work);
 }
 
@@ -1964,7 +1990,9 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 			 * drops the store: the on-region slot stays STALE,
 			 * which a later read false-mismatches on and the
 			 * confirmed heal-rewrite then repairs. */
-			xa_cmpxchg(&s->pending, idx, e, NULL, GFP_NOWAIT);
+			if (xa_cmpxchg(&s->pending, idx, e, NULL,
+				       GFP_NOWAIT) == e)
+				atomic_dec(&s->pending_nr);
 			did = true;
 			if (!--budget)
 				/* bounded pass: a sustained store flood must
@@ -1972,6 +2000,8 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 				 * one is a PARKED read) */
 				break;
 		}
+		if (did)
+			wake_up(&s->pending_waitq);	/* writers at the cap */
 
 		spin_lock_irqsave(&s->qlock, flags);
 		if (!list_empty(&s->vstripes)) {
@@ -2102,6 +2132,8 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 		s->max = per;
 		xa_init(&s->pages);
 		xa_init(&s->pending);
+		atomic_set(&s->pending_nr, 0);
+		init_waitqueue_head(&s->pending_waitq);
 		mutex_init(&s->lock);
 		spin_lock_init(&s->qlock);
 		INIT_LIST_HEAD(&s->lru);
