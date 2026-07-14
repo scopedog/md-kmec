@@ -160,4 +160,8 @@ benchmark was re-run after the fixes (table above).
   2^32).  Legacy raw-marker slots written by pre-fold kernels mismatch once,
   heal, and re-store folded (self-converging).  Regression test: csum-thrash
   T5 (crafted 4092×00 + 54 64 1f 64 block, whole-block CRC == 0xffffffff).
-- KASAN/lockdep pass over the new RCU/slock paths on the debug kernel.
+- ~~KASAN/lockdep pass over the new RCU/slock paths on the debug kernel~~ —
+  DONE: functional 12/0 + csum-thrash 7/7 + selfheal NATIVE=1 60/0 on a
+  6.12.0 RHEL-derived kernel with KASAN + PROVE_LOCKING + PROVE_RCU +
+  DEBUG_OBJECTS_RCU_HEAD + DEBUG_ATOMIC_SLEEP; zero KASAN/lockdep/RCU/ODEBUG
+  splats, lockdep still armed (debug_locks=1) after the full run.
