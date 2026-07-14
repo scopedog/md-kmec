@@ -103,7 +103,8 @@ These are load-bearing for the design and not up for negotiation:
 | GFNI cross-validation of degraded write + recovery | ✅ done (2026-05-25) — degraded-write matrix + hot-replace rebuilds repeated on an i5-1340P (GFNI): 10/10 pass, exercising the `ec_encode_data_avx2_gfni` path. The KVM testbed has no GFNI, so this is the only coverage of the GFNI EC variants under the new write/recovery scheduling |
 | **Device-mapper: drive raidkm via the kernel `dm-raid` target** (`dmsetup`) | ✅ done (2026-06-05) — level 71 is reachable through the in-tree `dm-raid` target with **no new dm target** (`dmsetup create … raid raidkm <chunk> parity_count <m> …`); m + rotating ride in the dm table, a `FEATURE_FLAG_RAIDKM` superblock bit keeps stock dm-raid from touching a raidkm SB. Phase 1 (create + I/O + degraded + scrub + reassembly) and Phase 2 (rebuild via reload + `rebuild <idx>`) validated 21/21 base + 51/51 GFNI, m=2..6. Reshape via dm is **gated off** (a hand-driven dmsetup grow corrupts — needs LVM's data-offset positioning). The `dm-raid.c` changes live in the [mdraid](https://github.com/scopedog/mdraid) fork. See `notes/dm-raid-design.md` |
 | **LVM-managed raidkm** (`lvcreate --type raidkm`) | ✅ done (2026-06-05) — the lvm2 raidkm fork provisions level-71 LVs via two segtypes `raidkm` (rotating) / `raidkm_n` (parity-last) carrying `parity_count` (m). Validated base + GFNI, m=2/3/4: create/activate/I/O/reassembly/degraded; `lvconvert --repair` (raidkm-aware leg replacement + rebuild); and **dmeventd** monitoring + auto-repair (level-agnostic plugin, no code change). Reshape via dm/LVM is out of scope (the data-offset out-of-place reshape doesn't fit raidkm — mdadm-only); the kernel reshape gate stays on. See `notes/dm-raid-design.md` |
-| **Checksum-driven self-healing** — reconstruct silently-corrupt blocks from parity, up to m per stripe | ✅ done (2026-07-02) — stacked on a per-block integrity layer (`dm-integrity` today; T10-PI passthrough next), md-kmec turns an integrity-flagged read error into an m-erasure **reconstruction**: the corrupt block is rebuilt from parity and rewritten, on both the read path and the m-way scrub, with mixed data+parity corruption healed in a **single repair pass** (durable `R5_IntegrityHeal` marker). A read-only `healed_blocks` sysfs counter reports repairs. **Validated to m=8** — heals 8 simultaneous silent corruptions in one stripe (data-only, parity-only, and mixed 4+4), deterministically, beyond RAID-Z3's 3. The integrity layer supplies the *detection*; md-kmec supplies the *reconstruction* (it consumes checksums, it does not reinvent them). See `tools/raidkm-test-selfheal.sh` |
+| **Checksum-driven self-healing** — reconstruct silently-corrupt blocks from parity, up to m per stripe | ✅ done (2026-07-02) — driven by a per-block integrity signal (md-kmec's own **native checksums**, next row, or a stacked `dm-integrity`; T10-PI passthrough next), md-kmec turns an integrity-flagged read error into an m-erasure **reconstruction**: the corrupt block is rebuilt from parity and rewritten, on both the read path and the m-way scrub, with mixed data+parity corruption healed in a **single repair pass** (durable `R5_IntegrityHeal` marker). A read-only `healed_blocks` sysfs counter reports repairs. **Validated to m=8** — heals 8 simultaneous silent corruptions in one stripe (data-only, parity-only, and mixed 4+4), deterministically, beyond RAID-Z3's 3. The integrity layer supplies the *detection*; md-kmec supplies the *reconstruction*. See `tools/raidkm-test-selfheal.sh` (runs on native checksums with `NATIVE=1`, or on `dm-integrity`) |
+| **Native per-block checksums** — built-in per-4K CRC-32C integrity, no stacking required | ✅ done (2026-07-14) — `mdadm --create … --integrity=crc32c` gives every 4 KiB block a CRC-32C that raidkm computes, stores, and verifies itself. CRCs persist in a **reserved region** at each member's tail (~0.1% of capacity, carved at create; SB layout bit `0x200`) in self-checking pages (per-page CRC + generation trailer, so a rotted region page is detected and dropped, never trusted), served through a bounded **demand-paged cache** (`raidkm_csum_cache_pages`, default 8192 pages ≈ 32 MiB; size it ≥ `member_blocks/1022 × members` to cover the working set — RAM does not scale with array size). Reads verify **inline in the bio completion** (lock-free expected-CRC lookup + `crc32c`, the dm-integrity inline-mode shape) including a **verified chunk-aligned read bypass**; stores land at write issue; a fast-path mismatch is never trusted — it is **rechecked** through the stripe cache before feeding the self-heal above. Real-NVMe validated (8× local SSD, m=2, fio direct): **reads and writes at 96–101% of the no-checksum baseline** (random read 100.0%), ahead of `dm-integrity` **bitmap** on all four workloads and of **journal** on writes (2.1–2.3×) and random read (1.26×), tying it on sequential read — with 0 false mismatches. Crash semantics: CRCs are recomputed over the resync window after an unclean shutdown (same class as dm-integrity bitmap; journal's crash-atomic tags are the stronger guarantee its ~2× write cost buys). Concurrency-hardened by a three-lens adversarial review (verify-fence ordering, workqueue isolation, rdev pinning). Design + benchmark: `notes/native-checksum-read-redesign-2026-07-14.md`; gates: `tools/raidkm-test-csum-thrash.sh` (cache-eviction round-trip) and the self-heal suite in `NATIVE=1` mode |
 
 ### How level 71 is integrated into raid5.c
 
@@ -471,13 +472,23 @@ reshape after losing members mid-flight is not yet supported (`migrate_band` is
 non-degraded-read only) — see `notes/reshape-cow-design.md` §6/§9.  Without the
 fault-inject build the script auto-runs Tier 0 + a best-effort timed crash.
 
-**Self-healing suite** (`tools/raidkm-test-selfheal.sh`, needs `integritysetup` from the
-`cryptsetup` package): stacks raidkm on `dm-integrity` members, writes data, then injects
-*silent* corruption directly on the raw backing store (bit-rot the integrity layer flags as an
-EIO), and verifies md-kmec **reconstructs the flagged block from parity** — on the read path and
-the m-way scrub, for data-only, parity-only, and mixed data+parity corruption up to m per stripe,
-confirming the `healed_blocks` counter advances. **Validated to m=8** (8 silent corruptions healed
-in one stripe, beyond RAID-Z3's 3).
+**Self-healing suite** (`tools/raidkm-test-selfheal.sh`): writes data, injects *silent*
+corruption directly on the raw backing store, and verifies md-kmec **reconstructs the corrupt
+block from parity** — on the read path and the m-way scrub, for data-only, parity-only, and
+mixed data+parity corruption up to m per stripe, confirming the `healed_blocks` counter
+advances. Runs in two modes: `NATIVE=1` uses raidkm's built-in checksums (also covers
+detection-after-remount from the persisted CRC region, and rotted-region-page handling — no
+false heal); the default stacks raidkm on `dm-integrity` members (needs `integritysetup` from
+the `cryptsetup` package). **Validated to m=8** (8 silent corruptions healed in one stripe,
+beyond RAID-Z3's 3).
+
+**Native-checksum cache-thrash suite** (`tools/raidkm-test-csum-thrash.sh`, `NATIVE=1`):
+drives an array whose CRC-region footprint is several times the cache ceiling, so region pages
+are continuously faulted, evicted, written back, and re-faulted, and asserts both directions of
+the round-trip: no false mismatch or spurious heal across evict+reload, fio data-verify clean
+under the churn, a REAL corruption of a block whose CRC page was evicted is still detected and
+healed after re-fault, and a final scrub reports zero mismatches. This is the standing gate for
+the demand-paged cache and the inline-verify engine.
 
 ## Repository layout
 
@@ -496,6 +507,8 @@ md-kmec/
 │   ├── raidkm-test-grow-traditional.sh    # stock --grow --raid-devices syntax (one-line + two-step)
 │   ├── raidkm-test-reshape-concurrent.sh  # I/O concurrent with a throttled reshape (dual EC tables)
 │   ├── raidkm-test-reshape-crash.sh    # power-loss/torn-write recovery of the COW reshape (fault-inject build)
+│   ├── raidkm-test-selfheal.sh        # checksum-driven self-heal (NATIVE=1 or dm-integrity)
+│   ├── raidkm-test-csum-thrash.sh     # native-checksum region-cache eviction round-trip
 │   ├── raidkm-standard-benchmark.sh   # fio harness, reused from prototype
 │   └── raidkm-create.sh               # sysfs array creation; needs adapting
 │                                    # to "raidkm" name / level 71
