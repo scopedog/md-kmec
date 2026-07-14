@@ -18,6 +18,10 @@
 #        the page is re-faulted from the region (rules out LOSS of the CRC).
 #   (T4) a mixed random read/write churn under the tiny cache stays clean, and a
 #        final scrub reports mismatch==0, with no WARN/BUG/KASAN in dmesg.
+#   (T5) ZERO_MARK escape — a block whose GENUINE CRC-32C is 0xffffffff (the
+#        slot encoding's crc-0 marker) must read back clean, repeatedly and
+#        across a stop/re-assemble.  Pre-fold kernels stored it as the raw
+#        marker, decoded expected-0, and heal-looped on every read.
 #
 # Disk-backed native checksum only (the region is where pages page to/from).
 #
@@ -174,6 +178,59 @@ else
 			|| rk_log "T3: healed_blocks $th0->$th1 (best-effort; detection+data are the assertion)"
 		rk_dmesg_clean || rk_fail "T3: WARN/BUG in dmesg after region-round-trip heal"
 	fi
+fi
+
+# ---- T5: ZERO_MARK alias block (genuine CRC == 0xffffffff) ------------------
+# 4092 zero bytes + 54 64 1f 64 is a 4 KiB block whose CRC-32C is exactly
+# 0xffffffff (zeros leave the CRC register at 0; the 4-byte tail forces the
+# target — cross-checked against two independent CRC-32C implementations).
+# Unescaped, the store collides with the slot encoding's crc-0 marker and the
+# block false-mismatches + heals on EVERY read, forever.  With the fold, both
+# sides canonicalise to 0xfffffffe and the block is just a block.
+if [ ! -b "$MD" ]; then
+	rk_fail "T5: array not assembled (T3 wreckage?) — skipping alias test"
+else
+	alias_blk="$RK_TMP/alias.blk"
+	head -c 4092 /dev/zero > "$alias_blk"
+	printf '\x54\x64\x1f\x64' >> "$alias_blk"
+	OFFB=$((1024 * 1024 / BLK))		# 1 MiB in, clear of T3's block 0
+	rk_dmesg_clear
+	a0=$(healed)
+	sudo dd if="$alias_blk" of="$MD" bs="$BLK" seek="$OFFB" count=1 \
+		oflag=direct conv=notrunc status=none 2>/dev/null
+	# Repeated O_DIRECT reads each re-verify via the bypass path (no stripe
+	# cache to hide behind); pre-fold every one of these heals.
+	t5_ok=yes
+	for i in 1 2 3 4; do
+		sudo dd if="$MD" of="$RK_TMP/alias.rd" bs="$BLK" skip="$OFFB" count=1 \
+			iflag=direct status=none 2>/dev/null
+		cmp -s "$alias_blk" "$RK_TMP/alias.rd" || t5_ok=no
+	done
+	a1=$(healed)
+	if [ "$t5_ok" = yes ] && no_mismatch && [ "$a1" = "$a0" ]; then
+		rk_pass "T5: CRC==0xffffffff alias block reads clean 4x (no mismatch, healed $a0->$a1)"
+	else
+		rk_fail "T5: alias block misbehaved (data_ok=$t5_ok healed $a0->$a1) — ZERO_MARK escape broken"
+		sudo dmesg 2>/dev/null | grep -iE 'native csum mismatch' | tail -4 | sed 's/^/      · /'
+	fi
+	# Persistence: the folded slot must round-trip through the on-disk region.
+	rk_stop
+	rk_dmesg_clear
+	if ! rk_assemble "${MEMBERS[@]}"; then
+		rk_fail "T5: re-assemble for alias persistence check failed"
+	else
+		a2=$(healed)
+		sudo dd if="$MD" of="$RK_TMP/alias.rd2" bs="$BLK" skip="$OFFB" count=1 \
+			iflag=direct status=none 2>/dev/null
+		a3=$(healed)
+		if cmp -s "$alias_blk" "$RK_TMP/alias.rd2" && no_mismatch && [ "$a3" = "$a2" ]; then
+			rk_pass "T5: alias block clean after stop/re-assemble (slot persisted folded)"
+		else
+			rk_fail "T5: alias block dirty after re-assemble (healed $a2->$a3)"
+			sudo dmesg 2>/dev/null | grep -iE 'native csum mismatch' | tail -4 | sed 's/^/      · /'
+		fi
+	fi
+	rk_dmesg_clean || rk_fail "T5: WARN/BUG in dmesg during alias-block test"
 fi
 
 # ---- T4 (cont.): final scrub must be clean ---------------------------------

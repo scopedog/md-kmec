@@ -1329,6 +1329,24 @@ module_param(native_csum, bool, 0644);
 MODULE_PARM_DESC(native_csum,
 	"raidkm P1a: compute/verify in-core per-4KiB CRC-32C (no persistence)");
 
+/* A region slot of 0 means "never written" (region is zero-initialised); a block
+ * whose real CRC-32C is 0 (the common all-zeroes block) must not read back as
+ * absent, so a real 0 is stored as this marker and mapped back on read. */
+#define RAIDKM_CSUM_ZERO_MARK	0xffffffffU
+
+/* Escape encoding for the marker collision: a block whose GENUINE CRC equals
+ * ZERO_MARK would round-trip as expected-0 and heal-loop on every read, so
+ * every data-block CRC is folded to ZERO_MARK-1 at COMPUTATION time -- store
+ * and verify sides alike, so compares still work on a single value and the
+ * slot encoding above stays unambiguous.  Cost: corruption that flips a
+ * block's CRC between ZERO_MARK and ZERO_MARK-1 is undetected (one value out
+ * of 2^32).  A legacy slot written as raw ZERO_MARK by a pre-fold kernel
+ * decodes as expected-0, mismatches once, and the heal re-stores it folded. */
+static inline u32 raidkm_csum_fold(u32 crc)
+{
+	return crc == RAIDKM_CSUM_ZERO_MARK ? RAIDKM_CSUM_ZERO_MARK - 1 : crc;
+}
+
 static u32 raidkm_block_crc(struct r5conf *conf, struct page *page,
 			    unsigned int offset)
 {
@@ -1336,7 +1354,7 @@ static u32 raidkm_block_crc(struct r5conf *conf, struct page *page,
 	u32 crc = crc32c_le(0, addr + offset, RAID5_STRIPE_SIZE(conf));
 
 	kunmap_local(addr);
-	return crc;
+	return raidkm_csum_fold(crc);
 }
 
 /*
@@ -1383,15 +1401,6 @@ struct raidkm_csum_page {
 #define RAIDKM_CSUM_P_DIRTY	0	/* modified since last write-back */
 #define RAIDKM_CSUM_P_REBUILD	1	/* rotted on load; slots absent until a
 					 * scrub/write repopulates them */
-
-/* A region slot of 0 means "never written" (region is zero-initialised); a block
- * whose real CRC-32C is 0 (e.g. an all-zero-parity page) must not read back as
- * absent, so store a real 0 as this marker and map it back on read.  Cost: a
- * block whose genuine CRC equals the marker (1-in-2^32 per block) reads back as
- * expected-0, so every read of it false-mismatches and heal-rewrites the same
- * bytes -- data is always served correctly (reconstruction reproduces it), but
- * the cycle never converges.  Accepted; a fix needs an escape encoding. */
-#define RAIDKM_CSUM_ZERO_MARK	0xffffffffU
 
 /* The cache is SHARDED by region-page index (page_index % nr_shards): a region
  * page (member,page_index) is owned by exactly one shard, so it is
@@ -7918,6 +7927,7 @@ static int raidkm_csum_verify_abio(struct r5conf *conf, struct bio *bio,
 			if (done < RAID5_STRIPE_SIZE(conf))
 				continue;
 			done = 0;
+			crc = raidkm_csum_fold(crc);
 			if (may_block) {
 				struct raidkm_csum_shard *s =
 					raidkm_csum_shard_for(conf->csum, blk);

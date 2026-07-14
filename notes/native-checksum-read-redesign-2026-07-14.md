@@ -150,5 +150,14 @@ benchmark was re-run after the fixes (table above).
 - Last ~4% of sequential read vs baseline/journal: inline bypass verify costs
   ~13 µs per 64K chunk in completion context.  If it matters: defer verify of
   bios above a size threshold to the concurrent wq.
-- Auto-size the CRC cache from geometry (above).
+- ~~Auto-size the CRC cache from geometry~~ — DONE (raidkm_csum_cache_pages=0
+  auto-sizes from geometry, clamped to ~1.6% RAM).
+- ~~ZERO_MARK alias (a block whose genuine CRC is 0xffffffff heal-looped on
+  every read)~~ — DONE: raidkm_csum_fold() canonicalises 0xffffffff→0xfffffffe
+  at CRC-computation time on both store and verify sides, so the raw marker
+  never exists and the slot encoding stays unambiguous.  Cost: a corruption
+  flipping a block's CRC between those two values is undetected (one value in
+  2^32).  Legacy raw-marker slots written by pre-fold kernels mismatch once,
+  heal, and re-store folded (self-converging).  Regression test: csum-thrash
+  T5 (crafted 4092×00 + 54 64 1f 64 block, whole-block CRC == 0xffffffff).
 - KASAN/lockdep pass over the new RCU/slock paths on the debug kernel.
