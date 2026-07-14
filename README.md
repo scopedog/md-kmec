@@ -366,6 +366,40 @@ restored.  Reproduce stock raid6 numbers by `xzcat`ing
 `/lib/modules/$(uname -r)/kernel/drivers/md/raid456.ko.xz` into a writable file
 and `insmod`ing it instead of raid_km.
 
+### Benchmark — native checksums vs no checksum vs dm-integrity (real NVMe)
+
+Cost of the built-in per-4K CRC-32C integrity (`--integrity=crc32c`), measured
+2026-07-14 on **real hardware**: GCP `n2-standard-32` (32 vCPU, AVX-512),
+**8 × 375 G local NVMe SSD**, RHEL 10.2 (`6.12.0-211.16.1.el10`).  raidkm m=2
+rotating (6 data + 2 parity), 64 KiB chunk, 8 GiB/member, `--assume-clean` +
+full-stripe prewrite; fio `--direct=1 --iodepth=32`, 30 s per point (seq =
+`bs=1M`, rand = `bs=4k`; seq read 4 jobs, rand read 16 jobs, rand write 4
+jobs); CRC region cache sized to cover the working set (20480 pages ≈ 80 MiB).
+The dm-integrity columns run the *same* raidkm array (checksums off) over 8 ×
+`integritysetup` crc32c members — journal is its crash-atomic default, bitmap
+its fast mode.  Percentages are relative to the no-checksum baseline:
+
+| Workload | no checksum | **native checksum** | dm-integrity journal | dm-integrity bitmap |
+|---|---|---|---|---|
+| Sequential write (MB/s) | 2245 | **2264 (101%)** | 1088 (48%) | 2230 (99%) |
+| Random write (K IOPS)   | 97.2 | **93.2 (96%)**  | 40.8 (42%) | 78.5 (81%) |
+| Sequential read (MB/s)  | 5626 | **5599 (99.5%)**| 5624 (100%)| 5014 (89%) |
+| Random read (K IOPS)    | 1236.2 | **1235.9 (100.0%)** | 978.0 (79%) | 934.4 (76%) |
+
+**Verified integrity at effectively no cost**: reads and writes run at
+96–101% of the raw array — ahead of dm-integrity **bitmap** on all four
+workloads and of **journal** on writes (2.1–2.3×) and random read (1.26×),
+tying it on sequential read (0.4% apart, inside run-to-run variance).  Zero
+false checksum mismatches across every run.  The read side is the 2026-07-14
+**read-first redesign**: verification runs inline in the bio completion
+(lock-free tag lookup + `crc32c`, no thread handoff) with a verified
+chunk-aligned read bypass — before it, random read sat at 37% of baseline.
+Fair-comparison note: dm-integrity *journal* is crash-atomic (tags+data
+survive power loss torn-write-free), a stronger guarantee than native or
+bitmap, both of which recompute checksums over the resync window after an
+unclean shutdown — that guarantee is what journal's ~2× write cost buys.
+Design + full write-up: `notes/native-checksum-read-redesign-2026-07-14.md`.
+
 ### Cost of `--grow --add-data` (online capacity grow)
 
 Same VM/ramdisks, m=2, 64 KiB chunk.  A grow has **two** costs: a one-time
