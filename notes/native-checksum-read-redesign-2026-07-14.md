@@ -99,8 +99,10 @@ too weak.  Re-run: 0 mismatches under the same load.
 The region working set is per MEMBER (data+parity blocks, not data bytes):
 member_blocks/1022 × nr_members.  For 8×8 GiB members that is 16416 pages —
 the benchmark's 16384 was *just* under, and the resulting steady eviction churn
-cost random write ~15% (79.2K vs 93.1K iops at 20480 pages).  Follow-up:
-auto-size raidkm_csum_cache_pages from array geometry at csum enable.
+cost random write ~15% (79.2K vs 93.1K iops at 20480 pages).  Follow-up
+DONE (2026-07-14, after this note): raidkm_csum_cache_pages now defaults to 0
+= auto-size from array geometry at csum enable (full region coverage, clamped
+to ~1.6% of RAM with a logged hint when clamped).
 
 ## Measured (bench-nvme16-csum, 2026-07-14; 8-disk m=2, chunk 64K, 8G/dev,
 fio direct iodepth=32 30s; seqread nj=4, randread nj=16, randwrite nj=4;

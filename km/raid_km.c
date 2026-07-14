@@ -48,6 +48,7 @@
 #include <linux/crc32c.h>
 #include <linux/xarray.h>
 #include <linux/highmem.h>
+#include <linux/mm.h>
 #include <linux/sched/mm.h>
 #include <linux/ratelimit.h>
 #include <linux/nodemask.h>
@@ -1426,10 +1427,10 @@ struct raidkm_csum_cache {
 	struct raidkm_csum_shard shards[];	/* flexible: nr_shards of them */
 };
 
-static unsigned int raidkm_csum_cache_pages = 8192;	/* ~32 MiB of 4 KiB pages */
+static unsigned int raidkm_csum_cache_pages;	/* 0 = auto-size (default) */
 module_param(raidkm_csum_cache_pages, uint, 0644);
 MODULE_PARM_DESC(raidkm_csum_cache_pages,
-	"raidkm: max resident native-checksum region pages (soft ceiling, total)");
+	"raidkm: max resident native-checksum region pages (soft ceiling, total); 0 = auto-size from array geometry (full region coverage, clamped to ~1.6% of RAM)");
 
 static unsigned int raidkm_csum_shards;			/* 0 = auto (per-cpu, capped) */
 module_param(raidkm_csum_shards, uint, 0644);
@@ -2039,11 +2040,44 @@ static void raidkm_csum_writeback(struct r5conf *conf)
 	}
 }
 
+/* Auto-size the region-page cache from the array geometry: enough pages to
+ * cover EVERY member's whole CRC region (member_blocks/1022 per member --
+ * that is data+parity blocks, ~1 page per 4 MiB of member capacity), clamped
+ * to ~1.6% of RAM.  Full coverage means steady-state I/O never faults a
+ * region page (the 2026-07-14 benchmark showed a cache just 32 pages short
+ * costs random write ~15% in silent eviction churn).  Uses the geometry at
+ * csum enable; a later --grow raises the need, so a grown array may want an
+ * explicit raidkm_csum_cache_pages (the ceiling is soft -- being under it is
+ * a performance, never a correctness, matter). */
+static unsigned int raidkm_csum_auto_pages(struct r5conf *conf)
+{
+	struct mddev *mddev = conf->mddev;
+	u64 blocks = mddev->dev_sectors >> RAID5_STRIPE_SHIFT(conf);
+	u64 need = DIV_ROUND_UP_ULL(blocks, RAIDKM_CSUM_PER_PAGE) *
+		   mddev->raid_disks;
+	u64 cap = totalram_pages() / 64;		/* ~1.6% of RAM */
+	u64 pages = clamp_t(u64, need, 64, max_t(u64, cap, 64));
+
+	pages = min_t(u64, pages, UINT_MAX);		/* fits the uint ceiling */
+
+	if (need > pages)
+		pr_warn("md/raid:%s: native csum cache auto-size clamped to %llu pages (%llu = full region coverage): cold blocks will fault region pages; set raidkm_csum_cache_pages to override\n",
+			mdname(mddev), pages, need);
+	else
+		pr_info("md/raid:%s: native csum cache auto-sized to %llu pages (full region coverage, ~%llu MiB)\n",
+			mdname(mddev), pages, pages >> 8);
+	return pages;
+}
+
 static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 {
 	unsigned int nsh = raidkm_csum_shards;
+	unsigned int total = raidkm_csum_cache_pages;
 	unsigned int i, per;
 	struct raidkm_csum_cache *c;
+
+	if (!total)					/* 0 = auto (default) */
+		total = raidkm_csum_auto_pages(conf);
 
 	if (!nsh) {					/* auto: one shard per cpu, capped */
 		nsh = num_online_cpus();
@@ -2060,7 +2094,7 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 	c->conf = conf;
 	c->nr_shards = nsh;
 	/* split the total soft ceiling across shards (>=16 each so tiny caches work) */
-	per = max(max(raidkm_csum_cache_pages, 64u) / nsh, 16u);
+	per = max(max(total, 64u) / nsh, 16u);
 	for (i = 0; i < nsh; i++) {
 		struct raidkm_csum_shard *s = &c->shards[i];
 
