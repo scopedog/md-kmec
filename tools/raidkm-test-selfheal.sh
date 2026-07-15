@@ -189,9 +189,9 @@ if [ "$NATIVE" = 1 ]; then
 	# P1b: enable the on-disk native CRC via mdadm --integrity, which sets the
 	# SB layout bit (csum_disk) so the CRC map persists in the reserved tail
 	# region and is reloaded on assemble.  No module param needed.
-	grep -qa integrity "$MDADM" || { echo "ERROR: this mdadm lacks --integrity (rebuild the fork)" >&2; exit 1; }
-	export RK_CREATE_EXTRA="--integrity=crc32c"
-	rk_log "native checksum ENABLED (--integrity=crc32c, disk-backed region)"
+	grep -qa integrity "$MDADM" || { echo "ERROR: this mdadm lacks native checksum support (--checksum) (rebuild the fork)" >&2; exit 1; }
+	export RK_CREATE_EXTRA="--checksum=crc32c"
+	rk_log "native checksum ENABLED (--checksum=crc32c, disk-backed region)"
 fi
 
 rk_setup_brd "$NDISK" || exit 1

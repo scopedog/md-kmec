@@ -62,7 +62,7 @@ if [ "$NATIVE" != 1 ]; then
 fi
 
 rk_load_modules || exit 1
-grep -qa integrity "$MDADM" || { echo "ERROR: this mdadm lacks --integrity (rebuild the fork)" >&2; exit 1; }
+grep -qa integrity "$MDADM" || { echo "ERROR: this mdadm lacks native checksum support (--checksum) (rebuild the fork)" >&2; exit 1; }
 
 # Shrink the region-page cache BEFORE --create: the ceiling is latched into the
 # per-array cache at setup_conf time, so the param must be set first.
@@ -77,7 +77,7 @@ else
 	exit 1
 fi
 
-export RK_CREATE_EXTRA="--integrity=crc32c"
+export RK_CREATE_EXTRA="--checksum=crc32c"
 
 rk_setup_brd "$NDISK" || exit 1
 DISKS=$(rk_pick_disks "$NDISK") || { echo "ERROR: need $NDISK ramdisks" >&2; exit 1; }
