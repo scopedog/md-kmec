@@ -5736,6 +5736,27 @@ static int need_this_block(struct stripe_head *sh, struct stripe_head_state *s,
 		 */
 		return 0;
 
+	/*
+	 * Defer an overlapping read while a skip_copy write is draining.
+	 * skip_copy (conf->skip_copy, default-on in md-kmec) borrows the write
+	 * bio's page as dev->page and deliberately leaves the block !UPTODATE --
+	 * the aliased page is not a readable stripe-cache copy and is handed back
+	 * to dev->orig_page in handle_stripe_clean_event().  Scheduling a disk
+	 * read into that aliased page to satisfy a toread would (a) clobber the
+	 * write's source page and (b) set R5_UPTODATE on a R5_SkipCopy block,
+	 * tripping the SkipCopy/UPTODATE invariant WARN_ON in
+	 * handle_stripe_clean_event() and ops_run_io().  Returning 0 keeps the
+	 * toread pending; the write's clean_event restores dev->page and clears
+	 * R5_SkipCopy, after which the read fetches the just-committed data from
+	 * disk (correct read-after-write).  No deadlock: R5_SkipCopy always
+	 * clears once the in-flight write completes.  This path is reachable with
+	 * native checksums, which re-drive chunk-aligned reads through the stripe
+	 * cache (retry_aligned_read) for verification, creating read/skip_copy
+	 * overlaps that a plain aligned read (served in raid5_align_endio) avoids.
+	 */
+	if (dev->toread && test_bit(R5_SkipCopy, &dev->flags))
+		return 0;
+
 	if (dev->toread ||
 	    (dev->towrite && !test_bit(R5_OVERWRITE, &dev->flags)))
 		/* We need this block to directly satisfy a request */

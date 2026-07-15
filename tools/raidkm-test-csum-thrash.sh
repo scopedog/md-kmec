@@ -66,7 +66,9 @@ grep -qa integrity "$MDADM" || { echo "ERROR: this mdadm lacks --integrity (rebu
 
 # Shrink the region-page cache BEFORE --create: the ceiling is latched into the
 # per-array cache at setup_conf time, so the param must be set first.
-if [ -w /sys/module/raidkm/parameters/raidkm_csum_cache_pages ]; then
+# Test presence with -e (the param file is mode 0644 = root-writable only, so
+# -w is false when this script runs as a non-root user that writes via sudo).
+if [ -e /sys/module/raidkm/parameters/raidkm_csum_cache_pages ]; then
 	echo "$CACHE_PAGES" | sudo tee /sys/module/raidkm/parameters/raidkm_csum_cache_pages >/dev/null
 	eff=$(cat /sys/module/raidkm/parameters/raidkm_csum_cache_pages)
 	rk_log "raidkm_csum_cache_pages set to $eff (kernel floors to 64); array footprint ~${THRASH_MIB} MiB >> cache"
@@ -151,10 +153,19 @@ else
 	# block 0 is genuinely cold -- md must re-read the corrupt member (a warm
 	# stripe from any earlier read would be served without re-verifying, and a
 	# plain drop_caches does not evict md's stripe cache).
-	sudo dd if="$member0" of="$RK_TMP/blk0.good" bs=512 skip="$do_s" count=8 \
-		iflag=direct status=none 2>/dev/null
-	sudo dd if=/dev/urandom of="$member0" bs=512 seek="$do_s" count=8 \
-		conv=notrunc status=none 2>/dev/null
+	#
+	# Read/write in the member's LOGICAL block size, not a hardcoded 512.  On a
+	# 4K-logical device (e.g. GCP local-SSD NVMe: logical_block_size=4096) an
+	# O_DIRECT dd with bs=512 fails EINVAL and produces an EMPTY good file, so the
+	# later cmp is trivially "no" and T3 false-fails regardless of the heal.  do_s
+	# is in 512-byte sectors (mdadm's unit); convert the byte offset into lbs units.
+	lbs=$(sudo blockdev --getss "$member0" 2>/dev/null || echo 512)
+	blk_lbs=$(( BLK / lbs ))			# 4 KiB block in logical-block units
+	off_lbs=$(( do_s * 512 / lbs ))		# data_offset (bytes) in logical-block units
+	sudo dd if="$member0" of="$RK_TMP/blk0.good" bs="$lbs" skip="$off_lbs" \
+		count="$blk_lbs" iflag=direct status=none 2>/dev/null
+	sudo dd if=/dev/urandom of="$member0" bs="$lbs" seek="$off_lbs" \
+		count="$blk_lbs" conv=notrunc status=none 2>/dev/null
 	sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
 	rk_dmesg_clear
 	if ! rk_assemble "${MEMBERS[@]}"; then

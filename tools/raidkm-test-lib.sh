@@ -134,8 +134,21 @@ rk_load_modules() {
 }
 
 # Ensure at least <need> (default $BRD_NR) block-device ram* nodes exist.
+# RK_DEVS: space-separated list of REAL block devices to test on instead of brd
+# (real-HW gating: NVMe timing exercises the store-vs-worker/drain windows that
+# a ramdisk's ~microsecond latency hides).  When set, rk_setup_brd is a no-op
+# and rk_pick_disks serves from this list.  The caller is responsible for the
+# devices being wipeable (rk_create zeroes them).
+RK_DEVS="${RK_DEVS:-}"
+
 rk_setup_brd() {
 	local need="${1:-$BRD_NR}" have want
+	if [ -n "$RK_DEVS" ]; then
+		have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
+		[ "$have" -ge "$need" ] && return 0
+		echo "ERROR: RK_DEVS has $have devices, need $need" >&2
+		return 1
+	fi
 	have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
 	[ "$have" -ge "$need" ] && return 0
 	# Too few ram devices.  brd may already be loaded at a smaller rd_nr from a
@@ -155,14 +168,14 @@ rk_setup_brd() {
 # Echo the first <n> working /dev/ram* block devices (skips broken nodes).
 rk_pick_disks() {
 	local need="$1" picked=() d
-	for d in /dev/ram*; do
+	for d in ${RK_DEVS:-/dev/ram*}; do
 		[ -b "$d" ] || continue
 		sudo blockdev --getsize64 "$d" >/dev/null 2>&1 || continue
 		picked+=("$d")
 		[ "${#picked[@]}" -ge "$need" ] && break
 	done
 	[ "${#picked[@]}" -ge "$need" ] || {
-		echo "ERROR: need $need ramdisks, found only ${#picked[@]}" >&2
+		echo "ERROR: need $need devices, found only ${#picked[@]} (RK_DEVS='${RK_DEVS:-}')" >&2
 		return 1
 	}
 	echo "${picked[@]}"

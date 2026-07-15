@@ -448,14 +448,18 @@ for m in $MSET; do
 			si_restore                 # clean data -> CRCs
 			rk_stop                    # flush region (pages carry self_crc+gen)
 			rmemb="${SI_BACKING[0]}"   # member 0's raw backing device
-			# region page 0 = data_offset + avail_dev_size (sectors)
+			# region page 0 starts at data_offset + USED dev size (the end of
+			# the data area = start of the reserved csum tail).  NOT avail_dev_size:
+			# Avail Dev Size > Used Dev Size on real devices (e.g. by 112 sectors),
+			# so do+avail overshoots page 0 into an unwritten region page (gen=0)
+			# that the kernel correctly ignores, silently failing this detect probe.
 			do_s=$(sudo "$MDADM" --examine "$rmemb" 2>/dev/null | \
 			       sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p')
-			av_s=$(sudo "$MDADM" --examine "$rmemb" 2>/dev/null | \
-			       sed -n 's/.*Avail Dev Size : \([0-9]*\) sectors.*/\1/p')
-			if [ -n "$do_s" ] && [ -n "$av_s" ]; then
+			ud_s=$(sudo "$MDADM" --examine "$rmemb" 2>/dev/null | \
+			       sed -n 's/.*Used Dev Size : \([0-9]*\) sectors.*/\1/p')
+			if [ -n "$do_s" ] && [ -n "$ud_s" ]; then
 				sudo dd if=/dev/urandom of="$rmemb" bs=1 \
-					seek=$(( (do_s + av_s) * 512 )) count=64 \
+					seek=$(( (do_s + ud_s) * 512 )) count=64 \
 					conv=notrunc status=none 2>/dev/null
 				sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
 			else
@@ -463,7 +467,7 @@ for m in $MSET; do
 			fi
 			# Always reassemble so the outer cleanup finds the array UP.
 			if rk_assemble "${SI_MAPPER[@]}"; then
-				if [ -n "$do_s" ] && [ -n "$av_s" ]; then
+				if [ -n "$do_s" ] && [ -n "$ud_s" ]; then
 					h0=$(rk_healed); ok=1
 					rk_readback "$WRITE_MIB" || ok=0     # data intact
 					sudo dmesg 2>/dev/null | \
