@@ -52,17 +52,24 @@ out=$(sudo "$MDADM" --create "$MD" --level=raidkm --parity-count=$M \
 	--dcl-nbase=$NBASE --chunk="$CHUNK_KB" --raid-devices=$N \
 	"${MEMBERS[@]}" --run --force 2>&1)
 rc=$?
-if [ $rc -ne 0 ]; then
-	rk_pass "create exits non-zero (kernel refuses activation as designed)"
+# 1c step 3: the declustered I/O path is live — create ACTIVATES now.
+if [ $rc -eq 0 ] && grep -q "md70 : active raidkm" /proc/mdstat; then
+	rk_pass "declustered array created and ACTIVE"
 else
-	rk_fail "create unexpectedly SUCCEEDED — Phase-1c gate missing?"
-fi
-if sudo dmesg | grep -q "declustered layout recognized but the declustered I/O path is not implemented yet; refusing activation"; then
-	rk_pass "kernel logged the recognize-and-refuse message"
-else
-	rk_fail "no recognize-and-refuse message in dmesg"
+	rk_fail "create failed or array not active (rc=$rc)"
 	sudo dmesg | tail -5 | sed 's/^/      · /'
 fi
+# array capacity must be rows * ngroups * k data columns
+ud0=$(sudo "$MDADM" --examine "${MEMBERS[0]}" 2>/dev/null | sed -n 's/.*Avail Dev Size : \([0-9]*\) sectors.*/\1/p')
+exp_bytes=$(( (ud0 / (CHUNK_KB * 2)) * (CHUNK_KB * 2) * 512 * ((N - SC) / G) * (G - M) ))
+got_bytes=$(sudo blockdev --getsize64 "$MD")
+if [ "$got_bytes" = "$exp_bytes" ]; then
+	rk_pass "array size = rows * ngroups * k ($got_bytes bytes)"
+else
+	rk_fail "array size $got_bytes != expected $exp_bytes"
+fi
+rk_wait_idle	# let the initial resync (group-looped sync path) finish
+sudo "$MDADM" --stop "$MD" 2>/dev/null
 # Phase 1c step 1: the kernel must have LOADED the rkdcl block before the
 # refuse — dmesg carries the loaded seed + regenerated PERM crc.
 kload=$(sudo dmesg | sed -n 's/.*declustered geometry loaded: \(.*\)/\1/p' | tail -1)

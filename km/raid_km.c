@@ -59,6 +59,7 @@
 
 #include "md.h"
 #include "raid_km.h"
+#include "raid_km_dcl.h"
 #include "raid0.h"
 #include "md-bitmap.h"
 #include "raid_km-log.h"
@@ -144,6 +145,39 @@ static inline int stripe_hash_locks_hash(struct r5conf *conf, sector_t sect,
 {
 	return ((sect >> RAID5_STRIPE_SHIFT(conf)) +
 		(sector_t)dcl_group * 7919) & STRIPE_HASH_LOCKS_MASK;
+}
+
+/* Declustered D1: slot -> physical disk.  A pure function of
+ * (sh->sector, dcl_group, slot) — row == device chunk, logical column ==
+ * group*g + slot — so no per-stripe ddisk[] storage is needed at all.
+ * Identity on non-declustered arrays. */
+static inline int raidkm_sh_pdisk(struct r5conf *conf,
+				  struct stripe_head *sh, int i)
+{
+	sector_t row;
+
+	if (!conf->dcl)
+		return i;
+	row = sh->sector;
+	sector_div(row, conf->chunk_sectors);
+	return dcl_disk(conf->dcl, row,
+			sh->dcl_group * conf->dcl->g + i);
+}
+
+/* Declustered: which group of its row a LOGICAL sector belongs to (the
+ * (sector, group) stripe-identity discriminator).  0 when not declustered. */
+static inline int raidkm_dcl_group_of(struct r5conf *conf, sector_t logical)
+{
+	struct dcl_geom *ge = conf->dcl;
+	sector_t chunk;
+	u32 dcol;
+
+	if (!ge)
+		return 0;
+	chunk = logical;
+	sector_div(chunk, conf->chunk_sectors);
+	dcol = sector_div(chunk, ge->ngroups * ge->k);
+	return dcol / ge->k;
 }
 
 static inline void lock_device_hash_lock(struct r5conf *conf, int hash)
@@ -726,7 +760,8 @@ static void init_stripe(struct stripe_head *sh, sector_t sector, int previous,
 retry:
 	seq = read_seqcount_begin(&conf->gen_lock);
 	sh->generation = conf->generation - previous;
-	sh->disks = previous ? conf->previous_raid_disks : conf->raid_disks;
+	sh->disks = conf->dcl ? (int)conf->dcl->g :
+		    (previous ? conf->previous_raid_disks : conf->raid_disks);
 	sh->sector = sector;
 	stripe_set_idx(sector, conf, previous, sh);
 	sh->state = 0;
@@ -2292,8 +2327,13 @@ again:
 				raidkm_csum_blkidx(conf, sh->sector),
 				raidkm_block_crc(conf, dev->page, dev->offset));
 
-		rdev = conf->disks[i].rdev;
-		rrdev = conf->disks[i].replacement;
+		{
+			/* declustered D1: slot i lives on pdisk, not disk i */
+			int pd = raidkm_sh_pdisk(conf, sh, i);
+
+			rdev = conf->disks[pd].rdev;
+			rrdev = conf->disks[pd].replacement;
+		}
 		if (op_is_write(op)) {
 			if (replace_only)
 				rdev = NULL;
@@ -4504,9 +4544,9 @@ static void raid5_end_read_request(struct bio * bi)
 		 * In that case it moved down to 'rdev'.
 		 * rdev is not removed until all requests are finished.
 		 */
-		rdev = conf->disks[i].replacement;
+		rdev = conf->disks[raidkm_sh_pdisk(conf, sh, i)].replacement;
 	if (!rdev)
-		rdev = conf->disks[i].rdev;
+		rdev = conf->disks[raidkm_sh_pdisk(conf, sh, i)].rdev;
 
 	if (use_new_offset(conf, sh))
 		s = sh->sector + rdev->new_data_offset;
@@ -4715,12 +4755,14 @@ static void raid5_end_write_request(struct bio *bi)
 	int replacement = 0;
 
 	for (i = 0 ; i < disks; i++) {
+		int pd = raidkm_sh_pdisk(conf, sh, i);
+
 		if (bi == &sh->dev[i].req) {
-			rdev = conf->disks[i].rdev;
+			rdev = conf->disks[pd].rdev;
 			break;
 		}
 		if (bi == &sh->dev[i].rreq) {
-			rdev = conf->disks[i].replacement;
+			rdev = conf->disks[pd].replacement;
 			if (rdev)
 				replacement = 1;
 			else
@@ -4728,7 +4770,7 @@ static void raid5_end_write_request(struct bio *bi)
 				 * replaced it.  rdev is not removed
 				 * until all requests are finished.
 				 */
-				rdev = conf->disks[i].rdev;
+				rdev = conf->disks[pd].rdev;
 			break;
 		}
 	}
@@ -4878,6 +4920,25 @@ sector_t raid5_compute_sector(struct r5conf *conf, sector_t r_sector,
 	pd_idx = qd_idx = -1;
 	if (is_raidkm(conf)) {
 		int m = raid_disks - data_disks;	/* parity count */
+
+		if (conf->dcl) {
+			/* Declustered (1c): logical chunk -> (row, group,
+			 * slot) through the permutation map; parity sits at
+			 * the group tail (PARITY_N within the g-wide group),
+			 * so pd/qd are constant.  The caller derives the
+			 * stripe-identity group via raidkm_dcl_group_of().
+			 * chunk_number is the LOGICAL chunk; the generic
+			 * data_disks-based dd_idx/stripe computed above are
+			 * simply overwritten here. */
+			struct dcl_addr a;
+
+			dcl_forward(conf->dcl, chunk_number, &a);
+			*dd_idx = a.slot;
+			pd_idx = conf->dcl->k;
+			qd_idx = conf->dcl->g - 1;
+			stripe = a.row;
+			goto out_pq;
+		}
 
 		/*
 		 * The m parity slots are pd_idx .. pd_idx+m-1 (mod N); data
@@ -5101,7 +5162,22 @@ sector_t raid5_compute_blocknr(struct stripe_head *sh, int i, int previous)
 	 */
 	if (is_raidkm(conf)) {
 		int m = raid_disks - data_disks;
-		int rel = (i - sh->pd_idx + raid_disks) % raid_disks;
+		int rel;
+
+		if (conf->dcl) {
+			/* Declustered inverse: slots [0,k) are data, [k,g)
+			 * parity; `stripe` already holds the row.  The group
+			 * comes from the stripe identity itself. */
+			struct dcl_geom *ge = conf->dcl;
+
+			if (i >= (int)ge->k)
+				return 0;	/* a parity slot */
+			chunk_number = stripe * ((sector_t)ge->ngroups * ge->k) +
+				       (sector_t)sh->dcl_group * ge->k + i;
+			r_sector = chunk_number * sectors_per_chunk + chunk_offset;
+			goto out_check;
+		}
+		rel = (i - sh->pd_idx + raid_disks) % raid_disks;
 
 		if (rel < m)
 			return 0;	/* a parity slot */
@@ -5196,6 +5272,7 @@ out_blocknr:
 	chunk_number = stripe * data_disks + i;
 	r_sector = chunk_number * sectors_per_chunk + chunk_offset;
 
+out_check:
 	check = raid5_compute_sector(conf, r_sector,
 				     previous, &dummy1, &sh2);
 	if (check != sh->sector || dummy1 != dd_idx || sh2.pd_idx != sh->pd_idx
@@ -5555,6 +5632,14 @@ static void stripe_set_idx(sector_t stripe, struct r5conf *conf, int previous,
 	int chunk_offset = sector_div(stripe, sectors_per_chunk);
 	int disks = previous ? conf->previous_raid_disks : conf->raid_disks;
 
+	if (conf->dcl) {
+		/* Declustered: parity is at the group tail — pd/qd are the
+		 * same for every stripe and don't depend on the sector. */
+		sh->pd_idx = conf->dcl->k;
+		sh->qd_idx = conf->dcl->g - 1;
+		sh->ddf_layout = 0;
+		return;
+	}
 	raid5_compute_sector(conf,
 			     stripe * (disks - (previous ? conf->prev_m : conf->m))
 			     *sectors_per_chunk + chunk_offset,
@@ -5573,7 +5658,8 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 		int bitmap_end = 0;
 
 		if (test_bit(R5_ReadError, &sh->dev[i].flags)) {
-			struct md_rdev *rdev = conf->disks[i].rdev;
+			struct md_rdev *rdev =
+				conf->disks[raidkm_sh_pdisk(conf, sh, i)].rdev;
 
 			if (rdev && test_bit(In_sync, &rdev->flags) &&
 			    !test_bit(Faulty, &rdev->flags))
@@ -5727,7 +5813,8 @@ static int want_replace(struct stripe_head *sh, int disk_idx)
 	struct md_rdev *rdev;
 	int rv = 0;
 
-	rdev = sh->raid_conf->disks[disk_idx].replacement;
+	rdev = sh->raid_conf->disks[raidkm_sh_pdisk(sh->raid_conf, sh,
+						    disk_idx)].replacement;
 	if (rdev
 	    && !test_bit(Faulty, &rdev->flags)
 	    && !test_bit(In_sync, &rdev->flags)
@@ -6666,6 +6753,9 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 			}
 
 			for (i = 0; i < disks; i++) {
+				/* TODO(dcl Phase 2): slot->pdisk audit — this
+				 * degraded-scrub path is unreachable for the
+				 * non-degraded declustered v1 */
 				struct md_rdev *rdev = conf->disks[i].rdev;
 
 				if (!(rdev && !test_bit(Faulty, &rdev->flags) &&
@@ -7123,7 +7213,7 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 		/* Prefer to use the replacement for reads, but only
 		 * if it is recovered enough and has no bad blocks.
 		 */
-		rdev = conf->disks[i].replacement;
+		rdev = conf->disks[raidkm_sh_pdisk(conf, sh, i)].replacement;
 		if (rdev && !test_bit(Faulty, &rdev->flags) &&
 		    rdev->recovery_offset >= sh->sector + RAID5_STRIPE_SECTORS(conf) &&
 		    !rdev_has_badblock(rdev, sh->sector,
@@ -7134,7 +7224,7 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 				set_bit(R5_NeedReplace, &dev->flags);
 			else
 				clear_bit(R5_NeedReplace, &dev->flags);
-			rdev = conf->disks[i].rdev;
+			rdev = conf->disks[raidkm_sh_pdisk(conf, sh, i)].rdev;
 			clear_bit(R5_ReadRepl, &dev->flags);
 		}
 		if (rdev && test_bit(Faulty, &rdev->flags))
@@ -7181,7 +7271,8 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 		if (test_bit(R5_WriteError, &dev->flags)) {
 			/* This flag does not apply to '.replacement'
 			 * only to .rdev, so make sure to check that*/
-			struct md_rdev *rdev2 = conf->disks[i].rdev;
+			struct md_rdev *rdev2 =
+				conf->disks[raidkm_sh_pdisk(conf, sh, i)].rdev;
 
 			if (rdev2 == rdev)
 				clear_bit(R5_Insync, &dev->flags);
@@ -7194,7 +7285,8 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 		if (test_bit(R5_MadeGood, &dev->flags)) {
 			/* This flag does not apply to '.replacement'
 			 * only to .rdev, so make sure to check that*/
-			struct md_rdev *rdev2 = conf->disks[i].rdev;
+			struct md_rdev *rdev2 =
+				conf->disks[raidkm_sh_pdisk(conf, sh, i)].rdev;
 
 			if (rdev2 && !test_bit(Faulty, &rdev2->flags)) {
 				s->handle_bad_blocks = 1;
@@ -8608,9 +8700,9 @@ static enum stripe_result make_stripe_request(struct mddev *mddev,
 		flags |= R5_GAS_PREVIOUS;
 	if (bi->bi_opf & REQ_RAHEAD)
 		flags |= R5_GAS_NOBLOCK;
-	/* declustered: the group comes out of raid5_compute_sector once the
-	 * map is wired (1c step 3); until then only group-0 arrays activate */
-	sh = raid5_get_active_stripe(conf, ctx, new_sector, 0, flags);
+	sh = raid5_get_active_stripe(conf, ctx, new_sector,
+				     raidkm_dcl_group_of(conf, logical_sector),
+				     flags);
 	if (unlikely(!sh)) {
 		/* cannot get stripe, just give-up */
 		bi->bi_status = BLK_STS_IOERR;
@@ -8757,7 +8849,7 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 	 * later we might have to read it again in order to reconstruct
 	 * data on failed drives.
 	 */
-	if (rw == READ && mddev->degraded == 0 &&
+	if (rw == READ && mddev->degraded == 0 && !conf->dcl &&
 	    mddev->reshape_position == MaxSector &&
 	    (!conf->csum || raidkm_csum_bio_verifiable(conf, bi))) {
 		/*
@@ -8775,6 +8867,13 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 	}
 
 	if (unlikely(bio_op(bi) == REQ_OP_DISCARD)) {
+		if (conf->dcl) {
+			/* declustered v1: no discard fan-out yet */
+			bi->bi_status = BLK_STS_NOTSUPP;
+			bio_endio(bi);
+			md_write_end(mddev);
+			return true;
+		}
 		make_discard_request(mddev, bi);
 		md_write_end(mddev);
 		return true;
@@ -9943,11 +10042,33 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	set_bit(STRIPE_HANDLE, &sh->state);
 	raid5_release_stripe(sh);
 
+	/* Declustered: every group of this row shares the device sector, so
+	 * one sync address means ngroups stripes.  md_do_sync credits
+	 * recovery_active only with our RETURN value (one stripe's worth —
+	 * the address must advance by one row), but EVERY group stripe calls
+	 * md_done_sync() on completion; credit the extras here so the counter
+	 * balances instead of going negative and wedging md_do_sync's drain
+	 * wait (same manual accounting the COW reshape uses). */
+	if (conf->dcl) {
+		int grp;
+
+		for (grp = 1; grp < (int)conf->dcl->ngroups; grp++) {
+			atomic64_add(RAID5_STRIPE_SECTORS(conf),
+				     &mddev->recovery_active);
+			sh = raid5_get_active_stripe(conf, NULL, sector_nr,
+						     grp, 0);
+			set_bit(STRIPE_SYNC_REQUESTED, &sh->state);
+			set_bit(STRIPE_HANDLE, &sh->state);
+			raid5_release_stripe(sh);
+		}
+	}
+
 	/* Submit remaining stripes in the window non-blocking.  Stop early
 	 * if the stripe cache is full — the disk queue is already saturated.
 	 */
 	win_sector = sector_nr + RAID5_STRIPE_SECTORS(conf);
 	for (submitted = 1;
+	     !conf->dcl &&	/* declustered: groups above replace the window */
 	     submitted < RAID5_SYNC_WINDOW && win_sector < max_sector;
 	     submitted++, win_sector += RAID5_STRIPE_SECTORS(conf)) {
 		if (waitqueue_active(&conf->wait_for_stripe))
@@ -10024,7 +10145,7 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio,
 			continue;
 
 		sh = raid5_get_active_stripe(conf, NULL, sector,
-				0 /* dcl group: 1c step 3 */,
+				raidkm_dcl_group_of(conf, logical_sector),
 				R5_GAS_NOBLOCK | R5_GAS_NOQUIESCE);
 		if (!sh) {
 			/* failed to get a stripe - must wait */
@@ -11295,6 +11416,10 @@ raid5_size(struct mddev *mddev, sector_t sectors, int raid_disks)
 
 	sectors &= ~((sector_t)conf->chunk_sectors - 1);
 	sectors &= ~((sector_t)conf->prev_chunk_sectors - 1);
+	if (conf->dcl)
+		/* declustered: each row (one chunk per member) carries
+		 * ngroups * k data columns */
+		return sectors * conf->dcl->ngroups * conf->dcl->k;
 	return sectors * (raid_disks - conf->max_degraded);
 }
 
@@ -11825,9 +11950,18 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		if (raidkm_layout_is_dcl(mddev->new_layout)) {
 			if (raidkm_dcl_load(conf, mddev))
 				goto abort;
-			pr_warn("md/raid:%s: declustered layout recognized but the declustered I/O path is not implemented yet; refusing activation\n",
-				mdname(mddev));
-			goto abort;
+			/* v1 exclusions — refuse rather than run wrong */
+			if (mddev->bitmap_info.offset ||
+			    mddev->bitmap_info.file) {
+				pr_err("md/raid:%s: declustered + write-intent bitmap not supported yet\n",
+				       mdname(mddev));
+				goto abort;
+			}
+			if (conf->csum) {
+				pr_err("md/raid:%s: declustered + native checksums not supported yet\n",
+				       mdname(mddev));
+				goto abort;
+			}
 		}
 	} else if (conf->effective_level == 6) {
 		conf->m = 2;
@@ -12676,6 +12810,10 @@ out:
 
 static int raid5_resize(struct mddev *mddev, sector_t sectors)
 {
+	struct r5conf *dclc = mddev->private;
+
+	if (dclc && dclc->dcl)
+		return -EOPNOTSUPP;	/* declustered v1: no resize */
 	/* no resync is happening, and there is enough space
 	 * on all devices, so we can resize.
 	 * We need to make sure resync covers any new space.
@@ -12785,6 +12923,9 @@ static int raid5_start_reshape(struct mddev *mddev)
 	struct r5conf *conf = mddev->private;
 	struct md_rdev *rdev;
 	int spares = 0;
+
+	if (conf->dcl)
+		return -EOPNOTSUPP;	/* declustered v1: no reshape */
 	int i;
 	unsigned long flags;
 	unsigned char *new_a = NULL, *new_gg = NULL, *new_gb = NULL;
@@ -13182,6 +13323,9 @@ static void *raid5_takeover_raid6(struct mddev *mddev)
 
 static int raid5_check_reshape(struct mddev *mddev)
 {
+	/* declustered v1: reshape is out of scope entirely */
+	if (((struct r5conf *)mddev->private)->dcl)
+		return -EOPNOTSUPP;
 	/* For a 2-drive array, the layout and chunk size can be changed
 	 * immediately as not restriping is needed.
 	 * For larger arrays we record the new value - after validation
