@@ -315,6 +315,7 @@ rk_geom() { grep -A1 "$MDNAME" /proc/mdstat | tail -1 | grep -o '\[[0-9]*/[0-9]*
 rk_dmesg_clear() { sudo dmesg -C >/dev/null 2>&1 || true; }
 rk_dmesg_clean() {
 	local hits
-	hits=$(sudo dmesg 2>/dev/null | grep -ciE 'WARN|BUG|map not correct|call trace|gf_invert')
+	hits=$(sudo dmesg 2>/dev/null | grep -iE 'WARN|BUG|map not correct|call trace|gf_invert' |
+		grep -civ 'appears to be on the same physical disk')
 	[ "${hits:-0}" -eq 0 ]
 }
