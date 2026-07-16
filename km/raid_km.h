@@ -61,6 +61,16 @@ static inline bool is_raid6_math(int level)
  *               CRCs persist across assemble.  This is the on-disk enable; md's
  *               core never interprets the layout word, so it needs no md-core
  *               support (P1b).
+ *   bit  10     RAIDKM_LAYOUT_DCL — declustered parity: stripes of width
+ *               g = k+m scattered over the N-disk pool by a balanced
+ *               permutation, with distributed spare columns.  g rides in
+ *               bits [23:16], the spare-column count in bits [30:24]
+ *               (<= 127 keeps the int layout word positive); nbase and the
+ *               64-bit permutation seed live in the on-disk rkdcl metadata
+ *               block at data_offset + data_size.  See raid_km_dcl.h and
+ *               notes/declustered-parity-design.md.  The I/O path is not
+ *               implemented yet (Phase 1c) — setup_conf recognizes the
+ *               geometry and refuses activation.
  *
  * Stored verbatim in the superblock layout field, so the choice persists
  * across assemble.  A plain `--layout=m` (no high bits) is PARITY_N, keeping
@@ -69,6 +79,11 @@ static inline bool is_raid6_math(int level)
 #define RAIDKM_LAYOUT_M_MASK	0x00ff
 #define RAIDKM_LAYOUT_ROTATING	0x0100
 #define RAIDKM_LAYOUT_CSUM	0x0200
+#define RAIDKM_LAYOUT_DCL	0x0400
+#define RAIDKM_LAYOUT_DCL_G(l)	(((l) >> 16) & 0xff)
+#define RAIDKM_LAYOUT_DCL_S(l)	(((l) >> 24) & 0x7f)
+/* bits [30:16] carry g and the spare-column count, valid ONLY with DCL set */
+#define RAIDKM_LAYOUT_DCL_FIELDS 0x7fff0000
 /* bits that carry meaning; anything else set is rejected at create time */
 #define RAIDKM_LAYOUT_KNOWN	(RAIDKM_LAYOUT_M_MASK | RAIDKM_LAYOUT_ROTATING | \
 				 RAIDKM_LAYOUT_CSUM)
@@ -84,6 +99,10 @@ static inline bool raidkm_layout_is_rotating(int layout)
 static inline bool raidkm_layout_has_csum(int layout)
 {
 	return !!(layout & RAIDKM_LAYOUT_CSUM);
+}
+static inline bool raidkm_layout_is_dcl(int layout)
+{
+	return !!(layout & RAIDKM_LAYOUT_DCL);
 }
 
 /*
@@ -316,6 +335,12 @@ struct stripe_head {
 	 * lookup.
 	 */
 	short			generation;	/* increments with every reshape */
+	short			dcl_group;	/* declustered: which group of the
+						 * row this stripe is — part of the
+						 * stripe identity, since all groups
+						 * of a row share one device sector
+						 * (D3).  Always 0 on non-declustered
+						 * arrays. */
 	int			overwrite_disks; /* total overwrite disks in stripe,
 						  * this is only checked when stripe
 						  * has STRIPE_BATCH_READY
@@ -919,6 +944,12 @@ struct r5conf {
 	 * is set the map is loaded from / flushed to the reserved tail region so
 	 * CRCs survive a remount.
 	 */
+	struct dcl_geom		*dcl;	/* declustered geometry + permutation
+					 * tables, loaded from the rkdcl
+					 * metadata block at setup_conf
+					 * (raidkm_dcl_load); NULL unless
+					 * RAIDKM_LAYOUT_DCL.  Freed with the
+					 * conf. */
 	struct raidkm_csum_cache *csum;	/* demand-paged region-page cache;
 					 * non-NULL == native checksum on */
 	bool			csum_disk;
@@ -1230,7 +1261,7 @@ struct stripe_request_ctx;
 #define R5_GAS_NOQUIESCE	(1 << 2)
 struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 		struct stripe_request_ctx *ctx, sector_t sector,
-		unsigned int flags);
+		int dcl_group, unsigned int flags);
 
 int raid5_calc_degraded(struct r5conf *conf);
 int raid_km_c_journal_mode_set(struct mddev *mddev, int journal_mode);
@@ -1239,4 +1270,8 @@ void raidkm_compute_partial_parity(struct stripe_head *sh);
 /* PPL recovery: encode modified data into m parity pages (raid_km.c) */
 void raidkm_ppl_encode_modified(struct r5conf *conf, void **src,
 				void **cod, size_t bytes);
+/* Declustered: load + verify the rkdcl metadata block, build the
+ * permutation tables into conf->dcl (raid_km-dcl.c) */
+int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev);
+void raidkm_dcl_free(struct r5conf *conf);
 #endif

@@ -125,15 +125,25 @@ static struct workqueue_struct *raid5_wq;
 
 static void raid5_quiesce(struct mddev *mddev, int quiesce);
 
-static inline struct hlist_head *stripe_hash(struct r5conf *conf, sector_t sect)
+/* Stripe identity is (sector, dcl_group): on a declustered array every
+ * group of a row lives at the SAME device sector on its member disks
+ * (dense per-row packing, design doc D3), so the group is part of the
+ * hash and of every identity comparison.  dcl_group is always 0 on
+ * non-declustered arrays, making all of this bit-identical to the
+ * historical sector-only behaviour there (7919 is prime, * 0 == 0). */
+static inline struct hlist_head *stripe_hash(struct r5conf *conf, sector_t sect,
+					     int dcl_group)
 {
-	int hash = (sect >> RAID5_STRIPE_SHIFT(conf)) & HASH_MASK;
+	int hash = ((sect >> RAID5_STRIPE_SHIFT(conf)) +
+		    (sector_t)dcl_group * 7919) & HASH_MASK;
 	return &conf->stripe_hashtbl[hash];
 }
 
-static inline int stripe_hash_locks_hash(struct r5conf *conf, sector_t sect)
+static inline int stripe_hash_locks_hash(struct r5conf *conf, sector_t sect,
+					 int dcl_group)
 {
-	return (sect >> RAID5_STRIPE_SHIFT(conf)) & STRIPE_HASH_LOCKS_MASK;
+	return ((sect >> RAID5_STRIPE_SHIFT(conf)) +
+		(sector_t)dcl_group * 7919) & STRIPE_HASH_LOCKS_MASK;
 }
 
 static inline void lock_device_hash_lock(struct r5conf *conf, int hash)
@@ -555,7 +565,7 @@ static inline void remove_hash(struct stripe_head *sh)
 
 static inline void insert_hash(struct r5conf *conf, struct stripe_head *sh)
 {
-	struct hlist_head *hp = stripe_hash(conf, sh->sector);
+	struct hlist_head *hp = stripe_hash(conf, sh->sector, sh->dcl_group);
 
 	pr_debug("insert_hash(), stripe %llu\n",
 		(unsigned long long)sh->sector);
@@ -698,10 +708,13 @@ static int grow_buffers(struct stripe_head *sh, gfp_t gfp)
 static void stripe_set_idx(sector_t stripe, struct r5conf *conf, int previous,
 			    struct stripe_head *sh);
 
-static void init_stripe(struct stripe_head *sh, sector_t sector, int previous)
+static void init_stripe(struct stripe_head *sh, sector_t sector, int previous,
+			int dcl_group)
 {
 	struct r5conf *conf = sh->raid_conf;
 	int i, seq;
+
+	sh->dcl_group = dcl_group;
 
 	BUG_ON(atomic_read(&sh->count) != 0);
 	BUG_ON(test_bit(STRIPE_HANDLE, &sh->state));
@@ -741,25 +754,26 @@ retry:
 }
 
 static struct stripe_head *__find_stripe(struct r5conf *conf, sector_t sector,
-					 short generation)
+					 short generation, int dcl_group)
 {
 	struct stripe_head *sh;
 
 	pr_debug("__find_stripe, sector %llu\n", (unsigned long long)sector);
-	hlist_for_each_entry(sh, stripe_hash(conf, sector), hash)
-		if (sh->sector == sector && sh->generation == generation)
+	hlist_for_each_entry(sh, stripe_hash(conf, sector, dcl_group), hash)
+		if (sh->sector == sector && sh->generation == generation &&
+		    sh->dcl_group == dcl_group)
 			return sh;
 	pr_debug("__stripe %llu not in cache\n", (unsigned long long)sector);
 	return NULL;
 }
 
 static struct stripe_head *find_get_stripe(struct r5conf *conf,
-		sector_t sector, short generation, int hash)
+		sector_t sector, short generation, int hash, int dcl_group)
 {
 	int inc_empty_inactive_list_flag;
 	struct stripe_head *sh;
 
-	sh = __find_stripe(conf, sector, generation);
+	sh = __find_stripe(conf, sector, generation, dcl_group);
 	if (!sh)
 		return NULL;
 
@@ -964,10 +978,10 @@ static bool is_inactive_blocked(struct r5conf *conf, int hash)
 
 struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 		struct stripe_request_ctx *ctx, sector_t sector,
-		unsigned int flags)
+		int dcl_group, unsigned int flags)
 {
 	struct stripe_head *sh;
-	int hash = stripe_hash_locks_hash(conf, sector);
+	int hash = stripe_hash_locks_hash(conf, sector, dcl_group);
 	int previous = !!(flags & R5_GAS_PREVIOUS);
 
 	pr_debug("get_stripe, sector %llu\n", (unsigned long long)sector);
@@ -994,7 +1008,7 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 		}
 
 		sh = find_get_stripe(conf, sector, conf->generation - previous,
-				     hash);
+				     hash, dcl_group);
 		if (sh)
 			break;
 
@@ -1002,7 +1016,7 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 			sh = get_free_stripe(conf, hash);
 			if (sh) {
 				r5c_check_stripe_cache_usage(conf);
-				init_stripe(sh, sector, previous);
+				init_stripe(sh, sector, previous, dcl_group);
 				atomic_inc(&sh->count);
 				break;
 			}
@@ -1104,14 +1118,18 @@ static void stripe_add_to_batch_list(struct r5conf *conf,
 		return;
 	head_sector = sh->sector - RAID5_STRIPE_SECTORS(conf);
 
-	if (last_sh && head_sector == last_sh->sector) {
+	/* The don't-cross-chunks guard above keeps the whole batch inside
+	 * one chunk == one declustered row, so the head is the SAME group;
+	 * matching sh->dcl_group is the identity discipline, not a filter. */
+	if (last_sh && head_sector == last_sh->sector &&
+	    sh->dcl_group == last_sh->dcl_group) {
 		head = last_sh;
 		atomic_inc(&head->count);
 	} else {
-		hash = stripe_hash_locks_hash(conf, head_sector);
+		hash = stripe_hash_locks_hash(conf, head_sector, sh->dcl_group);
 		spin_lock_irq(conf->hash_locks + hash);
 		head = find_get_stripe(conf, head_sector, conf->generation,
-				       hash);
+				       hash, sh->dcl_group);
 		spin_unlock_irq(conf->hash_locks + hash);
 		if (!head)
 			return;
@@ -6981,7 +6999,7 @@ static void handle_stripe_expansion(struct r5conf *conf, struct stripe_head *sh)
 			sector_t bn = raid5_compute_blocknr(sh, i, 1);
 			sector_t s = raid5_compute_sector(conf, bn, 0,
 							  &dd_idx, NULL);
-			sh2 = raid5_get_active_stripe(conf, NULL, s,
+			sh2 = raid5_get_active_stripe(conf, NULL, s, 0,
 				R5_GAS_NOBLOCK | R5_GAS_NOQUIESCE);
 			if (sh2 == NULL)
 				/* so far only the early blocks of this stripe
@@ -7709,6 +7727,7 @@ static void handle_stripe(struct stripe_head *sh)
 	if (sh->reconstruct_state == reconstruct_state_result) {
 		struct stripe_head *sh_src
 			= raid5_get_active_stripe(conf, NULL, sh->sector,
+					sh->dcl_group,
 					R5_GAS_PREVIOUS | R5_GAS_NOBLOCK |
 					R5_GAS_NOQUIESCE);
 		if (sh_src && test_bit(STRIPE_EXPAND_SOURCE, &sh_src->state)) {
@@ -8376,7 +8395,8 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 		DEFINE_WAIT(w);
 		int d;
 	again:
-		sh = raid5_get_active_stripe(conf, NULL, logical_sector, 0);
+		sh = raid5_get_active_stripe(conf, NULL, logical_sector,
+					     0 /* dcl group: 1c step 3 */, 0);
 		set_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags);
 		if (test_bit(STRIPE_SYNCING, &sh->state)) {
 			raid5_release_stripe(sh);
@@ -8588,7 +8608,9 @@ static enum stripe_result make_stripe_request(struct mddev *mddev,
 		flags |= R5_GAS_PREVIOUS;
 	if (bi->bi_opf & REQ_RAHEAD)
 		flags |= R5_GAS_NOBLOCK;
-	sh = raid5_get_active_stripe(conf, ctx, new_sector, flags);
+	/* declustered: the group comes out of raid5_compute_sector once the
+	 * map is wired (1c step 3); until then only group-0 arrays activate */
+	sh = raid5_get_active_stripe(conf, ctx, new_sector, 0, flags);
 	if (unlikely(!sh)) {
 		/* cannot get stripe, just give-up */
 		bi->bi_status = BLK_STS_IOERR;
@@ -9694,7 +9716,7 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr, int *sk
 	for (i = 0; i < reshape_sectors; i += RAID5_STRIPE_SECTORS(conf)) {
 		int j;
 		int skipped_disk = 0;
-		sh = raid5_get_active_stripe(conf, NULL, stripe_addr+i,
+		sh = raid5_get_active_stripe(conf, NULL, stripe_addr+i, 0,
 					     R5_GAS_NOQUIESCE);
 		set_bit(STRIPE_EXPANDING, &sh->state);
 		atomic_inc(&conf->reshape_stripes);
@@ -9745,7 +9767,7 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr, int *sk
 	if (last_sector >= mddev->dev_sectors)
 		last_sector = mddev->dev_sectors - 1;
 	while (first_sector <= last_sector) {
-		sh = raid5_get_active_stripe(conf, NULL, first_sector,
+		sh = raid5_get_active_stripe(conf, NULL, first_sector, 0,
 				R5_GAS_PREVIOUS | R5_GAS_NOQUIESCE);
 		set_bit(STRIPE_EXPAND_SOURCE, &sh->state);
 		set_bit(STRIPE_HANDLE, &sh->state);
@@ -9894,9 +9916,9 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		mddev->bitmap_ops->cond_end_sync(mddev, sector_nr, false);
 
 	/* First stripe: block if stripe cache is full, then throttle. */
-	sh = raid5_get_active_stripe(conf, NULL, sector_nr, R5_GAS_NOBLOCK);
+	sh = raid5_get_active_stripe(conf, NULL, sector_nr, 0, R5_GAS_NOBLOCK);
 	if (sh == NULL) {
-		sh = raid5_get_active_stripe(conf, NULL, sector_nr, 0);
+		sh = raid5_get_active_stripe(conf, NULL, sector_nr, 0, 0);
 		schedule_timeout_uninterruptible(1);
 	}
 
@@ -9939,7 +9961,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		    atomic_read(&conf->active_stripes) >=
 		    conf->max_nr_stripes / RAID5_SYNC_HWMARK)
 			break;
-		sh = raid5_get_active_stripe(conf, NULL, win_sector,
+		sh = raid5_get_active_stripe(conf, NULL, win_sector, 0,
 					     R5_GAS_NOBLOCK);
 		if (!sh)
 			break;
@@ -10002,6 +10024,7 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio,
 			continue;
 
 		sh = raid5_get_active_stripe(conf, NULL, sector,
+				0 /* dcl group: 1c step 3 */,
 				R5_GAS_NOBLOCK | R5_GAS_NOQUIESCE);
 		if (!sh) {
 			/* failed to get a stripe - must wait */
@@ -11395,6 +11418,7 @@ static void free_conf(struct r5conf *conf)
 	 * still-queued work, and the workers dereference conf->disks[m].rdev
 	 * for region I/O. */
 	raidkm_csum_cache_free(conf);
+	raidkm_dcl_free(conf);
 	for (i = 0; i < conf->pool_size; i++)
 		if (conf->disks[i].extra_page)
 			put_page(conf->disks[i].extra_page);
@@ -11508,12 +11532,42 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	 */
 	if (mddev->new_level == RAID_KM_LEVEL) {
 		int rkm_m = raidkm_layout_m(mddev->new_layout);
+		int rkm_known = RAIDKM_LAYOUT_KNOWN |
+			(raidkm_layout_is_dcl(mddev->new_layout) ?
+			 (RAIDKM_LAYOUT_DCL | RAIDKM_LAYOUT_DCL_FIELDS) : 0);
 
-		if (mddev->new_layout & ~RAIDKM_LAYOUT_KNOWN) {
+		if (mddev->new_layout & ~rkm_known) {
 			pr_warn("md/raid:%s: raidkm layout 0x%x has unknown bits (known mask 0x%x)\n",
 				mdname(mddev), mddev->new_layout,
-				RAIDKM_LAYOUT_KNOWN);
+				rkm_known);
 			return ERR_PTR(-EINVAL);
+		}
+		/*
+		 * Declustered parity (Phase 1b): the geometry is recognized and
+		 * validated so mdadm/--examine round-trips cleanly, but the
+		 * declustered I/O path (slot->disk indirection, (sector, group)
+		 * stripe identity, distributed-spare rebuild) is not implemented
+		 * yet — refuse activation rather than misinterpret the layout.
+		 * Older raidkm modules reject the DCL bit outright via the
+		 * unknown-bits check above, so a declustered array can never be
+		 * activated by a kernel that would misread it.
+		 */
+		if (raidkm_layout_is_dcl(mddev->new_layout)) {
+			int dcl_g = RAIDKM_LAYOUT_DCL_G(mddev->new_layout);
+			int dcl_s = RAIDKM_LAYOUT_DCL_S(mddev->new_layout);
+			int pool = mddev->raid_disks;
+
+			if (dcl_g <= rkm_m || dcl_s < 1 || pool < dcl_g + dcl_s ||
+			    (pool - dcl_s) % dcl_g) {
+				pr_warn("md/raid:%s: invalid declustered geometry: pool %d, g=%d, m=%d, s=%d (need k>=1, s>=1, (N-s)%%g==0)\n",
+					mdname(mddev), pool, dcl_g, rkm_m, dcl_s);
+				return ERR_PTR(-EINVAL);
+			}
+			/* geometry OK; the rkdcl metadata block is loaded and
+			 * verified later in setup_conf (raidkm_dcl_load, once
+			 * the rdevs are attached) — which is also where
+			 * activation is refused until the declustered I/O
+			 * path (Phase 1c) is complete. */
 		}
 		if (rkm_m < 2 || rkm_m > RAIDKM_MAX_M) {
 			pr_warn("md/raid:%s: raidkm m=%d out of range [2..%d]\n",
@@ -11757,6 +11811,23 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 				       mdname(mddev));
 				goto abort;
 			}
+		}
+		/*
+		 * Declustered (Phase 1c, in progress): load + verify the rkdcl
+		 * metadata block (magic/crc/geometry vs the layout word) and
+		 * regenerate the permutation tables from the recorded seed —
+		 * the loaded seed/perm_crc line in dmesg is pinned against
+		 * mdadm and the reference simulator by the create gate.  The
+		 * declustered I/O path (slot->disk indirection, (sector, group)
+		 * stripe identity) is not complete yet, so activation is still
+		 * refused AFTER a successful load.
+		 */
+		if (raidkm_layout_is_dcl(mddev->new_layout)) {
+			if (raidkm_dcl_load(conf, mddev))
+				goto abort;
+			pr_warn("md/raid:%s: declustered layout recognized but the declustered I/O path is not implemented yet; refusing activation\n",
+				mdname(mddev));
+			goto abort;
 		}
 	} else if (conf->effective_level == 6) {
 		conf->m = 2;
