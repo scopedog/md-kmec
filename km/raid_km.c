@@ -4930,6 +4930,17 @@ static void raid5_error(struct mddev *mddev, struct md_rdev *rdev)
 			mdname(mddev), conf->raid_disks - mddev->degraded);
 	}
 
+	/* Declustered auto-arm: this context cannot journal the spare
+	 * assignment, so only park the failed slot; raid5d arms it via
+	 * raidkm_dcl_arm() (which re-validates — a replacement-device
+	 * failure with the primary alive is dropped there).  v1: single
+	 * assignment — a second failure is left to the operator. */
+	if (conf->dcl && conf->dcl_auto &&
+	    !test_bit(MD_BROKEN, &conf->mddev->flags) &&
+	    conf->reb_state == RKDCL_ASSIGN_NONE && conf->reb_want < 0 &&
+	    rdev->raid_disk >= 0)
+		conf->reb_want = rdev->raid_disk;
+
 	spin_unlock_irqrestore(&conf->device_lock, flags);
 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 
@@ -10490,6 +10501,8 @@ static void raid5_do_work(struct work_struct *work)
  * During the scan, completed stripes are saved for us by the interrupt
  * handler, so that they will not have to wait for our next wakeup.
  */
+static int raidkm_dcl_arm(struct mddev *mddev, unsigned int x);
+
 static void raid5d(struct md_thread *thread)
 {
 	struct mddev *mddev = thread->mddev;
@@ -10512,6 +10525,30 @@ static void raid5d(struct md_thread *thread)
 		set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
 		set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
 		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	}
+
+	/* Declustered auto-arm service: the error handler parked a failed
+	 * slot in reb_want (it cannot journal from its context).  Arm it
+	 * here through the same path as the sysfs store.  trylock only —
+	 * raid5d must never sleep on mddev_lock (md_check_recovery
+	 * precedent); a failed trylock or a running recovery retries on
+	 * the next pass. */
+	if (conf->dcl && READ_ONCE(conf->reb_want) >= 0 &&
+	    md_is_rdwr(mddev) && mddev_trylock(mddev)) {
+		int x = conf->reb_want;
+
+		if (conf->reb_state != RKDCL_ASSIGN_NONE) {
+			conf->reb_want = -1;	/* v1: single assignment */
+		} else if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
+			int err = raidkm_dcl_arm(mddev, x);
+
+			if (err && err != -EBUSY)
+				pr_warn("md/raid:%s: declustered: auto-arm of disk %d failed: %d\n",
+					mdname(mddev), x, err);
+			if (err != -EBUSY)
+				conf->reb_want = -1;
+		}
+		mddev_unlock(mddev);
 	}
 
 	md_check_recovery(mddev);
@@ -10927,11 +10964,51 @@ raidkm_show_dcl_populate(struct mddev *mddev, char *page)
  * the spare columns permanently (until a replacement disk is added, which
  * clears the assignment and rebuilds via stock recovery).
  */
+static int raidkm_dcl_arm(struct mddev *mddev, unsigned int x)
+{
+	struct r5conf *conf = mddev->private;
+	struct md_rdev *rdev;
+	unsigned long flags;
+	int err;
+
+	if (!conf || !conf->dcl)
+		return -ENODEV;
+	if (x >= (unsigned int)mddev->raid_disks)
+		return -EINVAL;
+	if (conf->reb_state != RKDCL_ASSIGN_NONE ||
+	    test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+		return -EBUSY;
+	rdev = conf->disks[x].rdev;
+	if (rdev && !test_bit(Faulty, &rdev->flags))
+		return -EINVAL;	/* member is alive */
+
+	spin_lock_irqsave(&conf->reb_win_lock, flags);
+	conf->reb_win_base = 0;
+	bitmap_zero(conf->reb_win_bits, RKDCL_REB_WINDOW);
+	spin_unlock_irqrestore(&conf->reb_win_lock, flags);
+	atomic64_set(&conf->reb_mark, 0);
+	conf->reb_disk = x;
+	conf->reb_spare = 0;	/* v1: single assignment */
+	conf->reb_state = RKDCL_ASSIGN_POPULATING;
+	err = raidkm_dcl_journal_write(conf);
+	if (err) {
+		conf->reb_state = RKDCL_ASSIGN_NONE;
+		conf->reb_disk = -1;
+		conf->reb_spare = -1;
+		return err;
+	}
+	pr_info("md/raid:%s: declustered: population ARMED: disk %u -> spare col 0\n",
+		mdname(mddev), x);
+	set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+	set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	md_wakeup_thread(mddev->thread);
+	return 0;
+}
+
 static ssize_t
 raidkm_store_dcl_populate(struct mddev *mddev, const char *page, size_t len)
 {
-	struct r5conf *conf;
-	struct md_rdev *rdev;
 	unsigned int x;
 	int err;
 
@@ -10943,44 +11020,7 @@ raidkm_store_dcl_populate(struct mddev *mddev, const char *page, size_t len)
 	err = mddev_lock(mddev);
 	if (err)
 		return err;
-	conf = mddev->private;
-	if (!conf || !conf->dcl)
-		err = -ENODEV;
-	else if (x >= (unsigned int)mddev->raid_disks)
-		err = -EINVAL;
-	else if (conf->reb_state != RKDCL_ASSIGN_NONE ||
-		 test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
-		err = -EBUSY;
-	else {
-		rdev = conf->disks[x].rdev;
-		if (rdev && !test_bit(Faulty, &rdev->flags)) {
-			err = -EINVAL;	/* member is alive */
-		} else {
-			unsigned long flags;
-
-			spin_lock_irqsave(&conf->reb_win_lock, flags);
-			conf->reb_win_base = 0;
-			bitmap_zero(conf->reb_win_bits, RKDCL_REB_WINDOW);
-			spin_unlock_irqrestore(&conf->reb_win_lock, flags);
-			atomic64_set(&conf->reb_mark, 0);
-			conf->reb_disk = x;
-			conf->reb_spare = 0;	/* v1: single assignment */
-			conf->reb_state = RKDCL_ASSIGN_POPULATING;
-			err = raidkm_dcl_journal_write(conf);
-			if (err) {
-				conf->reb_state = RKDCL_ASSIGN_NONE;
-				conf->reb_disk = -1;
-				conf->reb_spare = -1;
-			} else {
-				pr_info("md/raid:%s: declustered: population ARMED: disk %u -> spare col 0\n",
-					mdname(mddev), x);
-				set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
-				set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
-				set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
-				md_wakeup_thread(mddev->thread);
-			}
-		}
-	}
+	err = raidkm_dcl_arm(mddev, x);
 	mddev_unlock(mddev);
 	return err ?: len;
 }
@@ -10989,6 +11029,56 @@ static struct md_sysfs_entry
 raidkm_dcl_populate = __ATTR(rk_dcl_populate, S_IRUGO | S_IWUSR,
 			     raidkm_show_dcl_populate,
 			     raidkm_store_dcl_populate);
+
+/*
+ * rk_dcl_auto: arm population automatically when a member fails.  The
+ * error handler runs in a context that cannot journal the assignment, so
+ * it only parks the failed slot in conf->reb_want; raid5d services it
+ * through the same raidkm_dcl_arm() path as the sysfs store.  Off by
+ * default and not persisted (matches other md tunables).
+ */
+static ssize_t
+raidkm_show_dcl_auto(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	ssize_t ret = -ENODEV;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf && conf->dcl)
+		ret = sprintf(page, "%d\n", conf->dcl_auto ? 1 : 0);
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+static ssize_t
+raidkm_store_dcl_auto(struct mddev *mddev, const char *page, size_t len)
+{
+	struct r5conf *conf;
+	unsigned int v;
+	int err;
+
+	if (len >= PAGE_SIZE)
+		return -EINVAL;
+	if (kstrtouint(page, 10, &v) || v > 1)
+		return -EINVAL;
+
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf || !conf->dcl)
+		err = -ENODEV;
+	else
+		conf->dcl_auto = v;
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_dcl_auto = __ATTR(rk_dcl_auto, S_IRUGO | S_IWUSR,
+			 raidkm_show_dcl_auto,
+			 raidkm_store_dcl_auto);
 
 static ssize_t
 stripe_cache_active_show(struct mddev *mddev, char *page)
@@ -11635,6 +11725,7 @@ static struct attribute *raid5_attrs[] =  {
 	&raid5_worker_thread_cnt.attr,
 	&raid5_skip_copy.attr,
 	&raidkm_dcl_populate.attr,
+	&raidkm_dcl_auto.attr,
 	&raid5_rmw_level.attr,
 	&raid5_stripe_size.attr,
 	&r5c_journal_mode.attr,

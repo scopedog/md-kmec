@@ -35,8 +35,8 @@ set -u
 SIM_SRC="$RK_TREE/tools/declustered-sim.c"
 SIM="$RK_TMP/declustered-sim"
 
-N=14; G=6; M=2; SC=2; NBASE=16
-SEED=0x10			# the accepted seed for this geometry (pinned)
+N=${DCL_N:-14}; G=${DCL_G:-6}; M=${DCL_M:-2}; SC=${DCL_SC:-2}; NBASE=${DCL_NBASE:-16}
+SEED=${DCL_SEED:-0x10}		# the accepted seed for this geometry (pinned)
 CS=$((CHUNK_KB * 2))		# chunk in sectors
 NVEC=4096			# vectors cover lcs 0..4095 (256 MiB of lspace)
 FIO_OFF=$((128 * 1024 * 1024))	# healthy baseline region: lcs 2048..3071

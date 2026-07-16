@@ -969,6 +969,14 @@ struct r5conf {
 	spinlock_t		reb_win_lock;	/* prefix-completion window	*/
 	u64			reb_win_base;	/* == atomic64_read(reb_mark)	*/
 	unsigned long		*reb_win_bits;	/* RKDCL_REB_WINDOW bits	*/
+	int			reb_want;	/* deferred auto-arm target
+						 * (physical index, set by the
+						 * error handler under
+						 * device_lock, serviced by
+						 * raid5d), -1 if none	*/
+	bool			dcl_auto;	/* arm population on member
+						 * failure (sysfs rk_dcl_auto,
+						 * default off, not persisted) */
 	struct raidkm_csum_cache *csum;	/* demand-paged region-page cache;
 					 * non-NULL == native checksum on */
 	bool			csum_disk;

@@ -348,6 +348,7 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 	spin_lock_init(&conf->reb_win_lock);
 	conf->reb_state = RKDCL_ASSIGN_NONE;
 	conf->reb_disk = -1;
+	conf->reb_want = -1;
 	conf->reb_spare = -1;
 	conf->reb_gen = best_gen;
 	/* window allocated unconditionally: runtime arming needs it too */
