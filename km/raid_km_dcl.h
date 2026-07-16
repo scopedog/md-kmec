@@ -173,12 +173,19 @@ static inline u32 dcl_inverse(const struct dcl_geom *ge, u32 disk,
  * All multi-byte fields little-endian.  Versioned: the Phase-3
  * spare-assignment table + rebuild high-water mark extend it. */
 #define RKDCL_MAGIC		"RKDCLMD1"
-#define RKDCL_SB_VERSION	1
+#define RKDCL_SB_VERSION	1	/* geometry only			*/
+#define RKDCL_SB_VERSION2	2	/* + spare assignment / rebuild mark	*/
 #define RKDCL_SB_BYTES		4096
+
+/* v2 spare-assignment state (notes/declustered-population-design.md §2) */
+#define RKDCL_NO_ASSIGN		(~0U)
+#define RKDCL_ASSIGN_NONE	0	/* no assignment		*/
+#define RKDCL_ASSIGN_POPULATING	1	/* rebuild into spare running	*/
+#define RKDCL_ASSIGN_POPULATED	2	/* redirect permanent		*/
 
 struct rkdcl_sb {
 	char		magic[8];	/* RKDCL_MAGIC, no NUL		*/
-	__le32		version;	/* RKDCL_SB_VERSION		*/
+	__le32		version;	/* RKDCL_SB_VERSION{,2}		*/
 	__le32		hdr_crc;	/* crc32-le of the 4 KiB block
 					 * with this field zeroed	*/
 	__le32		pool_disks;	/* N — cross-check vs SB	*/
@@ -189,6 +196,16 @@ struct rkdcl_sb {
 	__le32		nbase;		/* base permutations		*/
 	__le64		seed;		/* accepted permutation seed	*/
 	__le64		flags;		/* 0				*/
+	/* ---- v2 fields (zero in v1 blocks) --------------------------- */
+	__le64		gen;		/* journal generation; highest
+					 * crc-valid copy wins on load	*/
+	__le32		assign_disk;	/* X, or RKDCL_NO_ASSIGN	*/
+	__le32		assign_spare;	/* spare column index j		*/
+	__le32		assign_state;	/* RKDCL_ASSIGN_*		*/
+	__le32		pad0;
+	__le64		assign_mark;	/* journaled read mark, DEVICE
+					 * SECTORS; <= the runtime
+					 * prefix mark			*/
 	/* pad to RKDCL_SB_BYTES */
 } __packed;
 

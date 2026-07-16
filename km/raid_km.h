@@ -950,6 +950,25 @@ struct r5conf {
 					 * (raidkm_dcl_load); NULL unless
 					 * RAIDKM_LAYOUT_DCL.  Freed with the
 					 * conf. */
+	/*
+	 * Declustered spare-assignment / population state (Phase 3,
+	 * notes/declustered-population-design.md).  Loaded from the highest-
+	 * generation rkdcl v2 block; journaled back on state transitions and
+	 * mark checkpoints.  reb_state == RKDCL_ASSIGN_NONE means no redirect.
+	 * reb_mark is the RUNTIME prefix read-mark in rows: X-slot reads below
+	 * it are served from the spare column; at or above it the slot is
+	 * failed (on-the-fly decode).  X-slot WRITES redirect for ALL rows
+	 * while an assignment is active (the §1 ordering invariant).
+	 */
+	int			reb_state;	/* RKDCL_ASSIGN_*		*/
+	int			reb_disk;	/* X (physical), -1 if none	*/
+	int			reb_spare;	/* spare column index j		*/
+	atomic64_t		reb_mark;	/* runtime prefix read-mark	*/
+	u64			reb_journal_mark; /* last checkpointed mark	*/
+	u64			reb_gen;	/* journal generation		*/
+	spinlock_t		reb_win_lock;	/* prefix-completion window	*/
+	u64			reb_win_base;	/* == atomic64_read(reb_mark)	*/
+	unsigned long		*reb_win_bits;	/* RKDCL_REB_WINDOW bits	*/
 	struct raidkm_csum_cache *csum;	/* demand-paged region-page cache;
 					 * non-NULL == native checksum on */
 	bool			csum_disk;
@@ -1274,4 +1293,10 @@ void raidkm_ppl_encode_modified(struct r5conf *conf, void **src,
  * permutation tables into conf->dcl (raid_km-dcl.c) */
 int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev);
 void raidkm_dcl_free(struct r5conf *conf);
+/* Declustered Phase 3: spare-assignment journal + population prefix mark
+ * (raid_km-dcl.c; notes/declustered-population-design.md) */
+#define RKDCL_REB_WINDOW	16384	/* stripe-address granules; must
+					 * exceed md's sync flight window */
+int raidkm_dcl_journal_write(struct r5conf *conf);
+void raidkm_dcl_pop_done(struct r5conf *conf, sector_t sector);
 #endif

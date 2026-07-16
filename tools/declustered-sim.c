@@ -435,6 +435,40 @@ static void emit_vectors(const struct dcl_geom *ge, const char *path, u64 nvec)
 	       (unsigned long long)nvec, path);
 }
 
+/* Full per-row layout dump: every logical column's physical disk and role
+ * (Dg.s = data slot s of group g, Pg.j = parity j of group g, Sj = spare
+ * column j).  The Phase-3 population gate uses the Sj columns — the spare
+ * disks are not derivable from the data-chunk vectors. */
+static void emit_rowmap(const struct dcl_geom *ge, const char *path, u64 nrows)
+{
+	FILE *f = fopen(path, "w");
+	u64 row;
+	u32 lcol;
+
+	if (!f) { perror(path); return; }
+	fprintf(f, "# declustered-sim rowmap v1: row lcol disk role\n");
+	for (row = 0; row < nrows; row++)
+		for (lcol = 0; lcol < ge->N; lcol++) {
+			u32 d = dcl_disk(ge, row, lcol);
+			char role[32];
+
+			if (lcol >= ge->ngroups * ge->g)
+				snprintf(role, sizeof(role), "S%u",
+					 lcol - ge->ngroups * ge->g);
+			else if (lcol % ge->g >= ge->k)
+				snprintf(role, sizeof(role), "P%u.%u",
+					 lcol / ge->g, lcol % ge->g - ge->k);
+			else
+				snprintf(role, sizeof(role), "D%u.%u",
+					 lcol / ge->g, lcol % ge->g);
+			fprintf(f, "%llu\t%u\t%u\t%s\n",
+				(unsigned long long)row, lcol, d, role);
+		}
+	fclose(f);
+	printf("wrote %llu rowmap rows to %s\n",
+	       (unsigned long long)nrows, path);
+}
+
 /* ---- main ----------------------------------------------------------------- */
 
 static void usage(const char *argv0)
@@ -442,7 +476,8 @@ static void usage(const char *argv0)
 	fprintf(stderr,
 		"usage: %s -N <pool> -g <group=k+m> -m <parity> -s <spares>\n"
 		"          [-b nbase=4] [-S seed=1] [-T tries=64]\n"
-		"          [--vectors <file>] [--nvec <n=1024>] [-q]\n"
+		"          [--vectors <file>] [--nvec <n=1024>]\n"
+		"          [--rowmap <file>] [--nrows <n=64>] [-q]\n"
 		"constraint C1: (N - s) %% g == 0\n", argv0);
 	exit(2);
 }
@@ -452,9 +487,9 @@ int main(int argc, char **argv)
 	struct dcl_geom ge;
 	struct accept_result best;
 	struct p2_metrics pm;
-	u64 seed0 = 1, nvec = 1024;
+	u64 seed0 = 1, nvec = 1024, nrows = 64;
 	u32 tries = 64, X;
-	const char *vecpath = NULL;
+	const char *vecpath = NULL, *rowmappath = NULL;
 	int i, verbose = 1, ok = 1;
 
 	memset(&ge, 0, sizeof(ge));
@@ -470,6 +505,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "-T") && i + 1 < argc)  tries = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--vectors") && i + 1 < argc) vecpath = argv[++i];
 		else if (!strcmp(argv[i], "--nvec") && i + 1 < argc) nvec = strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--rowmap") && i + 1 < argc) rowmappath = argv[++i];
+		else if (!strcmp(argv[i], "--nrows") && i + 1 < argc) nrows = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "-q"))                  verbose = 0;
 		else usage(argv[0]);
 	}
@@ -527,6 +564,8 @@ int main(int argc, char **argv)
 
 	if (vecpath)
 		emit_vectors(&ge, vecpath, nvec);
+	if (rowmappath)
+		emit_rowmap(&ge, rowmappath, nrows);
 
 	printf("%s\n", ok ? "ALL CHECKS PASSED" : "CHECKS FAILED");
 	free(ge.base); free(ge.ibase);

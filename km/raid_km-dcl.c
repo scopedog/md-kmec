@@ -208,77 +208,112 @@ MODULE_PARM_DESC(dcl_selftest,
 
 /* ---- Phase 1c: load the on-disk rkdcl metadata block at setup_conf -------- */
 
-/* Read + verify one member's rkdcl metadata block (magic, version, crc,
- * geometry vs the layout word), regenerate the permutation tables from the
- * recorded seed, and hang the result off conf->dcl.  Called from setup_conf
- * with the rdevs attached; any failure aborts activation — a declustered
- * array must never run on a guessed or stale map.
- */
-int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
+/* Verify a candidate rkdcl block (magic, version 1 or 2, crc, geometry vs
+ * the layout word, v2 assignment sanity).  Returns 0 if the block is valid
+ * for this array. */
+static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 {
-	struct md_rdev *rdev, *from = NULL;
-	struct rkdcl_sb *blk;
-	struct dcl_geom *ge = NULL;
-	struct page *pg;
-	u32 crc, want, perm_crc;
 	int layout = mddev->new_layout;
-	int err = -EINVAL;
-
-	BUILD_BUG_ON(sizeof(struct rkdcl_sb) > RKDCL_SB_BYTES);
-	BUILD_BUG_ON(offsetof(struct rkdcl_sb, seed) != 40);
-
-	rdev_for_each(rdev, mddev) {
-		if (rdev->bdev && !test_bit(Faulty, &rdev->flags)) {
-			from = rdev;
-			break;
-		}
-	}
-	if (!from) {
-		pr_err("md/raid:%s: declustered: no readable member for the rkdcl metadata block\n",
-		       mdname(mddev));
-		return -EINVAL;
-	}
-
-	pg = alloc_page(GFP_KERNEL);
-	if (!pg)
-		return -ENOMEM;
-	/* The block sits at data_offset + data_size == dev_sectors (the same
-	 * derivation as the native-checksum region); sync_page_io takes the
-	 * data-relative sector. */
-	if (!sync_page_io(from, mddev->dev_sectors, RKDCL_SB_BYTES, pg,
-			  REQ_OP_READ, false)) {
-		pr_err("md/raid:%s: declustered: rkdcl metadata read failed on %pg\n",
-		       mdname(mddev), from->bdev);
-		err = -EIO;
-		goto out_page;
-	}
-	blk = page_address(pg);
+	u32 vers = le32_to_cpu(blk->version);
+	u32 crc, want;
 
 	if (memcmp(blk->magic, RKDCL_MAGIC, 8) ||
-	    le32_to_cpu(blk->version) != RKDCL_SB_VERSION) {
-		pr_err("md/raid:%s: declustered: bad rkdcl magic/version on %pg\n",
-		       mdname(mddev), from->bdev);
-		goto out_page;
-	}
+	    vers < RKDCL_SB_VERSION || vers > RKDCL_SB_VERSION2)
+		return -EINVAL;
 	want = le32_to_cpu(blk->hdr_crc);
 	blk->hdr_crc = 0;
 	crc = crc32_le(~0U, (const u8 *)blk, RKDCL_SB_BYTES) ^ ~0U;
 	blk->hdr_crc = cpu_to_le32(want);
-	if (crc != want) {
-		pr_err("md/raid:%s: declustered: rkdcl crc mismatch on %pg (0x%08x != 0x%08x)\n",
-		       mdname(mddev), from->bdev, crc, want);
-		goto out_page;
-	}
+	if (crc != want)
+		return -EINVAL;
 	/* geometry must agree with the layout word and the rdev count */
 	if (le32_to_cpu(blk->pool_disks) != (u32)mddev->raid_disks ||
 	    le32_to_cpu(blk->group_width) != (u32)RAIDKM_LAYOUT_DCL_G(layout) ||
 	    le32_to_cpu(blk->parity) != (u32)raidkm_layout_m(layout) ||
 	    le32_to_cpu(blk->spare_cols) != (u32)RAIDKM_LAYOUT_DCL_S(layout) ||
-	    !le32_to_cpu(blk->nbase) || le32_to_cpu(blk->nbase) > 64) {
-		pr_err("md/raid:%s: declustered: rkdcl block disagrees with the superblock layout\n",
-		       mdname(mddev));
+	    !le32_to_cpu(blk->nbase) || le32_to_cpu(blk->nbase) > 64)
+		return -EINVAL;
+	if (vers >= RKDCL_SB_VERSION2) {
+		u32 x = le32_to_cpu(blk->assign_disk);
+		u32 j = le32_to_cpu(blk->assign_spare);
+		u32 st = le32_to_cpu(blk->assign_state);
+
+		if (st > RKDCL_ASSIGN_POPULATED)
+			return -EINVAL;
+		if (st != RKDCL_ASSIGN_NONE &&
+		    (x >= le32_to_cpu(blk->pool_disks) ||
+		     j >= le32_to_cpu(blk->spare_cols)))
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/* Read + verify the rkdcl metadata block from EVERY readable member and keep
+ * the highest-generation valid copy (v1 blocks count as gen 0) — a torn
+ * multi-member journal update must never roll the assignment state back
+ * further than the last checkpoint.  Regenerate the permutation tables from
+ * the recorded seed, hang the result off conf->dcl, and restore the Phase-3
+ * spare-assignment state.  Called from setup_conf with the rdevs attached;
+ * total failure aborts activation — a declustered array must never run on a
+ * guessed or stale map.
+ */
+int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
+{
+	struct md_rdev *rdev;
+	struct rkdcl_sb *blk, *best;
+	struct dcl_geom *ge = NULL;
+	struct page *pg, *best_pg;
+	u32 perm_crc;
+	u64 best_gen = 0;
+	bool have_best = false;
+	int nread = 0;
+	int err = -EINVAL;
+
+	BUILD_BUG_ON(sizeof(struct rkdcl_sb) > RKDCL_SB_BYTES);
+	BUILD_BUG_ON(offsetof(struct rkdcl_sb, seed) != 40);
+	BUILD_BUG_ON(offsetof(struct rkdcl_sb, gen) != 56);
+	BUILD_BUG_ON(offsetof(struct rkdcl_sb, assign_mark) != 80);
+
+	pg = alloc_page(GFP_KERNEL);
+	best_pg = alloc_page(GFP_KERNEL);
+	if (!pg || !best_pg) {
+		err = -ENOMEM;
 		goto out_page;
 	}
+	blk = page_address(pg);
+	best = page_address(best_pg);
+
+	rdev_for_each(rdev, mddev) {
+		u64 gen;
+
+		if (!rdev->bdev || test_bit(Faulty, &rdev->flags))
+			continue;
+		/* The block sits at data_offset + data_size == dev_sectors
+		 * (the same derivation as the native-checksum region);
+		 * sync_page_io takes the data-relative sector. */
+		if (!sync_page_io(rdev, mddev->dev_sectors, RKDCL_SB_BYTES,
+				  pg, REQ_OP_READ, false)) {
+			pr_warn("md/raid:%s: declustered: rkdcl metadata read failed on %pg\n",
+				mdname(mddev), rdev->bdev);
+			continue;
+		}
+		nread++;
+		if (rkdcl_verify_blk(mddev, blk))
+			continue;
+		gen = le32_to_cpu(blk->version) >= RKDCL_SB_VERSION2 ?
+			le64_to_cpu(blk->gen) : 0;
+		if (!have_best || gen > best_gen) {
+			memcpy(best, blk, RKDCL_SB_BYTES);
+			best_gen = gen;
+			have_best = true;
+		}
+	}
+	if (!have_best) {
+		pr_err("md/raid:%s: declustered: no valid rkdcl metadata block on any member (%d readable)\n",
+		       mdname(mddev), nread);
+		goto out_page;
+	}
+	blk = best;
 
 	ge = kzalloc(sizeof(*ge), GFP_KERNEL);
 	if (!ge) {
@@ -305,11 +340,49 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 	perm_crc = crc32_le(~0U, (const u8 *)ge->base,
 			    (size_t)ge->nbase * ge->N * sizeof(u32)) ^ ~0U;
 
+	/* Phase 3: restore the spare-assignment / population state from the
+	 * winning (highest-gen) block.  The journal mark is a safe UNDER-
+	 * estimate of progress (checkpoints lag the runtime prefix mark);
+	 * population redoes rows [journal, crash) — idempotent spare
+	 * rewrites. */
+	spin_lock_init(&conf->reb_win_lock);
+	conf->reb_state = RKDCL_ASSIGN_NONE;
+	conf->reb_disk = -1;
+	conf->reb_spare = -1;
+	conf->reb_gen = best_gen;
+	/* window allocated unconditionally: runtime arming needs it too */
+	conf->reb_win_bits = bitmap_zalloc(RKDCL_REB_WINDOW, GFP_KERNEL);
+	if (!conf->reb_win_bits) {
+		err = -ENOMEM;
+		goto out_ge;
+	}
+	if (le32_to_cpu(blk->version) >= RKDCL_SB_VERSION2 &&
+	    le32_to_cpu(blk->assign_state) != RKDCL_ASSIGN_NONE) {
+		u64 mark = le64_to_cpu(blk->assign_mark);	/* sectors */
+		u64 base = mark;
+
+		do_div(base, RAID5_STRIPE_SECTORS(conf));
+		conf->reb_state = le32_to_cpu(blk->assign_state);
+		conf->reb_disk  = le32_to_cpu(blk->assign_disk);
+		conf->reb_spare = le32_to_cpu(blk->assign_spare);
+		atomic64_set(&conf->reb_mark, mark);
+		conf->reb_journal_mark = mark;
+		conf->reb_win_base = base;	/* stripe-address granules */
+	}
+
 	conf->dcl = ge;
 	pr_info("md/raid:%s: declustered geometry loaded: pool N=%u, %u groups of g=%u (k=%u+m=%u), %u spare col(s)/row, nbase=%u seed=0x%llx perm_crc=0x%08x\n",
 		mdname(mddev), ge->N, ge->ngroups, ge->g, ge->k, ge->m,
 		ge->s, ge->nbase, (unsigned long long)ge->seed, perm_crc);
+	if (conf->reb_state != RKDCL_ASSIGN_NONE)
+		pr_info("md/raid:%s: declustered: spare assignment restored: disk %d -> spare col %d, %s, mark %llu (gen %llu)\n",
+			mdname(mddev), conf->reb_disk, conf->reb_spare,
+			conf->reb_state == RKDCL_ASSIGN_POPULATING ?
+				"POPULATING" : "POPULATED",
+			(unsigned long long)atomic64_read(&conf->reb_mark),
+			(unsigned long long)conf->reb_gen);
 	__free_page(pg);
+	__free_page(best_pg);
 	return 0;
 
 out_ge:
@@ -317,7 +390,10 @@ out_ge:
 	kvfree(ge->ibase);
 	kfree(ge);
 out_page:
-	__free_page(pg);
+	if (pg)
+		__free_page(pg);
+	if (best_pg)
+		__free_page(best_pg);
 	return err;
 }
 
@@ -329,4 +405,107 @@ void raidkm_dcl_free(struct r5conf *conf)
 	kvfree(conf->dcl->ibase);
 	kfree(conf->dcl);
 	conf->dcl = NULL;
+	bitmap_free(conf->reb_win_bits);
+	conf->reb_win_bits = NULL;
+}
+
+/* ---- Phase 3: the rkdcl journal (spare assignment + rebuild mark) --------- */
+
+/* Build the on-disk block from the conf state (geometry from conf->dcl,
+ * assignment from conf->reb_*).  The kernel always writes v2. */
+static void rkdcl_build_blk(struct r5conf *conf, struct rkdcl_sb *blk)
+{
+	struct dcl_geom *ge = conf->dcl;
+
+	memset(blk, 0, RKDCL_SB_BYTES);
+	memcpy(blk->magic, RKDCL_MAGIC, 8);
+	blk->version	 = cpu_to_le32(RKDCL_SB_VERSION2);
+	blk->pool_disks	 = cpu_to_le32(ge->N);
+	blk->group_width = cpu_to_le32(ge->g);
+	blk->parity	 = cpu_to_le32(ge->m);
+	blk->spare_cols	 = cpu_to_le32(ge->s);
+	blk->ngroups	 = cpu_to_le32(ge->ngroups);
+	blk->nbase	 = cpu_to_le32(ge->nbase);
+	blk->seed	 = cpu_to_le64(ge->seed);
+	blk->gen	 = cpu_to_le64(conf->reb_gen);
+	blk->assign_state = cpu_to_le32(conf->reb_state);
+	if (conf->reb_state != RKDCL_ASSIGN_NONE) {
+		blk->assign_disk  = cpu_to_le32(conf->reb_disk);
+		blk->assign_spare = cpu_to_le32(conf->reb_spare);
+		blk->assign_mark  = cpu_to_le64(conf->reb_journal_mark);
+	} else {
+		blk->assign_disk  = cpu_to_le32(RKDCL_NO_ASSIGN);
+	}
+	blk->hdr_crc = 0;
+	blk->hdr_crc = cpu_to_le32(crc32_le(~0U, (const u8 *)blk,
+					    RKDCL_SB_BYTES) ^ ~0U);
+}
+
+/* Checkpoint the assignment state to every live member (gen++, FUA).
+ * BLOCKING — md sync-thread / arming / add_disk context only, never the
+ * stripe path (the P3a rule).  Success = at least one member carries the new
+ * generation (highest-gen wins on load; members that missed it only cost
+ * journal freshness, never correctness — the mark is an under-estimate).
+ */
+int raidkm_dcl_journal_write(struct r5conf *conf)
+{
+	struct mddev *mddev = conf->mddev;
+	struct md_rdev *rdev;
+	struct page *pg;
+	int written = 0;
+
+	pg = alloc_page(GFP_KERNEL);
+	if (!pg)
+		return -ENOMEM;
+	conf->reb_gen++;
+	conf->reb_journal_mark = (u64)atomic64_read(&conf->reb_mark);
+	rkdcl_build_blk(conf, page_address(pg));
+
+	rdev_for_each(rdev, mddev) {
+		if (!rdev->bdev || test_bit(Faulty, &rdev->flags))
+			continue;
+		/* PREFLUSH: the journaled mark asserts "spare writes below
+		 * this are durable" — flush each member's cache (population
+		 * data writes are not FUA) before the FUA'd journal block. */
+		if (sync_page_io(rdev, mddev->dev_sectors, RKDCL_SB_BYTES, pg,
+				 REQ_OP_WRITE | REQ_SYNC | REQ_PREFLUSH |
+				 REQ_FUA, false))
+			written++;
+		else
+			pr_warn("md/raid:%s: declustered: rkdcl journal write failed on %pg\n",
+				mdname(mddev), rdev->bdev);
+	}
+	__free_page(pg);
+	return written ? 0 : -EIO;
+}
+
+/* A population stripe address (or a skipped one) is durably done; advance
+ * the prefix read-mark.  The window is in STRIPE-ADDRESS granules (one row =
+ * chunk_sectors / RAID5_STRIPE_SECTORS of them); the exported reb_mark is in
+ * DEVICE SECTORS.  Completions may reorder inside md's flight window, so
+ * they are collected in a circular bitmap and the mark only advances over a
+ * solid prefix (a populated-but-unmarked row keeps decoding on the fly —
+ * correct, merely slower). */
+void raidkm_dcl_pop_done(struct r5conf *conf, sector_t sector)
+{
+	u64 granule = (u64)sector;
+	unsigned long flags;
+
+	do_div(granule, RAID5_STRIPE_SECTORS(conf));
+	spin_lock_irqsave(&conf->reb_win_lock, flags);
+	if (granule < conf->reb_win_base)	/* journal-resume redo */
+		goto out;
+	if (WARN_ON_ONCE(granule >= conf->reb_win_base + RKDCL_REB_WINDOW))
+		goto out;	/* mark stalls; correctness kept (decode) */
+	__set_bit(granule % RKDCL_REB_WINDOW, conf->reb_win_bits);
+	while (test_bit(conf->reb_win_base % RKDCL_REB_WINDOW,
+			conf->reb_win_bits)) {
+		__clear_bit(conf->reb_win_base % RKDCL_REB_WINDOW,
+			    conf->reb_win_bits);
+		conf->reb_win_base++;
+	}
+	atomic64_set(&conf->reb_mark,
+		     conf->reb_win_base * RAID5_STRIPE_SECTORS(conf));
+out:
+	spin_unlock_irqrestore(&conf->reb_win_lock, flags);
 }

@@ -147,21 +147,90 @@ static inline int stripe_hash_locks_hash(struct r5conf *conf, sector_t sect,
 		(sector_t)dcl_group * 7919) & STRIPE_HASH_LOCKS_MASK;
 }
 
+/* Declustered Phase 3: the spare-column redirect
+ * (notes/declustered-population-design.md §1).  While a spare assignment
+ * {X -> spare col j} is active, a slot mapped to X is served elsewhere:
+ *
+ *   WRITES redirect to spare_disk(row) for ALL rows the moment the
+ *   assignment arms — a write to a not-yet-populated row lands on the spare
+ *   AND updates parity, so the later population decode reproduces the same
+ *   bytes (idempotent); anything narrower reopens the populated-but-unmarked
+ *   stale-spare window.
+ *   READS redirect only below the prefix mark (rows whose population write
+ *   completed); above it the slot stays failed and decodes on the fly.
+ *   POPULATED redirects both, unconditionally.
+ *
+ * reb_mark is kept in DEVICE SECTORS (a row is covered iff its whole chunk
+ * is below the mark).  State transitions that would move a mapping backwards
+ * (clearing the assignment for rebalance) happen only under a full quiesce.
+ */
+static inline int raidkm_dcl_redirect(struct r5conf *conf, int disk,
+				      sector_t row, bool for_write)
+{
+	if (likely(conf->reb_state == RKDCL_ASSIGN_NONE) ||
+	    disk != conf->reb_disk)
+		return disk;
+	if (conf->reb_state == RKDCL_ASSIGN_POPULATED || for_write ||
+	    (row + 1) * conf->chunk_sectors <=
+			(u64)atomic64_read(&conf->reb_mark))
+		return dcl_disk(conf->dcl, row,
+				conf->dcl->ngroups * conf->dcl->g +
+				conf->reb_spare);
+	return disk;
+}
+
 /* Declustered D1: slot -> physical disk.  A pure function of
  * (sh->sector, dcl_group, slot) — row == device chunk, logical column ==
  * group*g + slot — so no per-stripe ddisk[] storage is needed at all.
- * Identity on non-declustered arrays. */
-static inline int raidkm_sh_pdisk(struct r5conf *conf,
-				  struct stripe_head *sh, int i)
+ * Identity on non-declustered arrays.  The _w variant is the WRITE-side
+ * map (see raidkm_dcl_redirect); every other consumer wants the read map. */
+static inline int raidkm_sh_pdisk_rw(struct r5conf *conf,
+				     struct stripe_head *sh, int i,
+				     bool for_write)
 {
 	sector_t row;
+	int disk;
 
 	if (!conf->dcl)
 		return i;
 	row = sh->sector;
 	sector_div(row, conf->chunk_sectors);
-	return dcl_disk(conf->dcl, row,
+	disk = dcl_disk(conf->dcl, row,
 			sh->dcl_group * conf->dcl->g + i);
+	return raidkm_dcl_redirect(conf, disk, row, for_write);
+}
+
+static inline int raidkm_sh_pdisk(struct r5conf *conf,
+				  struct stripe_head *sh, int i)
+{
+	return raidkm_sh_pdisk_rw(conf, sh, i, false);
+}
+
+static inline int raidkm_sh_pdisk_w(struct r5conf *conf,
+				    struct stripe_head *sh, int i)
+{
+	return raidkm_sh_pdisk_rw(conf, sh, i, true);
+}
+
+/* The population target slot of THIS stripe, or -1: the slot whose mapped
+ * disk is the armed X (at most one per stripe, bijectivity) when its group
+ * is the one the population pass issued for this row. */
+static inline int raidkm_dcl_pop_slot(struct r5conf *conf,
+				      struct stripe_head *sh)
+{
+	sector_t row;
+	u32 lcol;
+
+	if (conf->reb_state != RKDCL_ASSIGN_POPULATING)
+		return -1;
+	row = sh->sector;
+	sector_div(row, conf->chunk_sectors);
+	lcol = dcl_lcol(conf->dcl, row, conf->reb_disk);
+	if (lcol >= conf->dcl->ngroups * conf->dcl->g)
+		return -1;			/* X is a spare column here */
+	if ((int)(lcol / conf->dcl->g) != sh->dcl_group)
+		return -1;			/* other group's stripe */
+	return lcol % conf->dcl->g;
 }
 
 /* Declustered: which group of its row a LOGICAL sector belongs to (the
@@ -2328,8 +2397,10 @@ again:
 				raidkm_block_crc(conf, dev->page, dev->offset));
 
 		{
-			/* declustered D1: slot i lives on pdisk, not disk i */
-			int pd = raidkm_sh_pdisk(conf, sh, i);
+			/* declustered D1: slot i lives on pdisk, not disk i;
+			 * writes follow the Phase-3 spare redirect */
+			int pd = raidkm_sh_pdisk_rw(conf, sh, i,
+						    op_is_write(op));
 
 			rdev = conf->disks[pd].rdev;
 			rrdev = conf->disks[pd].replacement;
@@ -4013,7 +4084,8 @@ static void ops_run_check_pq(struct stripe_head *sh, struct raid5_percpu *percpu
 				 *    path), silently leaving the array under-protected.
 				 */
 				if (!uptodate) {
-					struct md_rdev *prdev = conf->disks[pslot].rdev;
+					struct md_rdev *prdev = conf->disks[
+						raidkm_sh_pdisk(conf, sh, pslot)].rdev;
 
 					if (!test_bit(R5_ReadError, &sh->dev[pslot].flags) ||
 					    !prdev || test_bit(Faulty, &prdev->flags))
@@ -4755,7 +4827,11 @@ static void raid5_end_write_request(struct bio *bi)
 	int replacement = 0;
 
 	for (i = 0 ; i < disks; i++) {
-		int pd = raidkm_sh_pdisk(conf, sh, i);
+		/* WRITE-side map: must match the ops_run_io issue lookup
+		 * (the Phase-3 write redirect only ever switches a fixed
+		 * missing disk for a fixed healthy spare between issue and
+		 * completion — never mid-flight for a given row) */
+		int pd = raidkm_sh_pdisk_w(conf, sh, i);
 
 		if (bi == &sh->dev[i].req) {
 			rdev = conf->disks[pd].rdev;
@@ -6090,7 +6166,8 @@ static int fetch_block(struct stripe_head *sh, struct stripe_head_state *s,
 					for (j = disks; j--; ) {
 						if (is_parity_disk(sh, j)) {
 							struct md_rdev *prdev =
-								sh->raid_conf->disks[j].rdev;
+								sh->raid_conf->disks[raidkm_sh_pdisk(
+									sh->raid_conf, sh, j)].rdev;
 
 							if (raidkm_sh_m(sh) != 2 || !s->syncing ||
 							    !test_bit(R5_ReadError, &sh->dev[j].flags) ||
@@ -6688,6 +6765,7 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 	 */
 	if (is_raidkm(conf)) {
 		bool recovering = false;
+		int pop = conf->dcl ? raidkm_dcl_pop_slot(conf, sh) : -1;
 		int ri;
 
 		/*
@@ -6697,9 +6775,15 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 		 * That is distinct from a truly-failed slot (faulty/missing
 		 * rdev) seen during a degraded scrub, which we must not try to
 		 * write.
+		 *
+		 * Declustered population (Phase 3) is the third variant: slot
+		 * `pop` maps to the armed missing disk X — reconstruct it like
+		 * a recovering slot, and the ops_run_io WRITE-side redirect
+		 * lands it on the row's spare column.
 		 */
 		for (ri = 0; ri < disks; ri++) {
-			struct md_rdev *rdev = conf->disks[ri].rdev;
+			struct md_rdev *rdev =
+				conf->disks[raidkm_sh_pdisk(conf, sh, ri)].rdev;
 
 			if (rdev && !test_bit(Faulty, &rdev->flags) &&
 			    !test_bit(In_sync, &rdev->flags)) {
@@ -6708,7 +6792,7 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 			}
 		}
 
-		if (recovering) {
+		if (recovering || pop >= 0) {
 			/*
 			 * Rebuild: reconstruct every recovering slot from the
 			 * surviving members and write it to the rebuilt disk.
@@ -6753,14 +6837,15 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 			}
 
 			for (i = 0; i < disks; i++) {
-				/* TODO(dcl Phase 2): slot->pdisk audit — this
-				 * degraded-scrub path is unreachable for the
-				 * non-degraded declustered v1 */
-				struct md_rdev *rdev = conf->disks[i].rdev;
+				/* i is a stripe SLOT; the member holding it
+				 * is slot-dependent under declustering */
+				struct md_rdev *rdev = conf->disks[
+					raidkm_sh_pdisk(conf, sh, i)].rdev;
 
-				if (!(rdev && !test_bit(Faulty, &rdev->flags) &&
+				if (i != pop &&
+				    !(rdev && !test_bit(Faulty, &rdev->flags) &&
 				      !test_bit(In_sync, &rdev->flags)))
-					continue;	/* not a recovery target */
+					continue;	/* not a rebuild target */
 
 				if (is_parity_disk(sh, i) && !test_bit(R5_UPTODATE,
 							 &sh->dev[i].flags)) {
@@ -6987,10 +7072,25 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 			set_bit(R5_LOCKED, &dev->flags);
 			set_bit(R5_Wantwrite, &dev->flags);
 		}
-		if (WARN_ONCE(dev && !test_bit(R5_UPTODATE, &dev->flags),
-			      "%s: disk%td not up to date\n",
-			      mdname(conf->mddev),
-			      dev - (struct r5dev *) &sh->dev)) {
+		if (dev && !test_bit(R5_UPTODATE, &dev->flags)) {
+			ptrdiff_t di = dev - (struct r5dev *)&sh->dev;
+			struct md_rdev *drdev = conf->disks[
+				raidkm_sh_pdisk(conf, sh, (int)di)].rdev;
+
+			/*
+			 * raidkm deliberately does NOT reconstruct a parity
+			 * slot that lives on a dead member during a degraded
+			 * scrub (fetch_block: the write-back can never land,
+			 * and a computed-but-unwritable slot wedges the
+			 * stripe).  Reaching here with such a slot is the
+			 * expected shape of every degraded declustered scrub
+			 * row whose failed member holds P or Q — drop the
+			 * writeback quietly.  Any OTHER not-uptodate dev
+			 * (live member) is still a real bug: keep the WARN.
+			 */
+			WARN_ONCE(drdev && !test_bit(Faulty, &drdev->flags),
+				  "%s: disk%td not up to date\n",
+				  mdname(conf->mddev), di);
 			clear_bit(R5_LOCKED, &dev->flags);
 			clear_bit(R5_Wantwrite, &dev->flags);
 			s->locked--;
@@ -7295,7 +7395,8 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 				clear_bit(R5_MadeGood, &dev->flags);
 		}
 		if (test_bit(R5_MadeGoodRepl, &dev->flags)) {
-			struct md_rdev *rdev2 = conf->disks[i].replacement;
+			struct md_rdev *rdev2 = conf->disks[
+				raidkm_sh_pdisk(conf, sh, i)].replacement;
 
 			if (rdev2 && !test_bit(Faulty, &rdev2->flags)) {
 				s->handle_bad_blocks = 1;
@@ -7317,7 +7418,8 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 			if (rdev && !test_bit(Faulty, &rdev->flags))
 				do_recovery = 1;
 			else if (!rdev) {
-				rdev = conf->disks[i].replacement;
+				rdev = conf->disks[
+					raidkm_sh_pdisk(conf, sh, i)].replacement;
 				if (rdev && !test_bit(Faulty, &rdev->flags))
 					do_recovery = 1;
 			}
@@ -7747,6 +7849,15 @@ static void handle_stripe(struct stripe_head *sh)
 	    test_bit(STRIPE_INSYNC, &sh->state)) {
 		md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
 		clear_bit(STRIPE_SYNCING, &sh->state);
+		/* Declustered population: this address's spare write is on
+		 * disk (locked drained through the write endio) — advance
+		 * the prefix read-mark.  REQUESTED gates out plain resync
+		 * stripes of the same group, which complete WITHOUT a
+		 * population write and must never move the mark. */
+		if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING &&
+		    test_bit(MD_RECOVERY_REQUESTED, &conf->mddev->recovery) &&
+		    raidkm_dcl_pop_slot(conf, sh) >= 0)
+			raidkm_dcl_pop_done(conf, sh->sector);
 		if (test_and_clear_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags))
 			wake_up_bit(&sh->dev[sh->pd_idx].flags, R5_Overlap);
 	}
@@ -7882,25 +7993,27 @@ finish:
 		for (i = disks; i--; ) {
 			struct md_rdev *rdev;
 			struct r5dev *dev = &sh->dev[i];
+			int pd = raidkm_sh_pdisk(conf, sh, i);
+
 			if (test_and_clear_bit(R5_WriteError, &dev->flags)) {
 				/* We own a safe reference to the rdev */
-				rdev = conf->disks[i].rdev;
+				rdev = conf->disks[pd].rdev;
 				if (!rdev_set_badblocks(rdev, sh->sector,
 							RAID5_STRIPE_SECTORS(conf), 0))
 					md_error(conf->mddev, rdev);
 				rdev_dec_pending(rdev, conf->mddev);
 			}
 			if (test_and_clear_bit(R5_MadeGood, &dev->flags)) {
-				rdev = conf->disks[i].rdev;
+				rdev = conf->disks[pd].rdev;
 				rdev_clear_badblocks(rdev, sh->sector,
 						     RAID5_STRIPE_SECTORS(conf), 0);
 				rdev_dec_pending(rdev, conf->mddev);
 			}
 			if (test_and_clear_bit(R5_MadeGoodRepl, &dev->flags)) {
-				rdev = conf->disks[i].replacement;
+				rdev = conf->disks[pd].replacement;
 				if (!rdev)
 					/* rdev have been moved down */
-					rdev = conf->disks[i].rdev;
+					rdev = conf->disks[pd].rdev;
 				rdev_clear_badblocks(rdev, sh->sector,
 						     RAID5_STRIPE_SECTORS(conf), 0);
 				rdev_dec_pending(rdev, conf->mddev);
@@ -9924,6 +10037,71 @@ ret:
 	return retn;
 }
 
+/* Checkpoint the population journal when the runtime mark has advanced far
+ * enough past the last checkpoint.  Sync-thread context (blocking OK). */
+#define RKDCL_REB_CHK_SECTORS	(16 * 1024 * 2)		/* 16 MiB of rows
+	 * between checkpoints: 14 FUA'd 4K block writes each — noise next to
+	 * the population I/O itself, and a tight resume bound after a crash */
+static void raidkm_dcl_maybe_checkpoint(struct r5conf *conf)
+{
+	u64 mark = (u64)atomic64_read(&conf->reb_mark);
+
+	if (mark - conf->reb_journal_mark >= RKDCL_REB_CHK_SECTORS)
+		raidkm_dcl_journal_write(conf);
+}
+
+/* Declustered Phase 3: one address of the population pass
+ * (notes/declustered-population-design.md §4).  Rides a REQUESTED sync;
+ * md_do_sync drives sector_nr over dev_sectors.  Per address: if the armed
+ * disk X holds a data/parity slot of some group in this row, issue that ONE
+ * group's stripe as a sync stripe — handle_parity_checks6 reconstructs the
+ * slot and the WRITE-side redirect lands it on the row's spare column;
+ * completion advances the prefix mark (hook at the md_done_sync site).
+ * Rows where X is a spare column need nothing and are skipped, but their
+ * granules still feed the prefix mark. */
+static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
+					    sector_t sector_nr, int *skipped)
+{
+	struct r5conf *conf = mddev->private;
+	struct dcl_geom *ge = conf->dcl;
+	struct stripe_head *sh;
+	sector_t row = sector_nr;
+	u64 mark = (u64)atomic64_read(&conf->reb_mark);
+	u32 lcolX;
+
+	/* resume fast-forward: everything below the restored mark is done */
+	if (sector_nr + RAID5_STRIPE_SECTORS(conf) <= mark) {
+		*skipped = 1;
+		return mark - sector_nr;
+	}
+
+	sector_div(row, conf->chunk_sectors);
+	lcolX = dcl_lcol(ge, row, conf->reb_disk);
+	if (lcolX >= ge->ngroups * ge->g) {
+		/* X is a spare column of this row — nothing to rebuild.
+		 * Feed the skipped granules to the prefix mark and advance
+		 * to the end of the row in one step. */
+		sector_t row_end = (row + 1) * conf->chunk_sectors;
+		sector_t sk = min_t(sector_t, row_end, mddev->dev_sectors) -
+			      sector_nr;
+		sector_t s;
+
+		for (s = 0; s < sk; s += RAID5_STRIPE_SECTORS(conf))
+			raidkm_dcl_pop_done(conf, sector_nr + s);
+		raidkm_dcl_maybe_checkpoint(conf);
+		*skipped = 1;
+		return sk;
+	}
+
+	sh = raid5_get_active_stripe(conf, NULL, sector_nr,
+				     (int)(lcolX / ge->g), 0);
+	set_bit(STRIPE_SYNC_REQUESTED, &sh->state);
+	set_bit(STRIPE_HANDLE, &sh->state);
+	raid5_release_stripe(sh);
+	raidkm_dcl_maybe_checkpoint(conf);
+	return RAID5_STRIPE_SECTORS(conf);
+}
+
 static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 				   sector_t max_sector, int *skipped)
 {
@@ -9949,6 +10127,27 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery)) {
 			end_reshape(conf);
 			return 0;
+		}
+
+		/* Declustered population finish: md_do_sync has drained
+		 * recovery_active, so every issued stripe (and its spare
+		 * write) is complete.  On a full pass the prefix mark covers
+		 * the device -> flip to POPULATED (redirect becomes
+		 * unconditional; redundancy is restored).  On an interrupted
+		 * pass just checkpoint the mark; assembly/next-repair resumes
+		 * from it. */
+		if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING &&
+		    test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
+			u64 mark = (u64)atomic64_read(&conf->reb_mark);
+
+			if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+			    mark >= mddev->dev_sectors) {
+				conf->reb_state = RKDCL_ASSIGN_POPULATED;
+				pr_info("md/raid:%s: declustered: population of disk %d into spare col %d COMPLETE — redundancy restored\n",
+					mdname(mddev), conf->reb_disk,
+					conf->reb_spare);
+			}
+			raidkm_dcl_journal_write(conf);
 		}
 
 		/* RHEL 10.2 port fix #9: the builtin md core's bitmap_ops sync
@@ -9977,6 +10176,13 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 
 	if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
 		return reshape_request(mddev, sector_nr, skipped);
+
+	/* Declustered Phase 3: while a population is armed, ANY requested
+	 * sync IS the population pass (a plain check/repair scrub would be
+	 * meaningless mid-population; it comes back once POPULATED). */
+	if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING &&
+	    test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+		return raidkm_dcl_populate_request(mddev, sector_nr, skipped);
 
 	/* No need to check resync_max as we never do more than one
 	 * stripe, and as resync_max will always be on a chunk boundary,
@@ -10292,6 +10498,21 @@ static void raid5d(struct md_thread *thread)
 	struct blk_plug plug;
 
 	pr_debug("+++ raid5d active\n");
+
+	/* Declustered population armed but nothing running: (re-)request the
+	 * sync.  One-shot triggers (run()-time resume, sysfs arming) can be
+	 * eaten by md_check_recovery's readonly/reap handling during
+	 * assemble (observed: the resume bits vanished and a no-op RECOVER
+	 * ran instead) — this idempotent re-arm makes the population pass
+	 * inevitable while the assignment stays POPULATING. */
+	if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING &&
+	    md_is_rdwr(mddev) &&
+	    !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
+	    !test_bit(MD_RECOVERY_NEEDED, &mddev->recovery)) {
+		set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+		set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	}
 
 	md_check_recovery(mddev);
 
@@ -10669,6 +10890,105 @@ static struct md_sysfs_entry
 raid5_skip_copy = __ATTR(skip_copy, S_IRUGO | S_IWUSR,
 					raid5_show_skip_copy,
 					raid5_store_skip_copy);
+
+static ssize_t
+raidkm_show_dcl_populate(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	ssize_t ret = 0;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf && conf->dcl) {
+		switch (conf->reb_state) {
+		case RKDCL_ASSIGN_POPULATING:
+			ret = sprintf(page, "populating %d -> spare %d mark %llu/%llu\n",
+				conf->reb_disk, conf->reb_spare,
+				(unsigned long long)atomic64_read(&conf->reb_mark),
+				(unsigned long long)mddev->dev_sectors);
+			break;
+		case RKDCL_ASSIGN_POPULATED:
+			ret = sprintf(page, "populated %d -> spare %d\n",
+				      conf->reb_disk, conf->reb_spare);
+			break;
+		default:
+			ret = sprintf(page, "none\n");
+		}
+	}
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+/*
+ * Declustered Phase 3 arming (notes/declustered-population-design.md §3):
+ * write the physical index of a FAILED/MISSING member to rebuild it into
+ * the distributed spare columns.  Population rides a REQUESTED sync; on
+ * completion the assignment flips to POPULATED and X-slot I/O is served by
+ * the spare columns permanently (until a replacement disk is added, which
+ * clears the assignment and rebuilds via stock recovery).
+ */
+static ssize_t
+raidkm_store_dcl_populate(struct mddev *mddev, const char *page, size_t len)
+{
+	struct r5conf *conf;
+	struct md_rdev *rdev;
+	unsigned int x;
+	int err;
+
+	if (len >= PAGE_SIZE)
+		return -EINVAL;
+	if (kstrtouint(page, 10, &x))
+		return -EINVAL;
+
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf || !conf->dcl)
+		err = -ENODEV;
+	else if (x >= (unsigned int)mddev->raid_disks)
+		err = -EINVAL;
+	else if (conf->reb_state != RKDCL_ASSIGN_NONE ||
+		 test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+		err = -EBUSY;
+	else {
+		rdev = conf->disks[x].rdev;
+		if (rdev && !test_bit(Faulty, &rdev->flags)) {
+			err = -EINVAL;	/* member is alive */
+		} else {
+			unsigned long flags;
+
+			spin_lock_irqsave(&conf->reb_win_lock, flags);
+			conf->reb_win_base = 0;
+			bitmap_zero(conf->reb_win_bits, RKDCL_REB_WINDOW);
+			spin_unlock_irqrestore(&conf->reb_win_lock, flags);
+			atomic64_set(&conf->reb_mark, 0);
+			conf->reb_disk = x;
+			conf->reb_spare = 0;	/* v1: single assignment */
+			conf->reb_state = RKDCL_ASSIGN_POPULATING;
+			err = raidkm_dcl_journal_write(conf);
+			if (err) {
+				conf->reb_state = RKDCL_ASSIGN_NONE;
+				conf->reb_disk = -1;
+				conf->reb_spare = -1;
+			} else {
+				pr_info("md/raid:%s: declustered: population ARMED: disk %u -> spare col 0\n",
+					mdname(mddev), x);
+				set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+				set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+				set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+				md_wakeup_thread(mddev->thread);
+			}
+		}
+	}
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_dcl_populate = __ATTR(rk_dcl_populate, S_IRUGO | S_IWUSR,
+			     raidkm_show_dcl_populate,
+			     raidkm_store_dcl_populate);
 
 static ssize_t
 stripe_cache_active_show(struct mddev *mddev, char *page)
@@ -11314,6 +11634,7 @@ static struct attribute *raid5_attrs[] =  {
 	&raid5_group_thread_cnt.attr,
 	&raid5_worker_thread_cnt.attr,
 	&raid5_skip_copy.attr,
+	&raidkm_dcl_populate.attr,
 	&raid5_rmw_level.attr,
 	&raid5_stripe_size.attr,
 	&r5c_journal_mode.attr,
@@ -12001,7 +12322,18 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	 * at create-time and keep them alive for the array's lifetime.
 	 */
 	if (is_raidkm(conf)) {
-		int k = conf->raid_disks - conf->m;
+		/*
+		 * Declustered: stripes are g wide (k = g - m), NOT pool wide.
+		 * The pool-k tables would be sliced at the wrong stride by
+		 * every kk = sh->disks - m consumer — self-consistent for
+		 * encode+scrub (both sides use the same slice, mismatch_cnt
+		 * stays 0) but fatally wrong for the DECODE: the survivor
+		 * matrix rows come out of place and gf_invert_matrix sees a
+		 * singular (or worse, wrong-but-invertible) system.  Found by
+		 * the Phase-2 degraded gate's reconstruct-read oracle.
+		 */
+		int k = conf->dcl ? (int)conf->dcl->k
+				  : conf->raid_disks - conf->m;
 
 		/* Build the current-geometry EC matrix + GFNI/base tables. */
 		if (raidkm_build_ec(conf->m, k, GFP_KERNEL,
@@ -12540,6 +12872,18 @@ static int raid5_run(struct mddev *mddev)
 	/* Native checksum: region pages fault in on demand (no load at assemble),
 	 * so this scales past a RAM-sized CRC map. */
 
+	/* Declustered Phase 3: an interrupted population was restored from
+	 * the rkdcl journal — self-trigger the REQUESTED sync to resume it
+	 * from the journaled mark (action_store precedent: same bits). */
+	if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING) {
+		pr_info("md/raid:%s: declustered: resuming population of disk %d from mark %llu\n",
+			mdname(mddev), conf->reb_disk,
+			(unsigned long long)atomic64_read(&conf->reb_mark));
+		set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+		set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	}
+
 	return 0;
 abort:
 	md_unregister_thread(mddev, &mddev->thread);
@@ -12761,6 +13105,42 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 	if (rdev->saved_raid_disk < 0 && has_failed(conf))
 		/* no point adding a device */
 		return -EINVAL;
+
+	/*
+	 * Declustered Phase 3 rebalance v1 (population design note §5): a
+	 * replacement may not join mid-population, and joining a POPULATED
+	 * array first RETIRES the spare assignment — under a full quiesce,
+	 * journal-first — after which every X-slot is a plain failed slot
+	 * again (parity is always consistent with logical content, so
+	 * decode serves reads) and the stock recovery below rebuilds the
+	 * replacement exactly like the Phase-2-validated rebuild leg.  The
+	 * spare columns are freed; their stale content is never mapped.
+	 */
+	if (conf->dcl) {
+		if (conf->reb_state == RKDCL_ASSIGN_POPULATING)
+			return -EBUSY;
+		if (conf->reb_state == RKDCL_ASSIGN_POPULATED) {
+			int rd = conf->reb_disk, rs = conf->reb_spare;
+
+			raid5_quiesce(mddev, 1);
+			conf->reb_state = RKDCL_ASSIGN_NONE;
+			conf->reb_disk = -1;
+			conf->reb_spare = -1;
+			ret = raidkm_dcl_journal_write(conf);
+			if (ret) {	/* journal must land before the map moves;
+					 * restore INSIDE the quiesce so no write
+					 * slips through the NONE window */
+				conf->reb_state = RKDCL_ASSIGN_POPULATED;
+				conf->reb_disk = rd;
+				conf->reb_spare = rs;
+			}
+			raid5_quiesce(mddev, 0);
+			if (ret)
+				return ret;
+			pr_info("md/raid:%s: declustered: spare assignment for disk %d retired; recovery will rebuild the replacement\n",
+				mdname(mddev), rd);
+		}
+	}
 
 	if (rdev->raid_disk >= 0)
 		first = last = rdev->raid_disk;
