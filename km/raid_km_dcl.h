@@ -167,6 +167,103 @@ static inline u32 dcl_inverse(const struct dcl_geom *ge, u32 disk,
 	return role;
 }
 
+/* ---- Phase 3b: multi-assignment chained resolve --------------------------- */
+/*
+ * With several spare assignments {X_i -> spare column j_i} active at once,
+ * a redirect can land on another failed-and-assigned disk: spare columns
+ * rotate over ALL pool disks, so there are rows where j_2's physical disk
+ * IS X_1.  Resolution therefore CHAINS: col -> j_2 -> X_1 (dead, assigned)
+ * -> j_1 -> live disk.  Bijectivity of the per-row column<->disk map gives
+ * (proven by the simulator's P4 checker, tools/declustered-sim.c):
+ *
+ *  - each failed disk occupies exactly one column per row, so at most one
+ *    chain traverses a given assignment: chains are vertex-disjoint and
+ *    resolved endpoints never collide;
+ *  - a cycle would need every disk on it to sit at a spare column of the
+ *    row (the only predecessor of a cycle element is another cycle
+ *    element), so chains starting at GROUP columns always terminate; cycles
+ *    are spare-only and content-free;
+ *  - a chain ends either at a live disk or DEAD (an unassigned failed disk,
+ *    a POPULATING assignment above its mark, or a content-free self-loop).
+ *
+ * `mark[i]` is the per-assignment prefix mark in ROWS: a hop through
+ * assignment i is permitted iff row < mark[i].  POPULATED = DCL_MARK_ALL.
+ * The WRITE map passes DCL_MARK_ALL for every active assignment (the
+ * redirect-all-writes invariant, applied transitively).
+ */
+struct dcl_assign {
+	u32 disk;	/* X_i: failed physical disk		*/
+	u32 spare;	/* j_i: spare column index, < s		*/
+};
+
+#define DCL_MARK_ALL	(~0ULL)
+
+/* Resolve (row, lcol) -> physical disk through the active assignment chain.
+ * *dead = 1 when the endpoint holds no live copy (caller decodes). */
+static inline u32 dcl_resolve(const struct dcl_geom *ge,
+			      const struct dcl_assign *as, const u64 *mark,
+			      u32 nas, u64 row, u32 lcol, u32 *dead)
+{
+	u32 disk = dcl_disk(ge, row, lcol);
+	u32 hops;
+
+	for (hops = 0; hops <= nas; hops++) {
+		u32 i, nlcol;
+
+		for (i = 0; i < nas; i++)
+			if (as[i].disk == disk)
+				break;
+		if (i == nas) {			/* live endpoint */
+			*dead = 0;
+			return disk;
+		}
+		if (row >= mark[i]) {		/* not covered: decode */
+			*dead = 1;
+			return disk;
+		}
+		nlcol = ge->ngroups * ge->g + as[i].spare;
+		if (nlcol == lcol) {		/* self-loop: content-free */
+			*dead = 1;
+			return disk;
+		}
+		lcol = nlcol;
+		disk = dcl_disk(ge, row, lcol);
+	}
+	*dead = 1;	/* spare-only cycle (unreachable from group columns) */
+	return disk;
+}
+
+/* Does the WRITE chain of (row, lcol) traverse disk X?  Population of a
+ * newly armed assignment {X -> j} must rebuild every group column whose
+ * chain traverses X — not only X's own column: rows where X held another
+ * assignment's spare content re-materialise through the extended chain
+ * (this replaces the single-assignment "spare column here -> skip" rule). */
+static inline int dcl_chain_traverses(const struct dcl_geom *ge,
+				      const struct dcl_assign *as, u32 nas,
+				      u64 row, u32 lcol, u32 X)
+{
+	u32 disk = dcl_disk(ge, row, lcol);
+	u32 hops;
+
+	for (hops = 0; hops <= nas; hops++) {
+		u32 i, nlcol;
+
+		if (disk == X)
+			return 1;
+		for (i = 0; i < nas; i++)
+			if (as[i].disk == disk)
+				break;
+		if (i == nas)
+			return 0;		/* live endpoint, X not seen */
+		nlcol = ge->ngroups * ge->g + as[i].spare;
+		if (nlcol == lcol)
+			return 0;		/* self-loop, content-free */
+		lcol = nlcol;
+		disk = dcl_disk(ge, row, lcol);
+	}
+	return 0;
+}
+
 /* On-disk rkdcl metadata block: 4 KiB at data_offset + data_size (the
  * reserved tail chunk), one identical copy per member, written by mdadm at
  * --create (mdadm raidkm-dcl.h is the userspace mirror of this struct).
@@ -175,6 +272,7 @@ static inline u32 dcl_inverse(const struct dcl_geom *ge, u32 disk,
 #define RKDCL_MAGIC		"RKDCLMD1"
 #define RKDCL_SB_VERSION	1	/* geometry only			*/
 #define RKDCL_SB_VERSION2	2	/* + spare assignment / rebuild mark	*/
+#define RKDCL_SB_VERSION3	3	/* + multi-assignment table (3b)	*/
 #define RKDCL_SB_BYTES		4096
 
 /* v2 spare-assignment state (notes/declustered-population-design.md §2) */
@@ -183,9 +281,34 @@ static inline u32 dcl_inverse(const struct dcl_geom *ge, u32 disk,
 #define RKDCL_ASSIGN_POPULATING	1	/* rebuild into spare running	*/
 #define RKDCL_ASSIGN_POPULATED	2	/* redirect permanent		*/
 
+/* v3 assignment-table entry (24 bytes).  Table capacity is the format
+ * maximum s (layout word keeps s <= 127); the live count is nassign. */
+#define RKDCL_MAX_ASSIGN	127
+
+struct rkdcl_assign {
+	__le32		disk;		/* X_i				*/
+	__le32		spare;		/* spare column index j_i	*/
+	__le32		state;		/* RKDCL_ASSIGN_*		*/
+	__le32		pad;
+	__le64		mark;		/* journaled read mark, DEVICE
+					 * SECTORS; <= runtime mark	*/
+} __packed;
+
+/*
+ * ADAPTIVE VERSIONING (decided 2026-07-17): the journal writes version 2
+ * while <= 1 assignment is active (legacy assign_* fields carry it, table
+ * zero) and version 3 only while >= 2 are.  Every journal write overwrites
+ * the same 4 KiB slot on ALL live members with gen++, so arming a second
+ * assignment removes every v2 copy — the published v2 module fails CLOSED
+ * (rejects version 3 -> no valid block -> refuses to assemble) instead of
+ * silently dropping an assignment (whose spare its writes would go stale).
+ * Retiring back to <= 1 assignment restores v2 blocks and downgrade compat.
+ * In a v3 block the legacy assign_* fields MIRROR assign[0] (debug/examine
+ * convenience only; the table is authoritative).
+ */
 struct rkdcl_sb {
 	char		magic[8];	/* RKDCL_MAGIC, no NUL		*/
-	__le32		version;	/* RKDCL_SB_VERSION{,2}		*/
+	__le32		version;	/* RKDCL_SB_VERSION{,2,3}	*/
 	__le32		hdr_crc;	/* crc32-le of the 4 KiB block
 					 * with this field zeroed	*/
 	__le32		pool_disks;	/* N — cross-check vs SB	*/
@@ -206,6 +329,10 @@ struct rkdcl_sb {
 	__le64		assign_mark;	/* journaled read mark, DEVICE
 					 * SECTORS; <= the runtime
 					 * prefix mark			*/
+	/* ---- v3 fields (zero in v1/v2 blocks) ------------------------ */
+	__le32		nassign;	/* live entries in assign[]	*/
+	__le32		pad1;
+	struct rkdcl_assign assign[RKDCL_MAX_ASSIGN];
 	/* pad to RKDCL_SB_BYTES */
 } __packed;
 

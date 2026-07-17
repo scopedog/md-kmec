@@ -147,9 +147,10 @@ static inline int stripe_hash_locks_hash(struct r5conf *conf, sector_t sect,
 		(sector_t)dcl_group * 7919) & STRIPE_HASH_LOCKS_MASK;
 }
 
-/* Declustered Phase 3: the spare-column redirect
- * (notes/declustered-population-design.md §1).  While a spare assignment
- * {X -> spare col j} is active, a slot mapped to X is served elsewhere:
+/* Declustered Phase 3/3b: the spare-column redirect
+ * (notes/declustered-population-design.md §1).  While spare assignments
+ * {X_i -> spare col j_i} are active, a slot mapped to an X_i is served
+ * elsewhere:
  *
  *   WRITES redirect to spare_disk(row) for ALL rows the moment the
  *   assignment arms — a write to a not-yet-populated row lands on the spare
@@ -160,23 +161,48 @@ static inline int stripe_hash_locks_hash(struct r5conf *conf, sector_t sect,
  *   completed); above it the slot stays failed and decodes on the fly.
  *   POPULATED redirects both, unconditionally.
  *
+ * MULTI-ASSIGNMENT (3b): spare columns rotate over ALL pool disks, so a
+ * redirect can land on another failed-and-assigned disk (rows where j_2's
+ * physical disk IS X_1).  Resolution CHAINS until it reaches a live disk or
+ * dead-ends (uncovered POPULATING hop -> decode).  Bijectivity makes chains
+ * vertex-disjoint and cycle-free from group columns (dcl_resolve in
+ * raid_km_dcl.h is the reference; simulator P4 proves the invariants).
+ * Only ONE entry is ever POPULATING, so the prefix mark is global.
+ *
  * reb_mark is kept in DEVICE SECTORS (a row is covered iff its whole chunk
  * is below the mark).  State transitions that would move a mapping backwards
- * (clearing the assignment for rebalance) happen only under a full quiesce.
+ * (retiring assignments for rebalance) happen only under a full quiesce.
  */
 static inline int raidkm_dcl_redirect(struct r5conf *conf, int disk,
 				      sector_t row, bool for_write)
 {
-	if (likely(conf->reb_state == RKDCL_ASSIGN_NONE) ||
-	    disk != conf->reb_disk)
+	/* Pairs with the smp_store_release(&conf->nreb, ...) in
+	 * raidkm_dcl_arm: entries below the acquired count are fully
+	 * published.  (Retire shrinks nreb under a full quiesce, so no
+	 * reader is in flight for that direction.) */
+	int nreb = smp_load_acquire(&conf->nreb);
+	int hops;
+
+	if (likely(!nreb))
 		return disk;
-	if (conf->reb_state == RKDCL_ASSIGN_POPULATED || for_write ||
-	    (row + 1) * conf->chunk_sectors <=
-			(u64)atomic64_read(&conf->reb_mark))
-		return dcl_disk(conf->dcl, row,
+	for (hops = 0; hops <= nreb; hops++) {
+		int i;
+
+		for (i = 0; i < nreb; i++)
+			if (conf->reb[i].disk == disk)
+				break;
+		if (i == nreb)
+			return disk;		/* live endpoint */
+		if (conf->reb[i].state == RKDCL_ASSIGN_POPULATING &&
+		    !for_write &&
+		    (row + 1) * conf->chunk_sectors >
+				(u64)atomic64_read(&conf->reb_mark))
+			return disk;		/* not covered: decode */
+		disk = dcl_disk(conf->dcl, row,
 				conf->dcl->ngroups * conf->dcl->g +
-				conf->reb_spare);
-	return disk;
+				conf->reb[i].spare);
+	}
+	return disk;	/* spare-only cycle; group slots never get here */
 }
 
 /* Declustered D1: slot -> physical disk.  A pure function of
@@ -212,25 +238,63 @@ static inline int raidkm_sh_pdisk_w(struct r5conf *conf,
 	return raidkm_sh_pdisk_rw(conf, sh, i, true);
 }
 
-/* The population target slot of THIS stripe, or -1: the slot whose mapped
- * disk is the armed X (at most one per stripe, bijectivity) when its group
- * is the one the population pass issued for this row. */
+/* The GROUP COLUMN whose write-chain traverses disk X in this row, or -1
+ * when none does (X holds an unassigned spare column, or a content-free
+ * spare-only cycle/self-loop).  Found by the INVERSE walk: X's column; if
+ * it is the spare of an active assignment, step to that assignment's disk
+ * (its unique predecessor) and repeat.  At most one chain traverses any
+ * disk per row (vertex-disjointness), so this is THE candidate — the
+ * population pass rebuilds exactly this slot and the write-side chain
+ * re-materialises every hop's content at the live endpoint.  This replaces
+ * the single-assignment "X at a spare column -> skip" rule: rows where X
+ * held ANOTHER assignment's live spare content walk back to that
+ * assignment's root. */
+static inline int raidkm_dcl_chain_root(struct r5conf *conf, sector_t row,
+					int X)
+{
+	int nreb = smp_load_acquire(&conf->nreb);	/* pairs with arm */
+	int hops;
+
+	for (hops = 0; hops <= nreb; hops++) {
+		u32 lcol = dcl_lcol(conf->dcl, row, X);
+		int i, j;
+
+		if (lcol < conf->dcl->ngroups * conf->dcl->g)
+			return (int)lcol;	/* group column: root found */
+		j = (int)(lcol - conf->dcl->ngroups * conf->dcl->g);
+		for (i = 0; i < nreb; i++)
+			if (conf->reb[i].spare == j)
+				break;
+		if (i == nreb)
+			return -1;	/* unassigned spare: content-free */
+		X = conf->reb[i].disk;	/* unique predecessor */
+	}
+	return -1;		/* spare-only cycle: content-free */
+}
+
+/* The population target slot of THIS stripe, or -1: the slot whose
+ * write-chain traverses the POPULATING X (at most one per row) when its
+ * group is the one the population pass issued for this row. */
 static inline int raidkm_dcl_pop_slot(struct r5conf *conf,
 				      struct stripe_head *sh)
 {
+	/* Single load: the completion path stores reb_pop = -1 from the
+	 * sync thread while straggler sync stripes are still handled on
+	 * raid5d — a re-load between guard and index would read reb[-1]. */
+	int pop = READ_ONCE(conf->reb_pop);
 	sector_t row;
-	u32 lcol;
+	int root;
 
-	if (conf->reb_state != RKDCL_ASSIGN_POPULATING)
+	if (pop < 0 || pop >= conf->nreb)
 		return -1;
 	row = sh->sector;
 	sector_div(row, conf->chunk_sectors);
-	lcol = dcl_lcol(conf->dcl, row, conf->reb_disk);
-	if (lcol >= conf->dcl->ngroups * conf->dcl->g)
-		return -1;			/* X is a spare column here */
-	if ((int)(lcol / conf->dcl->g) != sh->dcl_group)
+	root = raidkm_dcl_chain_root(conf, row, conf->reb[pop].disk);
+	if (root < 0)
+		return -1;			/* content-free row */
+	if (root / (int)conf->dcl->g != sh->dcl_group)
 		return -1;			/* other group's stripe */
-	return lcol % conf->dcl->g;
+	return root % (int)conf->dcl->g;
 }
 
 /* Declustered: which group of its row a LOGICAL sector belongs to (the
@@ -4933,11 +4997,13 @@ static void raid5_error(struct mddev *mddev, struct md_rdev *rdev)
 	/* Declustered auto-arm: this context cannot journal the spare
 	 * assignment, so only park the failed slot; raid5d arms it via
 	 * raidkm_dcl_arm() (which re-validates — a replacement-device
-	 * failure with the primary alive is dropped there).  v1: single
-	 * assignment — a second failure is left to the operator. */
+	 * failure with the primary alive is dropped there).  3b: park
+	 * whenever the assignment table has room; arming waits for any
+	 * running population (-EBUSY, retried every raid5d pass) so
+	 * sequential failures populate one after the other. */
 	if (conf->dcl && conf->dcl_auto &&
 	    !test_bit(MD_BROKEN, &conf->mddev->flags) &&
-	    conf->reb_state == RKDCL_ASSIGN_NONE && conf->reb_want < 0 &&
+	    conf->nreb < (int)conf->dcl->s && conf->reb_want < 0 &&
 	    rdev->raid_disk >= 0)
 		conf->reb_want = rdev->raid_disk;
 
@@ -7865,7 +7931,7 @@ static void handle_stripe(struct stripe_head *sh)
 		 * the prefix read-mark.  REQUESTED gates out plain resync
 		 * stripes of the same group, which complete WITHOUT a
 		 * population write and must never move the mark. */
-		if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING &&
+		if (conf->dcl && conf->reb_pop >= 0 &&
 		    test_bit(MD_RECOVERY_REQUESTED, &conf->mddev->recovery) &&
 		    raidkm_dcl_pop_slot(conf, sh) >= 0)
 			raidkm_dcl_pop_done(conf, sh->sector);
@@ -10058,17 +10124,20 @@ static void raidkm_dcl_maybe_checkpoint(struct r5conf *conf)
 	u64 mark = (u64)atomic64_read(&conf->reb_mark);
 
 	if (mark - conf->reb_journal_mark >= RKDCL_REB_CHK_SECTORS)
-		raidkm_dcl_journal_write(conf);
+		raidkm_dcl_journal_write(conf, false);
 }
 
-/* Declustered Phase 3: one address of the population pass
+/* Declustered Phase 3/3b: one address of the population pass
  * (notes/declustered-population-design.md §4).  Rides a REQUESTED sync;
- * md_do_sync drives sector_nr over dev_sectors.  Per address: if the armed
- * disk X holds a data/parity slot of some group in this row, issue that ONE
- * group's stripe as a sync stripe — handle_parity_checks6 reconstructs the
- * slot and the WRITE-side redirect lands it on the row's spare column;
- * completion advances the prefix mark (hook at the md_done_sync site).
- * Rows where X is a spare column need nothing and are skipped, but their
+ * md_do_sync drives sector_nr over dev_sectors.  Per address: if some group
+ * column's write-chain traverses the armed disk X in this row (X's own
+ * data/parity slot, or another assignment's spare content X was holding),
+ * issue that ONE group's stripe as a sync stripe — at most one chain
+ * traverses X (vertex-disjointness), so it is still one stripe per row.
+ * handle_parity_checks6 reconstructs the chain-root slot and the WRITE-side
+ * chained redirect lands it on the live endpoint; completion advances the
+ * prefix mark (hook at the md_done_sync site).  Content-free rows (X at an
+ * unassigned spare column or on a spare-only cycle) are skipped, but their
  * granules still feed the prefix mark. */
 static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 					    sector_t sector_nr, int *skipped)
@@ -10078,7 +10147,7 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 	struct stripe_head *sh;
 	sector_t row = sector_nr;
 	u64 mark = (u64)atomic64_read(&conf->reb_mark);
-	u32 lcolX;
+	int root;
 
 	/* resume fast-forward: everything below the restored mark is done */
 	if (sector_nr + RAID5_STRIPE_SECTORS(conf) <= mark) {
@@ -10087,9 +10156,9 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 	}
 
 	sector_div(row, conf->chunk_sectors);
-	lcolX = dcl_lcol(ge, row, conf->reb_disk);
-	if (lcolX >= ge->ngroups * ge->g) {
-		/* X is a spare column of this row — nothing to rebuild.
+	root = raidkm_dcl_chain_root(conf, row, conf->reb[conf->reb_pop].disk);
+	if (root < 0) {
+		/* No chain traverses X in this row — nothing to rebuild.
 		 * Feed the skipped granules to the prefix mark and advance
 		 * to the end of the row in one step. */
 		sector_t row_end = (row + 1) * conf->chunk_sectors;
@@ -10105,7 +10174,7 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 	}
 
 	sh = raid5_get_active_stripe(conf, NULL, sector_nr,
-				     (int)(lcolX / ge->g), 0);
+				     root / (int)ge->g, 0);
 	set_bit(STRIPE_SYNC_REQUESTED, &sh->state);
 	set_bit(STRIPE_HANDLE, &sh->state);
 	raid5_release_stripe(sh);
@@ -10147,18 +10216,21 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		 * unconditional; redundancy is restored).  On an interrupted
 		 * pass just checkpoint the mark; assembly/next-repair resumes
 		 * from it. */
-		if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING &&
+		if (conf->dcl && conf->reb_pop >= 0 &&
 		    test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
 			u64 mark = (u64)atomic64_read(&conf->reb_mark);
 
 			if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
 			    mark >= mddev->dev_sectors) {
-				conf->reb_state = RKDCL_ASSIGN_POPULATED;
-				pr_info("md/raid:%s: declustered: population of disk %d into spare col %d COMPLETE — redundancy restored\n",
-					mdname(mddev), conf->reb_disk,
-					conf->reb_spare);
+				struct rkdcl_reb *r = &conf->reb[conf->reb_pop];
+
+				r->state = RKDCL_ASSIGN_POPULATED;
+				conf->reb_pop = -1;
+				pr_info("md/raid:%s: declustered: population of disk %d into spare col %d COMPLETE — redundancy restored (%d assignment(s) active)\n",
+					mdname(mddev), r->disk, r->spare,
+					conf->nreb);
 			}
-			raidkm_dcl_journal_write(conf);
+			raidkm_dcl_journal_write(conf, false);
 		}
 
 		/* RHEL 10.2 port fix #9: the builtin md core's bitmap_ops sync
@@ -10191,7 +10263,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	/* Declustered Phase 3: while a population is armed, ANY requested
 	 * sync IS the population pass (a plain check/repair scrub would be
 	 * meaningless mid-population; it comes back once POPULATED). */
-	if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING &&
+	if (conf->dcl && conf->reb_pop >= 0 &&
 	    test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
 		return raidkm_dcl_populate_request(mddev, sector_nr, skipped);
 
@@ -10518,7 +10590,7 @@ static void raid5d(struct md_thread *thread)
 	 * assemble (observed: the resume bits vanished and a no-op RECOVER
 	 * ran instead) — this idempotent re-arm makes the population pass
 	 * inevitable while the assignment stays POPULATING. */
-	if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING &&
+	if (conf->dcl && conf->reb_pop >= 0 &&
 	    md_is_rdwr(mddev) &&
 	    !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
 	    !test_bit(MD_RECOVERY_NEEDED, &mddev->recovery)) {
@@ -10527,19 +10599,53 @@ static void raid5d(struct md_thread *thread)
 		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	}
 
-	/* Declustered auto-arm service: the error handler parked a failed
-	 * slot in reb_want (it cannot journal from its context).  Arm it
-	 * here through the same path as the sysfs store.  trylock only —
-	 * raid5d must never sleep on mddev_lock (md_check_recovery
-	 * precedent); a failed trylock or a running recovery retries on
-	 * the next pass. */
+	/* Declustered auto-arm RESCAN: the error-handler park (reb_want) is
+	 * a one-shot single slot, so on its own it drops (a) the second of
+	 * two burst failures (want occupied for the whole pre-arm window,
+	 * which spans entire recoveries/populations) and (b) disks left
+	 * missing after retire-all — raid5_error never re-fires for an
+	 * already-Faulty member.  Re-derive the want from the array state
+	 * instead of trusting the one-shot handoff: any missing/Faulty
+	 * member not covered by an active assignment gets parked.  Same
+	 * lock as the error handler's park (device_lock). */
+	if (conf->dcl && conf->dcl_auto && md_is_rdwr(mddev) &&
+	    READ_ONCE(conf->reb_want) < 0 && conf->reb_pop < 0 &&
+	    conf->nreb < (int)conf->dcl->s &&
+	    !test_bit(MD_BROKEN, &mddev->flags)) {
+		int di, ai;
+
+		spin_lock_irq(&conf->device_lock);
+		for (di = 0; di < conf->raid_disks && conf->reb_want < 0;
+		     di++) {
+			struct md_rdev *rdev = conf->disks[di].rdev;
+
+			if (rdev && !test_bit(Faulty, &rdev->flags))
+				continue;	/* member alive */
+			for (ai = 0; ai < conf->nreb; ai++)
+				if (conf->reb[ai].disk == di)
+					break;
+			if (ai == conf->nreb)
+				conf->reb_want = di;
+		}
+		spin_unlock_irq(&conf->device_lock);
+	}
+
+	/* Declustered auto-arm service: a failed slot was parked in
+	 * reb_want (by the error handler or the rescan above; neither can
+	 * journal from its context).  Arm it here through the same path as
+	 * the sysfs store.  trylock only — raid5d must never sleep on
+	 * mddev_lock (md_check_recovery precedent); a failed trylock, a
+	 * running recovery, or a running population (arm returns -EBUSY)
+	 * retries on the next pass — a second failure's population starts
+	 * when the first completes. */
 	if (conf->dcl && READ_ONCE(conf->reb_want) >= 0 &&
 	    md_is_rdwr(mddev) && mddev_trylock(mddev)) {
 		int x = conf->reb_want;
 
-		if (conf->reb_state != RKDCL_ASSIGN_NONE) {
-			conf->reb_want = -1;	/* v1: single assignment */
-		} else if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
+		if (conf->nreb >= (int)conf->dcl->s) {
+			conf->reb_want = -1;	/* table full */
+		} else if (conf->reb_pop < 0 &&
+			   !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
 			int err = raidkm_dcl_arm(mddev, x);
 
 			if (err && err != -EBUSY)
@@ -10937,20 +11043,25 @@ raidkm_show_dcl_populate(struct mddev *mddev, char *page)
 	spin_lock(&mddev->lock);
 	conf = mddev->private;
 	if (conf && conf->dcl) {
-		switch (conf->reb_state) {
-		case RKDCL_ASSIGN_POPULATING:
-			ret = sprintf(page, "populating %d -> spare %d mark %llu/%llu\n",
-				conf->reb_disk, conf->reb_spare,
-				(unsigned long long)atomic64_read(&conf->reb_mark),
-				(unsigned long long)mddev->dev_sectors);
-			break;
-		case RKDCL_ASSIGN_POPULATED:
-			ret = sprintf(page, "populated %d -> spare %d\n",
-				      conf->reb_disk, conf->reb_spare);
-			break;
-		default:
-			ret = sprintf(page, "none\n");
+		int i;
+
+		for (i = 0; i < conf->nreb && ret < (ssize_t)PAGE_SIZE - 64;
+		     i++) {
+			struct rkdcl_reb *r = &conf->reb[i];
+
+			if (r->state == RKDCL_ASSIGN_POPULATING)
+				ret += sprintf(page + ret,
+					"populating %d -> spare %d mark %llu/%llu\n",
+					r->disk, r->spare,
+					(unsigned long long)atomic64_read(&conf->reb_mark),
+					(unsigned long long)mddev->dev_sectors);
+			else
+				ret += sprintf(page + ret,
+					"populated %d -> spare %d\n",
+					r->disk, r->spare);
 		}
+		if (!conf->nreb)
+			ret = sprintf(page, "none\n");
 	}
 	spin_unlock(&mddev->lock);
 	return ret;
@@ -10969,36 +11080,61 @@ static int raidkm_dcl_arm(struct mddev *mddev, unsigned int x)
 	struct r5conf *conf = mddev->private;
 	struct md_rdev *rdev;
 	unsigned long flags;
-	int err;
+	int i, j, err;
 
 	if (!conf || !conf->dcl)
 		return -ENODEV;
 	if (x >= (unsigned int)mddev->raid_disks)
 		return -EINVAL;
-	if (conf->reb_state != RKDCL_ASSIGN_NONE ||
+	if (conf->reb_pop >= 0 ||	/* populations are sequential */
 	    test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
 		return -EBUSY;
+	if (conf->nreb >= (int)conf->dcl->s)
+		return -ENOSPC;		/* every spare column consumed */
+	for (i = 0; i < conf->nreb; i++)
+		if (conf->reb[i].disk == (int)x)
+			return -EEXIST;	/* already assigned */
 	rdev = conf->disks[x].rdev;
 	if (rdev && !test_bit(Faulty, &rdev->flags))
 		return -EINVAL;	/* member is alive */
+
+	/* first spare column not used by an active assignment */
+	for (j = 0; j < (int)conf->dcl->s; j++) {
+		for (i = 0; i < conf->nreb; i++)
+			if (conf->reb[i].spare == j)
+				break;
+		if (i == conf->nreb)
+			break;
+	}
 
 	spin_lock_irqsave(&conf->reb_win_lock, flags);
 	conf->reb_win_base = 0;
 	bitmap_zero(conf->reb_win_bits, RKDCL_REB_WINDOW);
 	spin_unlock_irqrestore(&conf->reb_win_lock, flags);
 	atomic64_set(&conf->reb_mark, 0);
-	conf->reb_disk = x;
-	conf->reb_spare = 0;	/* v1: single assignment */
-	conf->reb_state = RKDCL_ASSIGN_POPULATING;
-	err = raidkm_dcl_journal_write(conf);
+	/* Publication order matters: the redirect readers run lock-free on
+	 * the I/O path and gate on nreb — the entry fields (and reb_pop)
+	 * must be globally visible BEFORE the count admits them, or a
+	 * reader chains through a half-written entry (a zeroed entry
+	 * matches healthy disk 0; a stale retired entry redirects a
+	 * healthy replaced disk).  smp_store_release pairs with the
+	 * smp_load_acquire in raidkm_dcl_redirect/chain_root. */
+	conf->reb[conf->nreb].disk  = x;
+	conf->reb[conf->nreb].spare = j;
+	conf->reb[conf->nreb].state = RKDCL_ASSIGN_POPULATING;
+	WRITE_ONCE(conf->reb_pop, conf->nreb);
+	smp_store_release(&conf->nreb, conf->nreb + 1);
+	err = raidkm_dcl_journal_write(conf, true);
 	if (err) {
-		conf->reb_state = RKDCL_ASSIGN_NONE;
-		conf->reb_disk = -1;
-		conf->reb_spare = -1;
+		/* Retract count-first (readers seeing the old count may
+		 * still finish a walk over the valid POPULATING entry —
+		 * benign: reads decode, writes are §1-idempotent). */
+		smp_store_release(&conf->nreb, conf->nreb - 1);
+		WRITE_ONCE(conf->reb_pop, -1);
 		return err;
 	}
-	pr_info("md/raid:%s: declustered: population ARMED: disk %u -> spare col 0\n",
-		mdname(mddev), x);
+	pr_info("md/raid:%s: declustered: population ARMED: disk %u -> spare col %d (%d assignment(s) active)\n",
+		mdname(mddev), x, j, conf->nreb);
 	set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
 	set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
 	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
@@ -12966,9 +13102,9 @@ static int raid5_run(struct mddev *mddev)
 	/* Declustered Phase 3: an interrupted population was restored from
 	 * the rkdcl journal — self-trigger the REQUESTED sync to resume it
 	 * from the journaled mark (action_store precedent: same bits). */
-	if (conf->dcl && conf->reb_state == RKDCL_ASSIGN_POPULATING) {
+	if (conf->dcl && conf->reb_pop >= 0) {
 		pr_info("md/raid:%s: declustered: resuming population of disk %d from mark %llu\n",
-			mdname(mddev), conf->reb_disk,
+			mdname(mddev), conf->reb[conf->reb_pop].disk,
 			(unsigned long long)atomic64_read(&conf->reb_mark));
 		set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
 		set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
@@ -13198,38 +13334,57 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		return -EINVAL;
 
 	/*
-	 * Declustered Phase 3 rebalance v1 (population design note §5): a
-	 * replacement may not join mid-population, and joining a POPULATED
-	 * array first RETIRES the spare assignment — under a full quiesce,
+	 * Declustered Phase 3/3b rebalance v1 (population design note §5): a
+	 * replacement may not join mid-population, and joining an array with
+	 * assignments first RETIRES ALL of them — under a full quiesce,
 	 * journal-first — after which every X-slot is a plain failed slot
 	 * again (parity is always consistent with logical content, so
 	 * decode serves reads) and the stock recovery below rebuilds the
-	 * replacement exactly like the Phase-2-validated rebuild leg.  The
-	 * spare columns are freed; their stale content is never mapped.
+	 * replacement exactly like the Phase-2-validated rebuild leg.
+	 *
+	 * ALL-OR-NOTHING is a correctness rule, not laziness: with chained
+	 * redirects, dropping only the replaced disk's assignment while
+	 * another assignment's chain traverses it would leave that other
+	 * assignment's spare content pointing at the BLANK replacement
+	 * (stale-spare reads) — and stock RECOVER only rebuilds the
+	 * replacement's own slots, not spare-column content it hosts for
+	 * others.  Dropping every assignment is always safe (§5: redirect
+	 * off => decodable); auto-arm (or the operator) re-populates the
+	 * still-missing disks afterwards.  The spare columns are freed;
+	 * their stale content is never mapped.  Copy-aware partial retire
+	 * is the Phase-4 fast path.
 	 */
 	if (conf->dcl) {
-		if (conf->reb_state == RKDCL_ASSIGN_POPULATING)
+		if (conf->reb_pop >= 0)
 			return -EBUSY;
-		if (conf->reb_state == RKDCL_ASSIGN_POPULATED) {
-			int rd = conf->reb_disk, rs = conf->reb_spare;
+		if (conf->nreb) {
+			int saved_nreb = conf->nreb;
+			int ri;
 
 			raid5_quiesce(mddev, 1);
-			conf->reb_state = RKDCL_ASSIGN_NONE;
-			conf->reb_disk = -1;
-			conf->reb_spare = -1;
-			ret = raidkm_dcl_journal_write(conf);
+			conf->nreb = 0;
+			ret = raidkm_dcl_journal_write(conf, true);
 			if (ret) {	/* journal must land before the map moves;
 					 * restore INSIDE the quiesce so no write
-					 * slips through the NONE window */
-				conf->reb_state = RKDCL_ASSIGN_POPULATED;
-				conf->reb_disk = rd;
-				conf->reb_spare = rs;
+					 * slips through the retired window (reb[]
+					 * entries are untouched above nreb) */
+				conf->nreb = saved_nreb;
+			} else {
+				/* Scrub the retired entries (still inside the
+				 * quiesce): a later arm's publication window
+				 * must never expose a stale POPULATED entry
+				 * to the lock-free readers. */
+				for (ri = 0; ri < saved_nreb; ri++) {
+					conf->reb[ri].disk  = -1;
+					conf->reb[ri].spare = -1;
+					conf->reb[ri].state = RKDCL_ASSIGN_NONE;
+				}
 			}
 			raid5_quiesce(mddev, 0);
 			if (ret)
 				return ret;
-			pr_info("md/raid:%s: declustered: spare assignment for disk %d retired; recovery will rebuild the replacement\n",
-				mdname(mddev), rd);
+			pr_info("md/raid:%s: declustered: %d spare assignment(s) retired; recovery will rebuild the replacement (re-arm population for any still-missing disks)\n",
+				mdname(mddev), saved_nreb);
 		}
 	}
 

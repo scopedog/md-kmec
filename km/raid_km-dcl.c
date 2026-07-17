@@ -208,9 +208,9 @@ MODULE_PARM_DESC(dcl_selftest,
 
 /* ---- Phase 1c: load the on-disk rkdcl metadata block at setup_conf -------- */
 
-/* Verify a candidate rkdcl block (magic, version 1 or 2, crc, geometry vs
- * the layout word, v2 assignment sanity).  Returns 0 if the block is valid
- * for this array. */
+/* Verify a candidate rkdcl block (magic, version 1..3, crc, geometry vs
+ * the layout word, v2/v3 assignment sanity).  Returns 0 if the block is
+ * valid for this array. */
 static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 {
 	int layout = mddev->new_layout;
@@ -218,7 +218,7 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 	u32 crc, want;
 
 	if (memcmp(blk->magic, RKDCL_MAGIC, 8) ||
-	    vers < RKDCL_SB_VERSION || vers > RKDCL_SB_VERSION2)
+	    vers < RKDCL_SB_VERSION || vers > RKDCL_SB_VERSION3)
 		return -EINVAL;
 	want = le32_to_cpu(blk->hdr_crc);
 	blk->hdr_crc = 0;
@@ -233,7 +233,7 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 	    le32_to_cpu(blk->spare_cols) != (u32)RAIDKM_LAYOUT_DCL_S(layout) ||
 	    !le32_to_cpu(blk->nbase) || le32_to_cpu(blk->nbase) > 64)
 		return -EINVAL;
-	if (vers >= RKDCL_SB_VERSION2) {
+	if (vers == RKDCL_SB_VERSION2) {
 		u32 x = le32_to_cpu(blk->assign_disk);
 		u32 j = le32_to_cpu(blk->assign_spare);
 		u32 st = le32_to_cpu(blk->assign_state);
@@ -244,6 +244,32 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 		    (x >= le32_to_cpu(blk->pool_disks) ||
 		     j >= le32_to_cpu(blk->spare_cols)))
 			return -EINVAL;
+	}
+	if (vers >= RKDCL_SB_VERSION3) {
+		u32 n = le32_to_cpu(blk->nassign);
+		u32 i, k, npop = 0;
+
+		if (n > le32_to_cpu(blk->spare_cols) || n > RKDCL_MAX_ASSIGN)
+			return -EINVAL;
+		for (i = 0; i < n; i++) {
+			u32 x  = le32_to_cpu(blk->assign[i].disk);
+			u32 j  = le32_to_cpu(blk->assign[i].spare);
+			u32 st = le32_to_cpu(blk->assign[i].state);
+
+			/* table entries are ACTIVE by definition */
+			if (st != RKDCL_ASSIGN_POPULATING &&
+			    st != RKDCL_ASSIGN_POPULATED)
+				return -EINVAL;
+			if (st == RKDCL_ASSIGN_POPULATING && ++npop > 1)
+				return -EINVAL;	/* sequential rule */
+			if (x >= le32_to_cpu(blk->pool_disks) ||
+			    j >= le32_to_cpu(blk->spare_cols))
+				return -EINVAL;
+			for (k = 0; k < i; k++)
+				if (le32_to_cpu(blk->assign[k].disk) == x ||
+				    le32_to_cpu(blk->assign[k].spare) == j)
+					return -EINVAL;	/* duplicates */
+		}
 	}
 	return 0;
 }
@@ -273,6 +299,9 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 	BUILD_BUG_ON(offsetof(struct rkdcl_sb, seed) != 40);
 	BUILD_BUG_ON(offsetof(struct rkdcl_sb, gen) != 56);
 	BUILD_BUG_ON(offsetof(struct rkdcl_sb, assign_mark) != 80);
+	BUILD_BUG_ON(offsetof(struct rkdcl_sb, nassign) != 88);
+	BUILD_BUG_ON(offsetof(struct rkdcl_sb, assign) != 96);
+	BUILD_BUG_ON(sizeof(struct rkdcl_assign) != 24);
 
 	pg = alloc_page(GFP_KERNEL);
 	best_pg = alloc_page(GFP_KERNEL);
@@ -346,26 +375,59 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 	 * population redoes rows [journal, crash) — idempotent spare
 	 * rewrites. */
 	spin_lock_init(&conf->reb_win_lock);
-	conf->reb_state = RKDCL_ASSIGN_NONE;
-	conf->reb_disk = -1;
+	conf->nreb = 0;
+	conf->reb_pop = -1;
 	conf->reb_want = -1;
-	conf->reb_spare = -1;
 	conf->reb_gen = best_gen;
-	/* window allocated unconditionally: runtime arming needs it too */
+	/* window + assignment table allocated unconditionally: runtime
+	 * arming needs them too */
 	conf->reb_win_bits = bitmap_zalloc(RKDCL_REB_WINDOW, GFP_KERNEL);
-	if (!conf->reb_win_bits) {
+	conf->reb = kcalloc(ge->s, sizeof(*conf->reb), GFP_KERNEL);
+	if (!conf->reb_win_bits || !conf->reb) {
 		err = -ENOMEM;
-		goto out_ge;
+		goto out_reb;
 	}
-	if (le32_to_cpu(blk->version) >= RKDCL_SB_VERSION2 &&
+	/* disk -1 everywhere: a not-yet-published entry must never match a
+	 * real physical index if a racing reader glimpses it (arm publishes
+	 * with store-release, this is defense in depth; kcalloc's zero would
+	 * alias healthy disk 0). */
+	for (nread = 0; nread < (int)ge->s; nread++) {
+		conf->reb[nread].disk  = -1;
+		conf->reb[nread].spare = -1;
+	}
+	nread = 0;
+	if (le32_to_cpu(blk->version) == RKDCL_SB_VERSION2 &&
 	    le32_to_cpu(blk->assign_state) != RKDCL_ASSIGN_NONE) {
-		u64 mark = le64_to_cpu(blk->assign_mark);	/* sectors */
+		/* v2: single legacy assignment */
+		conf->reb[0].state = le32_to_cpu(blk->assign_state);
+		conf->reb[0].disk  = le32_to_cpu(blk->assign_disk);
+		conf->reb[0].spare = le32_to_cpu(blk->assign_spare);
+		conf->nreb = 1;
+		if (conf->reb[0].state == RKDCL_ASSIGN_POPULATING)
+			conf->reb_pop = 0;
+	} else if (le32_to_cpu(blk->version) >= RKDCL_SB_VERSION3) {
+		/* v3: assignment table (verified: <= s, distinct,
+		 * <= 1 POPULATING) */
+		u32 i, n = le32_to_cpu(blk->nassign);
+
+		for (i = 0; i < n; i++) {
+			conf->reb[i].disk  = le32_to_cpu(blk->assign[i].disk);
+			conf->reb[i].spare = le32_to_cpu(blk->assign[i].spare);
+			conf->reb[i].state = le32_to_cpu(blk->assign[i].state);
+			if (conf->reb[i].state == RKDCL_ASSIGN_POPULATING)
+				conf->reb_pop = i;
+		}
+		conf->nreb = n;
+	}
+	if (conf->reb_pop >= 0) {
+		/* restore the POPULATING entry's prefix mark (v2: legacy
+		 * field; v3: its table entry) */
+		u64 mark = le32_to_cpu(blk->version) == RKDCL_SB_VERSION2 ?
+			le64_to_cpu(blk->assign_mark) :
+			le64_to_cpu(blk->assign[conf->reb_pop].mark);
 		u64 base = mark;
 
 		do_div(base, RAID5_STRIPE_SECTORS(conf));
-		conf->reb_state = le32_to_cpu(blk->assign_state);
-		conf->reb_disk  = le32_to_cpu(blk->assign_disk);
-		conf->reb_spare = le32_to_cpu(blk->assign_spare);
 		atomic64_set(&conf->reb_mark, mark);
 		conf->reb_journal_mark = mark;
 		conf->reb_win_base = base;	/* stripe-address granules */
@@ -375,17 +437,25 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 	pr_info("md/raid:%s: declustered geometry loaded: pool N=%u, %u groups of g=%u (k=%u+m=%u), %u spare col(s)/row, nbase=%u seed=0x%llx perm_crc=0x%08x\n",
 		mdname(mddev), ge->N, ge->ngroups, ge->g, ge->k, ge->m,
 		ge->s, ge->nbase, (unsigned long long)ge->seed, perm_crc);
-	if (conf->reb_state != RKDCL_ASSIGN_NONE)
+	for (nread = 0; nread < conf->nreb; nread++)
 		pr_info("md/raid:%s: declustered: spare assignment restored: disk %d -> spare col %d, %s, mark %llu (gen %llu)\n",
-			mdname(mddev), conf->reb_disk, conf->reb_spare,
-			conf->reb_state == RKDCL_ASSIGN_POPULATING ?
+			mdname(mddev), conf->reb[nread].disk,
+			conf->reb[nread].spare,
+			conf->reb[nread].state == RKDCL_ASSIGN_POPULATING ?
 				"POPULATING" : "POPULATED",
-			(unsigned long long)atomic64_read(&conf->reb_mark),
+			nread == conf->reb_pop ?
+				(unsigned long long)atomic64_read(&conf->reb_mark) :
+				(unsigned long long)mddev->dev_sectors,
 			(unsigned long long)conf->reb_gen);
 	__free_page(pg);
 	__free_page(best_pg);
 	return 0;
 
+out_reb:
+	bitmap_free(conf->reb_win_bits);
+	conf->reb_win_bits = NULL;
+	kfree(conf->reb);
+	conf->reb = NULL;
 out_ge:
 	kvfree(ge->base);
 	kvfree(ge->ibase);
@@ -408,19 +478,30 @@ void raidkm_dcl_free(struct r5conf *conf)
 	conf->dcl = NULL;
 	bitmap_free(conf->reb_win_bits);
 	conf->reb_win_bits = NULL;
+	kfree(conf->reb);
+	conf->reb = NULL;
 }
 
 /* ---- Phase 3: the rkdcl journal (spare assignment + rebuild mark) --------- */
 
 /* Build the on-disk block from the conf state (geometry from conf->dcl,
- * assignment from conf->reb_*).  The kernel always writes v2. */
+ * assignments from conf->reb[]).  ADAPTIVE VERSIONING (raid_km_dcl.h): v2
+ * while <= 1 assignment is active — the published v2 module can still
+ * assemble the array — and v3 while >= 2 (the v2 module must fail CLOSED,
+ * which rejecting version 3 provides).  Since every journal write lands on
+ * the same 4 KiB slot of ALL live members, the transition replaces every
+ * older-format copy.  In a v3 block the legacy assign_* fields mirror
+ * entry 0 (display only; the table is authoritative). */
 static void rkdcl_build_blk(struct r5conf *conf, struct rkdcl_sb *blk)
 {
 	struct dcl_geom *ge = conf->dcl;
+	u64 emark;
+	int i;
 
 	memset(blk, 0, RKDCL_SB_BYTES);
 	memcpy(blk->magic, RKDCL_MAGIC, 8);
-	blk->version	 = cpu_to_le32(RKDCL_SB_VERSION2);
+	blk->version	 = cpu_to_le32(conf->nreb >= 2 ?
+				       RKDCL_SB_VERSION3 : RKDCL_SB_VERSION2);
 	blk->pool_disks	 = cpu_to_le32(ge->N);
 	blk->group_width = cpu_to_le32(ge->g);
 	blk->parity	 = cpu_to_le32(ge->m);
@@ -429,13 +510,28 @@ static void rkdcl_build_blk(struct r5conf *conf, struct rkdcl_sb *blk)
 	blk->nbase	 = cpu_to_le32(ge->nbase);
 	blk->seed	 = cpu_to_le64(ge->seed);
 	blk->gen	 = cpu_to_le64(conf->reb_gen);
-	blk->assign_state = cpu_to_le32(conf->reb_state);
-	if (conf->reb_state != RKDCL_ASSIGN_NONE) {
-		blk->assign_disk  = cpu_to_le32(conf->reb_disk);
-		blk->assign_spare = cpu_to_le32(conf->reb_spare);
-		blk->assign_mark  = cpu_to_le64(conf->reb_journal_mark);
+	if (conf->nreb) {
+		/* legacy fields = entry 0 (v2: the whole story; v3: mirror) */
+		emark = conf->reb_pop == 0 ? conf->reb_journal_mark :
+					     conf->mddev->dev_sectors;
+		blk->assign_state = cpu_to_le32(conf->reb[0].state);
+		blk->assign_disk  = cpu_to_le32(conf->reb[0].disk);
+		blk->assign_spare = cpu_to_le32(conf->reb[0].spare);
+		blk->assign_mark  = cpu_to_le64(emark);
 	} else {
+		blk->assign_state = cpu_to_le32(RKDCL_ASSIGN_NONE);
 		blk->assign_disk  = cpu_to_le32(RKDCL_NO_ASSIGN);
+	}
+	if (conf->nreb >= 2) {
+		blk->nassign = cpu_to_le32(conf->nreb);
+		for (i = 0; i < conf->nreb; i++) {
+			emark = conf->reb_pop == i ? conf->reb_journal_mark :
+						     conf->mddev->dev_sectors;
+			blk->assign[i].disk  = cpu_to_le32(conf->reb[i].disk);
+			blk->assign[i].spare = cpu_to_le32(conf->reb[i].spare);
+			blk->assign[i].state = cpu_to_le32(conf->reb[i].state);
+			blk->assign[i].mark  = cpu_to_le64(emark);
+		}
 	}
 	blk->hdr_crc = 0;
 	blk->hdr_crc = cpu_to_le32(crc32_le(~0U, (const u8 *)blk,
@@ -444,16 +540,32 @@ static void rkdcl_build_blk(struct r5conf *conf, struct rkdcl_sb *blk)
 
 /* Checkpoint the assignment state to every live member (gen++, FUA).
  * BLOCKING — md sync-thread / arming / add_disk context only, never the
- * stripe path (the P3a rule).  Success = at least one member carries the new
- * generation (highest-gen wins on load; members that missed it only cost
- * journal freshness, never correctness — the mark is an under-estimate).
+ * stripe path (the P3a rule).
+ *
+ * Two success policies:
+ *  - LAX (mark checkpoints, completion): at least one member carries the
+ *    new generation.  Members that missed it only cost journal freshness,
+ *    never correctness — the mark is an under-estimate and completion
+ *    replays idempotently from the last POPULATING record.
+ *  - STRICT (arm / retire — assignment-SET transitions, which include the
+ *    adaptive v2<->v3 version flips): EVERY non-Faulty member must accept
+ *    the block.  A live member left holding a stale lower-gen copy is
+ *    invisible to the new module's gen election, but the PUBLISHED v2
+ *    module rejects v3 blocks — a stale v2 survivor would be the only
+ *    "valid" copy it sees and would resurrect the old assignment set
+ *    instead of failing closed.  Same-version transitions want it too: a
+ *    retire recorded on a single member resurrects retired assignments if
+ *    that member is later lost.  Callers roll the transition back on
+ *    -EIO.  (Residual caveat, documented in the design note: a FAULTY
+ *    member's block cannot be rewritten at all; its staleness is fenced
+ *    by md's own event-count gating at assemble.)
  */
-int raidkm_dcl_journal_write(struct r5conf *conf)
+int raidkm_dcl_journal_write(struct r5conf *conf, bool strict)
 {
 	struct mddev *mddev = conf->mddev;
 	struct md_rdev *rdev;
 	struct page *pg;
-	int written = 0;
+	int written = 0, failed = 0;
 
 	pg = alloc_page(GFP_KERNEL);
 	if (!pg)
@@ -470,13 +582,18 @@ int raidkm_dcl_journal_write(struct r5conf *conf)
 		 * data writes are not FUA) before the FUA'd journal block. */
 		if (sync_page_io(rdev, mddev->dev_sectors, RKDCL_SB_BYTES, pg,
 				 REQ_OP_WRITE | REQ_SYNC | REQ_PREFLUSH |
-				 REQ_FUA, false))
+				 REQ_FUA, false)) {
 			written++;
-		else
-			pr_warn("md/raid:%s: declustered: rkdcl journal write failed on %pg\n",
-				mdname(mddev), rdev->bdev);
+		} else {
+			failed++;
+			pr_warn("md/raid:%s: declustered: rkdcl journal write failed on %pg%s\n",
+				mdname(mddev), rdev->bdev,
+				strict ? " (strict transition write)" : "");
+		}
 	}
 	__free_page(pg);
+	if (strict)
+		return failed ? -EIO : (written ? 0 : -EIO);
 	return written ? 0 : -EIO;
 }
 

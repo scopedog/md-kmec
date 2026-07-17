@@ -213,7 +213,7 @@ rk_dmesg_clear
 rk_add_disks "$FDEV"
 rk_wait_full
 deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
-if [ "$deg" = 0 ] && sudo dmesg | grep -q "spare assignment for disk $F retired"; then
+if [ "$deg" = 0 ] && sudo dmesg | grep -q "spare assignment(s) retired"; then
 	rk_pass "replacement added: assignment retired + rebuild complete (degraded=0)"
 else
 	rk_fail "rebalance failed (degraded=$deg)"

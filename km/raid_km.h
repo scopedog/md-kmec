@@ -951,19 +951,31 @@ struct r5conf {
 					 * RAIDKM_LAYOUT_DCL.  Freed with the
 					 * conf. */
 	/*
-	 * Declustered spare-assignment / population state (Phase 3,
+	 * Declustered spare-assignment / population state (Phase 3 + 3b,
 	 * notes/declustered-population-design.md).  Loaded from the highest-
-	 * generation rkdcl v2 block; journaled back on state transitions and
-	 * mark checkpoints.  reb_state == RKDCL_ASSIGN_NONE means no redirect.
-	 * reb_mark is the RUNTIME prefix read-mark in rows: X-slot reads below
-	 * it are served from the spare column; at or above it the slot is
-	 * failed (on-the-fly decode).  X-slot WRITES redirect for ALL rows
-	 * while an assignment is active (the §1 ordering invariant).
+	 * generation rkdcl v2/v3 block; journaled back on state transitions
+	 * and mark checkpoints.  reb[] holds up to dcl->s assignments
+	 * {X_i -> spare col j_i} in ARMING ORDER (== on-disk table order);
+	 * redirect resolution CHAINS through them (see raidkm_dcl_redirect).
+	 * At most ONE entry is POPULATING at a time (reb_pop, -1 if none) —
+	 * populations are strictly sequential — so the runtime prefix
+	 * read-mark stays GLOBAL: X-slot reads whose chain hops through the
+	 * POPULATING entry are served from the spare below reb_mark and
+	 * decode on the fly at or above it.  POPULATED entries are covered
+	 * unconditionally.  X-slot WRITES chain for ALL rows while the
+	 * traversed assignments are active (the §1 ordering invariant,
+	 * applied transitively).
 	 */
-	int			reb_state;	/* RKDCL_ASSIGN_*		*/
-	int			reb_disk;	/* X (physical), -1 if none	*/
-	int			reb_spare;	/* spare column index j		*/
-	atomic64_t		reb_mark;	/* runtime prefix read-mark	*/
+	struct rkdcl_reb {
+		int		disk;		/* X_i (physical)	*/
+		int		spare;		/* spare column j_i	*/
+		int		state;		/* POPULATING/POPULATED	*/
+	}			*reb;		/* [dcl->s], kcalloc at
+						 * raidkm_dcl_load	*/
+	int			nreb;		/* live entries in reb[] */
+	int			reb_pop;	/* POPULATING index, -1	*/
+	atomic64_t		reb_mark;	/* runtime prefix read-mark
+						 * of the POPULATING entry */
 	u64			reb_journal_mark; /* last checkpointed mark	*/
 	u64			reb_gen;	/* journal generation		*/
 	spinlock_t		reb_win_lock;	/* prefix-completion window	*/
@@ -1305,6 +1317,6 @@ void raidkm_dcl_free(struct r5conf *conf);
  * (raid_km-dcl.c; notes/declustered-population-design.md) */
 #define RKDCL_REB_WINDOW	16384	/* stripe-address granules; must
 					 * exceed md's sync flight window */
-int raidkm_dcl_journal_write(struct r5conf *conf);
+int raidkm_dcl_journal_write(struct r5conf *conf, bool strict);
 void raidkm_dcl_pop_done(struct r5conf *conf, sector_t sector);
 #endif

@@ -190,6 +190,103 @@ static u32 dcl_inverse(const struct dcl_geom *ge, u32 disk, u64 phys_chunk,
 	return role;
 }
 
+/* ---- Phase 3b: multi-assignment chained resolve ------------------------- */
+/*
+ * With several spare assignments {X_i -> spare column j_i} active at once,
+ * a redirect can land on another failed-and-assigned disk: spare columns
+ * rotate over ALL pool disks, so there are rows where j_2's physical disk
+ * IS X_1.  Resolution therefore CHAINS: col -> j_2 -> X_1 (dead, assigned)
+ * -> j_1 -> live disk.  Bijectivity of the per-row column<->disk map gives
+ * the properties the checker below asserts:
+ *
+ *  - each failed disk occupies exactly one column per row, so at most one
+ *    chain traverses a given assignment: chains are vertex-disjoint and
+ *    resolved endpoints never collide;
+ *  - a cycle would need every disk on it to sit at a spare column of the
+ *    row (the only predecessor of a cycle element is another cycle
+ *    element), so chains starting at GROUP columns always terminate; cycles
+ *    are spare-only and content-free (copies of copies of nothing);
+ *  - a chain ends either at a live disk or DEAD (an unassigned failed disk,
+ *    a POPULATING assignment above its mark, or a content-free self-loop).
+ *
+ * `mark[i]` is the per-assignment prefix mark in ROWS: a hop through
+ * assignment i is permitted iff row < mark[i].  POPULATED = mark ~0ULL.
+ * The WRITE map passes ~0ULL for every active assignment (the §1
+ * redirect-all-writes invariant, applied transitively).
+ */
+struct dcl_assign {
+	u32 disk;	/* X_i: failed physical disk		*/
+	u32 spare;	/* j_i: spare column index, < s		*/
+};
+
+#define DCL_MARK_ALL	(~0ULL)
+
+/* Resolve (row, lcol) -> physical disk through the active assignment chain.
+ * *dead = 1 when the endpoint holds no live copy (caller decodes). */
+static inline u32 dcl_resolve(const struct dcl_geom *ge,
+			      const struct dcl_assign *as, const u64 *mark,
+			      u32 nas, u64 row, u32 lcol, u32 *dead)
+{
+	u32 disk = dcl_disk(ge, row, lcol);
+	u32 hops;
+
+	for (hops = 0; hops <= nas; hops++) {
+		u32 i, nlcol;
+
+		for (i = 0; i < nas; i++)
+			if (as[i].disk == disk)
+				break;
+		if (i == nas) {			/* live endpoint */
+			*dead = 0;
+			return disk;
+		}
+		if (row >= mark[i]) {		/* not covered: decode */
+			*dead = 1;
+			return disk;
+		}
+		nlcol = ge->ngroups * ge->g + as[i].spare;
+		if (nlcol == lcol) {		/* self-loop: content-free */
+			*dead = 1;
+			return disk;
+		}
+		lcol = nlcol;
+		disk = dcl_disk(ge, row, lcol);
+	}
+	*dead = 1;	/* spare-only cycle (unreachable from group columns) */
+	return disk;
+}
+
+/* Does the WRITE chain of (row, lcol) traverse disk X?  Population of a
+ * newly armed assignment {X -> j} must rebuild every group column whose
+ * chain traverses X — not only X's own column: rows where X held another
+ * assignment's spare content re-materialise through the extended chain
+ * (this replaces the single-assignment "spare column here -> skip" rule). */
+static inline int dcl_chain_traverses(const struct dcl_geom *ge,
+				      const struct dcl_assign *as, u32 nas,
+				      u64 row, u32 lcol, u32 X)
+{
+	u32 disk = dcl_disk(ge, row, lcol);
+	u32 hops;
+
+	for (hops = 0; hops <= nas; hops++) {
+		u32 i, nlcol;
+
+		if (disk == X)
+			return 1;
+		for (i = 0; i < nas; i++)
+			if (as[i].disk == disk)
+				break;
+		if (i == nas)
+			return 0;		/* live endpoint, X not seen */
+		nlcol = ge->ngroups * ge->g + as[i].spare;
+		if (nlcol == lcol)
+			return 0;		/* self-loop, content-free */
+		lcol = nlcol;
+		disk = dcl_disk(ge, row, lcol);
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------------------ */
 /* KERNEL-CORE-END                                                           */
 /* ------------------------------------------------------------------------ */
@@ -300,6 +397,151 @@ static int check_roundtrip(const struct dcl_geom *ge, u64 nchunks, int verbose)
 		printf("Bijectivity + %llu-chunk forward/inverse roundtrip: OK\n",
 		       (unsigned long long)nchunks);
 	return 1;
+}
+
+/* ---- P4: multi-assignment chain invariants (Phase 3b) --------------------- */
+
+#define DCL_MAX_ASSIGN_SIM	127	/* == rkdcl v3 table capacity */
+
+/*
+ * For an assignment set (X_i -> j_i) with per-assignment marks, over one full
+ * period, assert:
+ *   A1  every GROUP-column chain terminates within nas hops, visiting no
+ *       column twice (group chains never enter cycles);
+ *   A2  per row, the resolved write-map disks of all group columns are
+ *       pairwise distinct and live (no write collisions, nothing lands on a
+ *       failed disk);
+ *   A3  cycles exist only among spare columns (content-free); counted;
+ *   A4  chains are vertex-disjoint: <= 1 group column per row traverses any
+ *       given failed disk; for the newest assignment X, EXACTLY one when X's
+ *       column that row is a group column (the v1 case);
+ *   A5  read-map mark semantics for the newest (POPULATING) assignment:
+ *       candidate rows >= M dead-end exactly at X; rows < M resolve live.
+ */
+static int check_chains(const struct dcl_geom *ge, const struct dcl_assign *as,
+			const u64 *mark, u32 nas, int verbose)
+{
+	u64 period = (u64)ge->nbase * ge->N;
+	u64 wmark[DCL_MAX_ASSIGN_SIM];
+	u64 row, cyc_rows = 0, cand_rows = 0;
+	u32 gcols = ge->ngroups * ge->g;
+	u32 Xnew = as[nas - 1].disk;
+	int ok = 1;
+
+	for (row = 0; row < nas; row++)
+		wmark[row] = DCL_MARK_ALL;
+
+	for (row = 0; row < period && ok; row++) {
+		u32 seen_disk[256], nseen = 0;
+		u32 c, i, ncand = 0;
+
+		for (c = 0; c < gcols; c++) {
+			/* A1: manual walk, no column revisits, bounded */
+			u32 visited[DCL_MAX_ASSIGN_SIM + 1], nvis = 0;
+			u32 lcol = c, disk = dcl_disk(ge, row, lcol);
+			u32 dead, hops = 0, rdisk;
+
+			while (1) {
+				u32 v;
+
+				for (v = 0; v < nvis; v++)
+					if (visited[v] == lcol) {
+						printf("A1 FAIL row %llu col %u: column %u revisited\n",
+						       (unsigned long long)row, c, lcol);
+						return 0;
+					}
+				visited[nvis++] = lcol;
+				for (i = 0; i < nas; i++)
+					if (as[i].disk == disk)
+						break;
+				if (i == nas)
+					break;
+				if (++hops > nas + 1) {
+					printf("A1 FAIL row %llu col %u: unterminated chain\n",
+					       (unsigned long long)row, c);
+					return 0;
+				}
+				lcol = ge->ngroups * ge->g + as[i].spare;
+				disk = dcl_disk(ge, row, lcol);
+			}
+			/* A2: write-map endpoints distinct + live */
+			rdisk = dcl_resolve(ge, as, wmark, nas, row, c, &dead);
+			if (dead || rdisk != disk) {
+				printf("A2 FAIL row %llu col %u: write map dead=%u disk=%u/%u\n",
+				       (unsigned long long)row, c, dead, rdisk, disk);
+				return 0;
+			}
+			for (i = 0; i < nseen; i++)
+				if (seen_disk[i] == rdisk) {
+					printf("A2 FAIL row %llu col %u: endpoint collision on disk %u\n",
+					       (unsigned long long)row, c, rdisk);
+					return 0;
+				}
+			seen_disk[nseen++] = rdisk;
+			/* A4/A5 below need candidacy for the newest assignment */
+			if (dcl_chain_traverses(ge, as, nas, row, c, Xnew)) {
+				u32 d5, r5 = dcl_resolve(ge, as, mark, nas,
+							 row, c, &d5);
+
+				ncand++;
+				if (row >= mark[nas - 1]) {
+					if (!d5 || r5 != Xnew) {
+						printf("A5 FAIL row %llu col %u: above-mark dead=%u disk=%u (want dead at %u)\n",
+						       (unsigned long long)row, c, d5, r5, Xnew);
+						return 0;
+					}
+				} else if (d5) {
+					printf("A5 FAIL row %llu col %u: below-mark resolved dead\n",
+					       (unsigned long long)row, c);
+					return 0;
+				}
+			}
+		}
+		/* A3: walks from active spare columns; cycles must be spare-only */
+		for (i = 0; i < nas; i++) {
+			u32 lcol = ge->ngroups * ge->g + as[i].spare;
+			u32 disk = dcl_disk(ge, row, lcol), hops;
+			int cycled = 0;
+
+			for (hops = 0; hops <= nas; hops++) {
+				u32 j;
+
+				for (j = 0; j < nas; j++)
+					if (as[j].disk == disk)
+						break;
+				if (j == nas)
+					break;
+				lcol = ge->ngroups * ge->g + as[j].spare;
+				disk = dcl_disk(ge, row, lcol);
+				if (lcol == ge->ngroups * ge->g + as[i].spare) {
+					cycled = 1;	/* closed loop */
+					break;
+				}
+			}
+			if (cycled) {
+				cyc_rows++;
+				break;	/* one count per row is enough */
+			}
+		}
+		/* A4: vertex-disjointness for the newest assignment */
+		if (ncand > 1) {
+			printf("A4 FAIL row %llu: %u chains traverse disk %u\n",
+			       (unsigned long long)row, ncand, Xnew);
+			return 0;
+		}
+		if (dcl_lcol(ge, row, Xnew) < gcols && ncand != 1) {
+			printf("A4 FAIL row %llu: X at group column but no candidate\n",
+			       (unsigned long long)row);
+			return 0;
+		}
+		cand_rows += ncand;
+	}
+	if (verbose)
+		printf("P4 chain invariants (%u assignments, X=%u): OK\n"
+		       "  candidate rows %llu/%llu (rebuild volume), spare-only cycle rows %llu\n",
+		       nas, Xnew, (unsigned long long)cand_rows,
+		       (unsigned long long)period, (unsigned long long)cyc_rows);
+	return ok;
 }
 
 /* ---- P2: rebuild load distribution for a failed disk --------------------- */
@@ -469,6 +711,49 @@ static void emit_rowmap(const struct dcl_geom *ge, const char *path, u64 nrows)
 	       (unsigned long long)nrows, path);
 }
 
+/* rowmap v2: v1 columns + the read-map resolved disk and dead flag for the
+ * given assignment set — the multi-assignment gate's placement oracle
+ * (chain rows are exactly where resolved != disk beyond one hop). */
+static void emit_rowmap2(const struct dcl_geom *ge,
+			 const struct dcl_assign *as, const u64 *mark,
+			 u32 nas, const char *path, u64 nrows)
+{
+	FILE *f = fopen(path, "w");
+	u64 row;
+	u32 lcol, i;
+
+	if (!f) { perror(path); return; }
+	fprintf(f, "# declustered-sim rowmap v2: row lcol disk role resolved dead\n");
+	fprintf(f, "# assignments:");
+	for (i = 0; i < nas; i++)
+		fprintf(f, " %u:%u:%llu", as[i].disk, as[i].spare,
+			(unsigned long long)mark[i]);
+	fprintf(f, "\n");
+	for (row = 0; row < nrows; row++)
+		for (lcol = 0; lcol < ge->N; lcol++) {
+			u32 d = dcl_disk(ge, row, lcol);
+			u32 dead, rd;
+			char role[32];
+
+			if (lcol >= ge->ngroups * ge->g)
+				snprintf(role, sizeof(role), "S%u",
+					 lcol - ge->ngroups * ge->g);
+			else if (lcol % ge->g >= ge->k)
+				snprintf(role, sizeof(role), "P%u.%u",
+					 lcol / ge->g, lcol % ge->g - ge->k);
+			else
+				snprintf(role, sizeof(role), "D%u.%u",
+					 lcol / ge->g, lcol % ge->g);
+			rd = dcl_resolve(ge, as, mark, nas, row, lcol, &dead);
+			fprintf(f, "%llu\t%u\t%u\t%s\t%u\t%u\n",
+				(unsigned long long)row, lcol, d, role,
+				rd, dead);
+		}
+	fclose(f);
+	printf("wrote %llu rowmap rows to %s\n",
+	       (unsigned long long)nrows, path);
+}
+
 /* ---- main ----------------------------------------------------------------- */
 
 static void usage(const char *argv0)
@@ -477,8 +762,14 @@ static void usage(const char *argv0)
 		"usage: %s -N <pool> -g <group=k+m> -m <parity> -s <spares>\n"
 		"          [-b nbase=4] [-S seed=1] [-T tries=64]\n"
 		"          [--vectors <file>] [--nvec <n=1024>]\n"
-		"          [--rowmap <file>] [--nrows <n=64>] [-q]\n"
-		"constraint C1: (N - s) %% g == 0\n", argv0);
+		"          [--rowmap <file>] [--nrows <n=64>]\n"
+		"          [--assign X:j[:M]]... [-q]\n"
+		"constraint C1: (N - s) %% g == 0\n"
+		"--assign: spare assignment X->column j, optional POPULATING\n"
+		"          prefix mark M in rows (omitted = POPULATED); repeatable,\n"
+		"          <= s assignments, at most the LAST may carry a mark.\n"
+		"          Runs the P4 chain checks; --rowmap emits v2 (resolved).\n"
+		"          With s >= 2 and no --assign, P4 runs on a synthetic set.\n", argv0);
 	exit(2);
 }
 
@@ -487,8 +778,10 @@ int main(int argc, char **argv)
 	struct dcl_geom ge;
 	struct accept_result best;
 	struct p2_metrics pm;
+	struct dcl_assign as[DCL_MAX_ASSIGN_SIM];
+	u64 mark[DCL_MAX_ASSIGN_SIM];
 	u64 seed0 = 1, nvec = 1024, nrows = 64;
-	u32 tries = 64, X;
+	u32 tries = 64, X, nas = 0, explicit_nas;
 	const char *vecpath = NULL, *rowmappath = NULL;
 	int i, verbose = 1, ok = 1;
 
@@ -507,12 +800,31 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--nvec") && i + 1 < argc) nvec = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--rowmap") && i + 1 < argc) rowmappath = argv[++i];
 		else if (!strcmp(argv[i], "--nrows") && i + 1 < argc) nrows = strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--assign") && i + 1 < argc) {
+			unsigned int ax, aj;
+			unsigned long long am;
+			int nf;
+
+			if (nas >= DCL_MAX_ASSIGN_SIM) usage(argv[0]);
+			nf = sscanf(argv[++i], "%u:%u:%llu", &ax, &aj, &am);
+			if (nf < 2) usage(argv[0]);
+			as[nas].disk  = ax;
+			as[nas].spare = aj;
+			mark[nas] = nf == 3 ? (u64)am : DCL_MARK_ALL;
+			nas++;
+		}
 		else if (!strcmp(argv[i], "-q"))                  verbose = 0;
 		else usage(argv[0]);
 	}
 
 	if (!ge.N || !ge.g || !ge.m || ge.g <= ge.m || ge.N < ge.g + ge.s)
 		usage(argv[0]);
+	if (ge.N > 255) {	/* on-disk format cap (GF(2^8) pool limit);
+				 * also bounds check_chains' seen_disk[] */
+		fprintf(stderr, "N=%u exceeds the format cap of 255 disks\n",
+			ge.N);
+		return 2;
+	}
 	if ((ge.N - ge.s) % ge.g) {
 		fprintf(stderr, "C1 violated: (N-s) %% g = (%u-%u) %% %u = %u != 0\n",
 			ge.N, ge.s, ge.g, (ge.N - ge.s) % ge.g);
@@ -562,10 +874,59 @@ int main(int argc, char **argv)
 	if (ok && verbose)
 		printf("P2 rotation symmetry (X=1..3 identical to X=0): OK\n");
 
+	/* P4: multi-assignment chain invariants (explicit set, or synthetic
+	 * when the geometry has room for one).  Only an EXPLICIT --assign set
+	 * switches --rowmap to the v2 format — the Phase-3 populate gate
+	 * parses v1. */
+	explicit_nas = nas;
+	if (!nas && ge.s >= 2) {
+		u32 a = ge.s < 3 ? ge.s : 3, ai;
+
+		for (ai = 0; ai < a; ai++) {
+			/* 2a-1 <= N-1 for every legal geometry (N >= g+s >= 3+a) */
+			as[ai].disk  = ai * 2 + 1;
+			as[ai].spare = ai;
+			mark[ai] = DCL_MARK_ALL;
+		}
+		mark[a - 1] = (u64)ge.nbase * ge.N / 2;	/* newest POPULATING */
+		nas = a;
+	}
+	if (nas) {
+		u32 ai, aj;
+
+		if (nas > ge.s) {
+			fprintf(stderr, "--assign: %u assignments > s=%u\n", nas, ge.s);
+			return 2;
+		}
+		for (ai = 0; ai < nas; ai++) {
+			if (as[ai].disk >= ge.N || as[ai].spare >= ge.s) {
+				fprintf(stderr, "--assign %u:%u out of range\n",
+					as[ai].disk, as[ai].spare);
+				return 2;
+			}
+			if (ai < nas - 1 && mark[ai] != DCL_MARK_ALL) {
+				fprintf(stderr, "--assign: only the last assignment may be POPULATING\n");
+				return 2;
+			}
+			for (aj = 0; aj < ai; aj++)
+				if (as[ai].disk == as[aj].disk ||
+				    as[ai].spare == as[aj].spare) {
+					fprintf(stderr, "--assign: duplicate disk/spare\n");
+					return 2;
+				}
+		}
+		ok &= check_chains(&ge, as, mark, nas, verbose);
+	}
+
 	if (vecpath)
 		emit_vectors(&ge, vecpath, nvec);
-	if (rowmappath)
-		emit_rowmap(&ge, rowmappath, nrows);
+	if (rowmappath) {
+		if (explicit_nas)
+			emit_rowmap2(&ge, as, mark, explicit_nas,
+				     rowmappath, nrows);
+		else
+			emit_rowmap(&ge, rowmappath, nrows);
+	}
 
 	printf("%s\n", ok ? "ALL CHECKS PASSED" : "CHECKS FAILED");
 	free(ge.base); free(ge.ibase);

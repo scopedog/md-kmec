@@ -20,6 +20,10 @@
 # matrix validates ORDERING (mark never ahead of durable spare writes), not
 # drive-cache behavior.
 #
+# DCL_CRASH_MULTI=1 (needs s >= 2): Phase-3b variant — first population runs
+# to POPULATED, then a second member fails and the power cut lands mid-
+# SECOND-population, i.e. on the v3 two-assignment journal; the resume must
+# restore BOTH assignments and finish.  DCL_CRASH_DELAY pins the cut delay.
 # Configurable: DCL_N/G/M/SC/NBASE/SEED (geometry), DCL_CRASH_ITERS (4),
 #               DCL_CRASH_DISK_MB (192), DCL_CRASH_BACK dir.
 # OPT-IN reliability gate — not part of the default raidkm-test.sh runner.
@@ -68,6 +72,14 @@ stack_setup() {
 	FLK=(); LOOPS=(); DEVS=()
 	mkdir -p "$BACK"
 	global_cleanup
+	# Iteration boundary needs the same udev discipline as the post-crash
+	# assemble: teardown/creation events can trigger an incremental md127
+	# assembly of the previous iteration's members, which then holds the
+	# dm devices busy (observed: 7-member inactive md127 wedging iter4's
+	# create).  Settle, tear down anything udev built, settle again.
+	sudo udevadm settle 2>/dev/null
+	sudo "$MDADM" --stop --scan > /dev/null 2>&1
+	sudo udevadm settle 2>/dev/null
 	for i in $(seq 1 "$N"); do
 		f="$BACK/disk$i.img"
 		sudo rm -f "$f"
@@ -133,6 +145,15 @@ F=$(awk '$1 !~ /^#/ && $1 == 0 {print $6}' "$RK_TMP/vec.tsv")
 read -r -a FLCS <<< "$(awk -v F="$F" '$1 !~ /^#/ && $6 == F && $1 < 1536 && !seen[$5]++ {print $1}' \
 	"$RK_TMP/vec.tsv" | head -6 | tr '\n' ' ')"
 [ "${#FLCS[@]}" -ge 3 ] || { echo "ERROR: too few on-F vectors" >&2; exit 1; }
+# multi-assignment variant (DCL_CRASH_MULTI=1, needs s >= 2): populate F to
+# POPULATED first, then fail F2 and CRASH mid-SECOND-population — the power
+# cut lands on the v3 (two-assignment) journal and the resume must restore
+# BOTH assignments and finish the second population.
+MULTI=${DCL_CRASH_MULTI:-0}
+if [ "$MULTI" = 1 ]; then
+	[ "$SC" -ge 2 ] || { echo "ERROR: DCL_CRASH_MULTI needs s >= 2" >&2; exit 1; }
+	F2=$(awk -v f="$F" '$1 !~ /^#/ && $6 != f {print $6; exit}' "$RK_TMP/vec.tsv")
+fi
 
 mkpat() {
 	yes "$1$(printf '%04d' "$2")" | head -c $((CHUNK_KB * 1024)) | \
@@ -166,28 +187,68 @@ for it in $(seq 1 "$ITERS"); do
 	FDEV="${DEVS[$F]}"
 	rk_fail_disks "$FDEV"
 	sudo "$MDADM" --remove "$MD" "$FDEV" > /dev/null 2>&1
-	rk_throttle 8192
-	echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
-		rk_fail "$tag: arming failed"; break; }
-	delay=$(( (RANDOM % 9) + 1 ))	# 1..9s: pre-checkpoint AND mid-pass cells
+	if [ "$MULTI" = 1 ]; then
+		# first population runs to POPULATED at full speed; the crash
+		# targets the SECOND population (v3 journal on disk)
+		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
+			rk_fail "$tag: arming F failed"; break; }
+		rk_wait_idle
+		pop_show | grep -q "^populated $F " || {
+			rk_fail "$tag: first population did not complete"; break; }
+		FDEV2="${DEVS[$F2]}"
+		rk_fail_disks "$FDEV2"
+		sudo "$MDADM" --remove "$MD" "$FDEV2" > /dev/null 2>&1
+		rk_throttle 8192
+		echo "$F2" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
+			rk_fail "$tag: arming F2 failed"; break; }
+	else
+		rk_throttle 8192
+		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
+			rk_fail "$tag: arming failed"; break; }
+	fi
+	delay=${DCL_CRASH_DELAY:-$(( (RANDOM % 9) + 1 ))}	# 1..9s: pre-checkpoint AND mid-pass cells
 	sleep "$delay"
 	premark=$(pop_show | sed -n 's/.*mark \([0-9]*\)\/.*/\1/p')
 	crash_now
 	sudo "$MDADM" --stop "$MD" > /dev/null 2>&1
 	crash_thaw
 	sudo "$MDADM" --stop "$MD" > /dev/null 2>&1
+	# The thaw's dm resume events can trigger udev INCREMENTAL assembly of
+	# the survivors into md127, stealing the members from the assemble
+	# below (observed: population resumed fine — on md127; our pop_show on
+	# $MDNAME read '').  Settle udev FIRST so its assembly (if any) is
+	# complete, THEN tear every scanned array down, then settle again so
+	# the teardown events are drained before we assemble.
+	sudo udevadm settle 2>/dev/null
 	sudo "$MDADM" --stop --scan > /dev/null 2>&1
+	sudo udevadm settle 2>/dev/null
 	sleep 0.2
 
 	SURV=()
-	for d in "${DEVS[@]}"; do [ "$d" != "$FDEV" ] && SURV+=("$d"); done
+	for d in "${DEVS[@]}"; do
+		[ "$d" = "$FDEV" ] && continue
+		[ "$MULTI" = 1 ] && [ "$d" = "${FDEV2:-}" ] && continue
+		SURV+=("$d")
+	done
 	dmesg_window_close; rk_dmesg_clear
 	# --force: the dropped stop leaves DIRTY superblocks and the pool is
 	# degraded — md (correctly) refuses dirty+degraded without it.
 	sudo "$MDADM" --assemble --force --run "$MD" "${SURV[@]}" > /dev/null 2>&1 || {
 		rk_fail "$tag: post-crash assemble failed (crash at ${delay}s, premark=$premark)"
 		break; }
-	state=$(pop_show)
+	# multi: F's assignment completed (and was journaled) BEFORE F2 failed,
+	# so every election outcome preserves it — assert that first.
+	if [ "$MULTI" = 1 ] && ! pop_show | grep -q "^populated $F "; then
+		echo "  DIAG: state: $(pop_show | tr '\n' '|')"
+		rk_fail "$tag: first assignment lost across the crash"; break
+	fi
+	if [ "$MULTI" = 1 ]; then
+		state=$(pop_show | grep -v "^populated $F ")
+		rearm="$F2"
+	else
+		state=$(pop_show)
+		rearm="$F"
+	fi
 	case "$state" in
 	populating*)
 		rmark=$(sudo dmesg | sed -n 's/.*resuming population of disk [0-9]* from mark \([0-9]*\).*/\1/p' | tail -1)
@@ -196,20 +257,31 @@ for it in $(seq 1 "$ITERS"); do
 	populated*)
 		rk_pass "$tag: assignment already POPULATED at assemble (crash at ${delay}s)"
 		;;
-	none*)
+	""|none*)
 		# crash beat the arming journal — legit cell; arm again
-		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 \
+		# (multi: only F2's arming can be lost; F was asserted above)
+		echo "$rearm" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 \
 			&& rk_pass "$tag: assignment lost to the crash (pre-journal cell) — re-armed" \
 			|| { rk_fail "$tag: state none and re-arm failed"; break; }
 		;;
 	*)
+		echo "  DIAG: mdstat: $(grep -A1 "$MDNAME" /proc/mdstat | tr '\n' ' ')"
+		echo "  DIAG: attr exists: $(ls -la /sys/block/$MDNAME/md/rk_dcl_populate 2>&1)"
+		echo "  DIAG: array_state: $(cat /sys/block/$MDNAME/md/array_state 2>&1)"
+		echo "  DIAG: dmesg tail: $(sudo dmesg | tail -8 | tr '\n' '|')"
 		rk_fail "$tag: unexpected state '$state' after crash"; break;;
 	esac
 	rk_unthrottle
 	rk_wait_idle
-	pop_show | grep -q "^populated" \
-		&& rk_pass "$tag: population COMPLETE after crash ($(pop_show))" \
-		|| { rk_fail "$tag: population did not complete: $(pop_show)"; break; }
+	if [ "$MULTI" = 1 ]; then
+		pop_show | grep -q "^populated $F " && pop_show | grep -q "^populated $F2 " \
+			&& rk_pass "$tag: BOTH populations COMPLETE after crash ($(pop_show | tr '\n' ';'))" \
+			|| { rk_fail "$tag: populations did not complete: $(pop_show | tr '\n' ';')"; break; }
+	else
+		pop_show | grep -q "^populated" \
+			&& rk_pass "$tag: population COMPLETE after crash ($(pop_show))" \
+			|| { rk_fail "$tag: population did not complete: $(pop_show)"; break; }
+	fi
 
 	ok=1
 	for lc in "${FLCS[@]}"; do

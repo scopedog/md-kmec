@@ -11,7 +11,13 @@
 #   4. auto=1: a bare `mdadm --fail` (member still attached, Faulty) arms
 #      population via raid5d and it completes; content + scrub clean;
 #   5. --add of a wiped replacement retires the assignment, stock recovery
-#      rebuilds it (degraded=0), content intact, no kernel WARN/BUG.
+#      rebuilds it (degraded=0), content intact;
+#   6. 3b rescan legs (needs s >= 2): a burst double-failure ends with BOTH
+#      members auto-populated regardless of park-slot interleaving (the
+#      raid5d rescan re-derives the want from array state), and adding a
+#      replacement for only ONE of two populated victims — which retires
+#      ALL assignments — automatically RE-populates the still-missing one.
+#      No kernel WARN/BUG anywhere.
 set -u
 
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
@@ -141,7 +147,7 @@ sudo dd if=/dev/zero of="${MEMBERS[$F2]}" bs=1M status=none 2>/dev/null || true
 rk_add_disks "${MEMBERS[$F2]}"
 rk_wait_full
 deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
-if [ "$deg" = 0 ] && sudo dmesg | grep -q "spare assignment for disk $F2 retired" \
+if [ "$deg" = 0 ] && sudo dmesg | grep -q "spare assignment(s) retired" \
    && pop_show | grep -q "^none"; then
 	rk_pass "replacement retired the assignment + rebuilt (degraded=0)"
 else
@@ -156,6 +162,49 @@ mm=$(rk_scrub)
 [ $ok = 1 ] && [ "$mm" = 0 ] \
 	&& rk_pass "content intact after rebalance + final scrub clean" \
 	|| rk_fail "post-rebalance content/scrub bad (ok=$ok mismatch=$mm)"
+# ---- 6. 3b rescan: burst double-failure + retire-one re-arm ---------------------
+if [ "$SC" -ge 2 ]; then
+	F3=2; F4=7
+	rk_fail_disks "${MEMBERS[$F3]}" "${MEMBERS[$F4]}"	# burst: one park slot
+	# BOTH must end POPULATED whatever the park/rescan interleaving —
+	# that guarantee IS the rescan (the one-shot park alone drops one)
+	ok=0
+	for i in $(seq 1 240); do
+		pop_show | grep -q "^populated $F3 " && \
+		pop_show | grep -q "^populated $F4 " && { ok=1; break; }
+		sleep 1
+	done
+	[ $ok = 1 ] && rk_pass "burst double-failure: BOTH auto-populated sequentially" \
+		    || { rk_fail "burst leg incomplete: $(pop_show | tr '\n' ';')"; rk_summary; exit 1; }
+	# replacement for F3 ONLY: retire-all fires, then the rescan must
+	# re-park + re-populate the still-missing F4 with no operator step
+	sudo "$MDADM" --remove "$MD" "${MEMBERS[$F3]}" > /dev/null 2>&1
+	sudo "$MDADM" --zero-superblock "${MEMBERS[$F3]}" 2>/dev/null
+	sudo dd if=/dev/zero of="${MEMBERS[$F3]}" bs=1M status=none 2>/dev/null || true
+	rk_add_disks "${MEMBERS[$F3]}"
+	rk_wait_full
+	ok=0
+	for i in $(seq 1 240); do
+		pop_show | grep -q "^populated $F4 " && { ok=1; break; }
+		sleep 1
+	done
+	deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
+	[ $ok = 1 ] && [ "$deg" = 1 ] \
+		&& rk_pass "retire-one: still-missing member re-populated automatically (degraded=1)" \
+		|| rk_fail "retire-one re-arm failed (deg=$deg, $(pop_show | tr '\n' ';'))"
+	# restore: add F4's replacement, back to clean
+	sudo "$MDADM" --remove "$MD" "${MEMBERS[$F4]}" > /dev/null 2>&1
+	sudo "$MDADM" --zero-superblock "${MEMBERS[$F4]}" 2>/dev/null
+	sudo dd if=/dev/zero of="${MEMBERS[$F4]}" bs=1M status=none 2>/dev/null || true
+	rk_add_disks "${MEMBERS[$F4]}"
+	rk_wait_full
+	mm=$(rk_scrub)
+	deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
+	[ "$mm" = 0 ] && [ "$deg" = 0 ] \
+		&& rk_pass "restored to clean after rescan legs (degraded=0, scrub clean)" \
+		|| rk_fail "post-rescan restore bad (deg=$deg mismatch=$mm)"
+fi
+
 rk_dmesg_clean && rk_pass "no kernel WARN/BUG during the run" \
 	       || rk_fail "kernel log had WARN/BUG — check dmesg"
 
