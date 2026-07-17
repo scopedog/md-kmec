@@ -47,6 +47,134 @@
 static DEFINE_MUTEX(dcl_selftest_lock);
 static char dcl_selftest_result[128] = "never run";
 
+/* Chain-walk equivalence sweep (selftest step 6).  Builds a synthetic
+ * assignment set (a = min(s, 3) assignments on distinct disks, the last one
+ * POPULATING) plus a minimal fake conf carrying ONLY the fields the runtime
+ * walks read (dcl, reb[], nreb, reb_pop, reb_mark, chunk_sectors), then
+ * asserts, over one full period:
+ *   - runtime redirect == core dcl_resolve, read + write maps, with the
+ *     POPULATING prefix mark at 0, period/2 and period rows;
+ *   - runtime chain_root == core dcl_chain_root == the unique group column
+ *     dcl_chain_traverses finds, for every assigned disk + a live probe.
+ * The runtime coverage compare `(row+1)*chunk_sectors <= mark_sectors` is
+ * exactly `row < mark_rows` when mark_sectors = mark_rows*chunk_sectors,
+ * which is how the core's row-granular mark[] is populated. */
+#define DCL_ST_CHUNK_SECT	128	/* 64K chunks: any value works */
+
+static bool dcl_selftest_chains(struct dcl_geom *ge)
+{
+	u64 period = (u64)ge->nbase * ge->N;
+	u32 gcols = ge->ngroups * ge->g;
+	u32 nas = min_t(u32, ge->s, 3);
+	struct dcl_assign as[3];
+	u64 mark_core[3];
+	struct rkdcl_reb reb[3];
+	struct r5conf *conf;
+	static const u32 mark_div[] = { 0, 2, 1 };  /* -> 0, period/2, period */
+	u32 mi, i;
+	u64 row;
+	bool ok = true;
+
+	conf = kzalloc(sizeof(*conf), GFP_KERNEL);
+	if (!conf)
+		return false;
+	conf->dcl = ge;
+	conf->reb = reb;
+	conf->chunk_sectors = DCL_ST_CHUNK_SECT;
+
+	for (i = 0; i < nas; i++) {
+		/* distinct disks for every legal geometry (2a-1 <= N-1) */
+		as[i].disk  = i * 2 + 1;
+		as[i].spare = i;
+		reb[i].disk  = (int)as[i].disk;
+		reb[i].spare = (int)as[i].spare;
+		reb[i].state = RKDCL_ASSIGN_POPULATED;
+	}
+	reb[nas - 1].state = RKDCL_ASSIGN_POPULATING;
+	conf->nreb = (int)nas;
+	conf->reb_pop = (int)nas - 1;
+
+	for (mi = 0; mi < ARRAY_SIZE(mark_div) && ok; mi++) {
+		u64 mark_rows = mark_div[mi] ? period / mark_div[mi] : 0;
+		u32 lcol;
+
+		atomic64_set(&conf->reb_mark,
+			     mark_rows * DCL_ST_CHUNK_SECT);
+		for (i = 0; i < nas; i++)
+			mark_core[i] = DCL_MARK_ALL;
+		mark_core[nas - 1] = mark_rows;
+
+		for (row = 0; row < period && ok; row++) {
+			for (lcol = 0; lcol < gcols; lcol++) {
+				u32 dead, want_r, want_w;
+				int got_r, got_w;
+				int disk0 = (int)dcl_disk(ge, row, lcol);
+
+				want_r = dcl_resolve(ge, as, mark_core, nas,
+						     row, lcol, &dead);
+				got_r = raidkm_dcl_test_redirect(conf, disk0,
+								 row, false);
+				/* write map: every hop covered */
+				mark_core[nas - 1] = DCL_MARK_ALL;
+				want_w = dcl_resolve(ge, as, mark_core, nas,
+						     row, lcol, &dead);
+				mark_core[nas - 1] = mark_rows;
+				got_w = raidkm_dcl_test_redirect(conf, disk0,
+								 row, true);
+				if (got_r != (int)want_r ||
+				    got_w != (int)want_w) {
+					pr_err("raidkm: DCLTEST chain FAIL row %llu lcol %u mark %llu: runtime r/w %d/%d core %u/%u\n",
+					       (unsigned long long)row, lcol,
+					       (unsigned long long)mark_rows,
+					       got_r, got_w, want_r, want_w);
+					ok = false;
+					break;
+				}
+			}
+			/* inverse walk: assigned disks + one live probe */
+			for (i = 0; i <= nas && ok; i++) {
+				u32 probe, k2, fwd_n = 0, cc;
+				int fwd = -1, inv_core, inv_rt;
+
+				if (i < nas) {
+					probe = as[i].disk;
+				} else {
+					probe = (as[0].disk + 1) % ge->N;
+					for (k2 = 0; k2 < nas; k2++)
+						if (as[k2].disk == probe)
+							probe = (probe + 1) %
+								ge->N;
+				}
+				for (cc = 0; cc < gcols; cc++)
+					if (dcl_chain_traverses(ge, as, nas,
+								row, cc,
+								probe)) {
+						fwd = (int)cc;
+						fwd_n++;
+					}
+				inv_core = dcl_chain_root(ge, as, nas, row,
+							  probe);
+				inv_rt = raidkm_dcl_test_chain_root(conf, row,
+								(int)probe);
+				if (fwd_n > 1 || inv_core != fwd ||
+				    inv_rt != fwd) {
+					pr_err("raidkm: DCLTEST chain-root FAIL row %llu disk %u: fwd=%d(n=%u) core=%d runtime=%d\n",
+					       (unsigned long long)row, probe,
+					       fwd, fwd_n, inv_core, inv_rt);
+					ok = false;
+				}
+			}
+			cond_resched();
+		}
+	}
+	if (ok)
+		pr_info("raidkm: DCLTEST chain-walk equivalence OK (%u assignment(s), %u marks, %llu rows)\n",
+			nas, (u32)ARRAY_SIZE(mark_div),
+			(unsigned long long)period);
+	kfree(conf);
+	return ok;
+}
+
 static int dcl_selftest_run(struct dcl_geom *ge, u32 want_crc)
 {
 	u64 period = (u64)ge->nbase * ge->N;
@@ -57,6 +185,7 @@ static int dcl_selftest_run(struct dcl_geom *ge, u32 want_crc)
 	struct dcl_addr a;
 	int err = -EIO;
 	bool crc_ok = true, p1_ok = true, bij_ok = true, rt_ok = true;
+	bool chain_ok = true;
 
 	dcl_geom_tables(ge);
 
@@ -130,7 +259,18 @@ static int dcl_selftest_run(struct dcl_geom *ge, u32 want_crc)
 			a.group, a.slot, a.lcol, a.disk);
 	}
 
-	if (crc_ok && p1_ok && bij_ok && rt_ok)
+	/* 6. chain-walk equivalence: the RUNTIME walks (raidkm_dcl_redirect
+	 * / raidkm_dcl_chain_root, reached via the raid_km.c test hooks on a
+	 * synthetic conf) must match the KERNEL-CORE reference walks
+	 * (dcl_resolve / dcl_chain_root / dcl_chain_traverses) — same code
+	 * the simulator's P4/A6 checker proves — over the full period, for
+	 * read and write maps, at empty/mid/full prefix marks.  This is the
+	 * mechanical tie between the proven reference and the code the I/O
+	 * path actually executes (three hand-synced copies otherwise). */
+	if (!dcl_selftest_chains(ge))
+		chain_ok = false;
+
+	if (crc_ok && p1_ok && bij_ok && rt_ok && chain_ok)
 		err = 0;
 	scnprintf(dcl_selftest_result, sizeof(dcl_selftest_result),
 		  "N=%u g=%u m=%u s=%u nbase=%u seed=0x%llx crc=0x%08x %s",

@@ -297,6 +297,23 @@ static inline int raidkm_dcl_pop_slot(struct r5conf *conf,
 	return root % (int)conf->dcl->g;
 }
 
+/* dcl_selftest cross-check hooks (raid_km-dcl.c): evaluate the RUNTIME
+ * chain walks on a synthetic conf so the selftest can assert them
+ * equivalent to the KERNEL-CORE reference (dcl_resolve / dcl_chain_root /
+ * dcl_chain_traverses) over full periods — the walks themselves are static
+ * inline and operate on conf->reb[], so this is the only way the selftest
+ * can reach the exact code the I/O path executes. */
+int raidkm_dcl_test_redirect(struct r5conf *conf, int disk, sector_t row,
+			     bool for_write)
+{
+	return raidkm_dcl_redirect(conf, disk, row, for_write);
+}
+
+int raidkm_dcl_test_chain_root(struct r5conf *conf, sector_t row, int X)
+{
+	return raidkm_dcl_chain_root(conf, row, X);
+}
+
 /* Declustered: which group of its row a LOGICAL sector belongs to (the
  * (sector, group) stripe-identity discriminator).  0 when not declustered. */
 static inline int raidkm_dcl_group_of(struct r5conf *conf, sector_t logical)

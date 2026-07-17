@@ -1319,4 +1319,10 @@ void raidkm_dcl_free(struct r5conf *conf);
 					 * exceed md's sync flight window */
 int raidkm_dcl_journal_write(struct r5conf *conf, bool strict);
 void raidkm_dcl_pop_done(struct r5conf *conf, sector_t sector);
+/* dcl_selftest hooks: the RUNTIME chain walks on a synthetic conf
+ * (raid_km.c; asserted equivalent to the KERNEL-CORE reference walks by
+ * the chain-equivalence sweep in dcl_selftest) */
+int raidkm_dcl_test_redirect(struct r5conf *conf, int disk, sector_t row,
+			     bool for_write);
+int raidkm_dcl_test_chain_root(struct r5conf *conf, sector_t row, int X);
 #endif

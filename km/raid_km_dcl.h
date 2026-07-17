@@ -264,6 +264,38 @@ static inline int dcl_chain_traverses(const struct dcl_geom *ge,
 	return 0;
 }
 
+/* INVERSE walk: the group column whose write-chain traverses disk X in
+ * this row, or -1 when none does (X holds an unassigned spare column, or
+ * a content-free spare-only cycle/self-loop).  Walk predecessors: X's
+ * column; while it is an active assignment's spare column, step to that
+ * assignment's disk (its unique predecessor — bijectivity) and repeat.
+ * At most one chain traverses any disk per row (vertex-disjointness), so
+ * this is THE candidate; equivalence with the forward dcl_chain_traverses
+ * is asserted by the simulator's P4 A6 check and by the kernel dcl
+ * selftest against the runtime walk. */
+static inline int dcl_chain_root(const struct dcl_geom *ge,
+				 const struct dcl_assign *as, u32 nas,
+				 u64 row, u32 X)
+{
+	u32 hops;
+
+	for (hops = 0; hops <= nas; hops++) {
+		u32 lcol = dcl_lcol(ge, row, X);
+		u32 i, j;
+
+		if (lcol < ge->ngroups * ge->g)
+			return (int)lcol;	/* group column: root found */
+		j = lcol - ge->ngroups * ge->g;
+		for (i = 0; i < nas; i++)
+			if (as[i].spare == j)
+				break;
+		if (i == nas)
+			return -1;	/* unassigned spare: content-free */
+		X = as[i].disk;		/* unique predecessor */
+	}
+	return -1;		/* spare-only cycle: content-free */
+}
+
 /* On-disk rkdcl metadata block: 4 KiB at data_offset + data_size (the
  * reserved tail chunk), one identical copy per member, written by mdadm at
  * --create (mdadm raidkm-dcl.h is the userspace mirror of this struct).

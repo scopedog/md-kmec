@@ -287,6 +287,38 @@ static inline int dcl_chain_traverses(const struct dcl_geom *ge,
 	return 0;
 }
 
+/* INVERSE walk: the group column whose write-chain traverses disk X in
+ * this row, or -1 when none does (X holds an unassigned spare column, or
+ * a content-free spare-only cycle/self-loop).  Walk predecessors: X's
+ * column; while it is an active assignment's spare column, step to that
+ * assignment's disk (its unique predecessor — bijectivity) and repeat.
+ * At most one chain traverses any disk per row (vertex-disjointness), so
+ * this is THE candidate; equivalence with the forward dcl_chain_traverses
+ * is asserted by the P4 A6 check below and by the kernel dcl selftest
+ * against the runtime walk. */
+static inline int dcl_chain_root(const struct dcl_geom *ge,
+				 const struct dcl_assign *as, u32 nas,
+				 u64 row, u32 X)
+{
+	u32 hops;
+
+	for (hops = 0; hops <= nas; hops++) {
+		u32 lcol = dcl_lcol(ge, row, X);
+		u32 i, j;
+
+		if (lcol < ge->ngroups * ge->g)
+			return (int)lcol;	/* group column: root found */
+		j = lcol - ge->ngroups * ge->g;
+		for (i = 0; i < nas; i++)
+			if (as[i].spare == j)
+				break;
+		if (i == nas)
+			return -1;	/* unassigned spare: content-free */
+		X = as[i].disk;		/* unique predecessor */
+	}
+	return -1;		/* spare-only cycle: content-free */
+}
+
 /* ------------------------------------------------------------------------ */
 /* KERNEL-CORE-END                                                           */
 /* ------------------------------------------------------------------------ */
@@ -535,6 +567,43 @@ static int check_chains(const struct dcl_geom *ge, const struct dcl_assign *as,
 			return 0;
 		}
 		cand_rows += ncand;
+		/* A6: the INVERSE walk (dcl_chain_root — what the kernel's
+		 * population pass uses to pick its target) must equal the
+		 * unique forward candidate, for every assigned disk and for
+		 * a live-disk probe.  Both walks use the write map. */
+		for (i = 0; i <= nas; i++) {
+			u32 probe, fwd_n = 0, cc;
+			int fwd = -1, inv;
+
+			if (i < nas) {
+				probe = as[i].disk;
+			} else {
+				/* one live (unassigned) probe per row */
+				u32 k2;
+
+				probe = (as[0].disk + 1) % ge->N;
+				for (k2 = 0; k2 < nas; k2++)
+					if (as[k2].disk == probe)
+						probe = (probe + 1) % ge->N;
+			}
+			for (cc = 0; cc < gcols; cc++)
+				if (dcl_chain_traverses(ge, as, nas, row,
+							cc, probe)) {
+					fwd = (int)cc;
+					fwd_n++;
+				}
+			if (fwd_n > 1) {
+				printf("A6 FAIL row %llu disk %u: %u forward candidates\n",
+				       (unsigned long long)row, probe, fwd_n);
+				return 0;
+			}
+			inv = dcl_chain_root(ge, as, nas, row, probe);
+			if (inv != fwd) {
+				printf("A6 FAIL row %llu disk %u: inverse=%d forward=%d\n",
+				       (unsigned long long)row, probe, inv, fwd);
+				return 0;
+			}
+		}
 	}
 	if (verbose)
 		printf("P4 chain invariants (%u assignments, X=%u): OK\n"
