@@ -138,9 +138,11 @@ sudo dd if=/dev/zero of="${MEMBERS[$F2]}" bs=1M status=none 2>/dev/null || true
 rk_add_disks "${MEMBERS[$F2]}"
 rk_wait_full
 deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
-if [ "$deg" = 0 ] && sudo dmesg | grep -q "spare assignment(s) retired" \
+# single POPULATED assignment -> Phase-4 COPY path (or retire-all for >=2)
+if [ "$deg" = 0 ] \
+   && sudo dmesg | grep -qE "spare assignment\(s\) retired|copy of disk .* COMPLETE" \
    && rk_pop_show | grep -q "^none"; then
-	rk_pass "replacement retired the assignment + rebuilt (degraded=0)"
+	rk_pass "replacement rebuilt the assignment (degraded=0, copy or retire)"
 else
 	rk_fail "rebalance after auto-populate failed (degraded=$deg, $(rk_pop_show))"
 fi

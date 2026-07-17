@@ -378,7 +378,7 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 		u32 j = le32_to_cpu(blk->assign_spare);
 		u32 st = le32_to_cpu(blk->assign_state);
 
-		if (st > RKDCL_ASSIGN_POPULATED)
+		if (st > RKDCL_ASSIGN_COPYING)
 			return -EINVAL;
 		if (st != RKDCL_ASSIGN_NONE &&
 		    (x >= le32_to_cpu(blk->pool_disks) ||
@@ -543,8 +543,9 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 		conf->reb[0].disk  = le32_to_cpu(blk->assign_disk);
 		conf->reb[0].spare = le32_to_cpu(blk->assign_spare);
 		conf->nreb = 1;
-		if (conf->reb[0].state == RKDCL_ASSIGN_POPULATING)
-			conf->reb_pop = 0;
+		if (conf->reb[0].state == RKDCL_ASSIGN_POPULATING ||
+		    conf->reb[0].state == RKDCL_ASSIGN_COPYING)
+			conf->reb_pop = 0;	/* a sync pass is mid-flight */
 	} else if (le32_to_cpu(blk->version) >= RKDCL_SB_VERSION3) {
 		/* v3: assignment table (verified: <= s, distinct,
 		 * <= 1 POPULATING) */
@@ -560,8 +561,8 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 		conf->nreb = n;
 	}
 	if (conf->reb_pop >= 0) {
-		/* restore the POPULATING entry's prefix mark (v2: legacy
-		 * field; v3: its table entry) */
+		/* restore the active (POPULATING/COPYING) entry's prefix mark
+		 * (v2: legacy field; v3: its table entry) */
 		u64 mark = le32_to_cpu(blk->version) == RKDCL_SB_VERSION2 ?
 			le64_to_cpu(blk->assign_mark) :
 			le64_to_cpu(blk->assign[conf->reb_pop].mark);
@@ -582,7 +583,9 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 			mdname(mddev), conf->reb[nread].disk,
 			conf->reb[nread].spare,
 			conf->reb[nread].state == RKDCL_ASSIGN_POPULATING ?
-				"POPULATING" : "POPULATED",
+				"POPULATING" :
+			conf->reb[nread].state == RKDCL_ASSIGN_COPYING ?
+				"COPYING" : "POPULATED",
 			nread == conf->reb_pop ?
 				(unsigned long long)atomic64_read(&conf->reb_mark) :
 				(unsigned long long)mddev->dev_sectors,

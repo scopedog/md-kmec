@@ -312,6 +312,14 @@ static inline int dcl_chain_root(const struct dcl_geom *ge,
 #define RKDCL_ASSIGN_NONE	0	/* no assignment		*/
 #define RKDCL_ASSIGN_POPULATING	1	/* rebuild into spare running	*/
 #define RKDCL_ASSIGN_POPULATED	2	/* redirect permanent		*/
+#define RKDCL_ASSIGN_COPYING	3	/* Phase 4: copying spare -> a
+					 * replacement at slot X; offset-
+					 * split at the mark (row < mark ->
+					 * R, >= mark -> spare).  Transient:
+					 * flips to NONE + spare_active when
+					 * the mark reaches dev_sectors
+					 * (declustered-rebalance-copy-
+					 * design.md).			*/
 
 /* v3 assignment-table entry (24 bytes).  Table capacity is the format
  * maximum s (layout word keeps s <= 127); the live count is nassign. */

@@ -200,8 +200,12 @@ rk_dmesg_clear
 rk_add_disks "$FDEV"
 rk_wait_full
 deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
-if [ "$deg" = 0 ] && sudo dmesg | grep -q "spare assignment(s) retired"; then
-	rk_pass "replacement added: assignment retired + rebuild complete (degraded=0)"
+# A single POPULATED assignment's --add takes the Phase-4 COPY path
+# ("copy of disk N ... COMPLETE"); >=2 assignments retire-all ("spare
+# assignment(s) retired").  Either rebuilds to degraded=0.
+if [ "$deg" = 0 ] && sudo dmesg | \
+     grep -qE "spare assignment\(s\) retired|copy of disk .* COMPLETE"; then
+	rk_pass "replacement added: rebuilt to degraded=0 (copy or retire path)"
 else
 	rk_fail "rebalance failed (degraded=$deg)"
 fi
