@@ -35,12 +35,8 @@ FIO_OFF=$((128 * 1024 * 1024))	# baseline region: lcs 2048..3071
 FIO_SZ=$((64 * 1024 * 1024))
 MEMBERS=()
 
-pop_show() { cat "/sys/block/$MDNAME/md/rk_dcl_populate" 2>/dev/null; }
-pop_mark() { pop_show | sed -n 's/.*mark \([0-9]*\)\/.*/\1/p'; }
 # dmesg is cleared mid-test (resume/retire line matching); accumulate the
 # WARN/BUG verdict across every window so nothing escapes the final check
-DMESG_BAD=0
-dmesg_window_close() { rk_dmesg_clean || DMESG_BAD=1; }
 
 cleanup() {
 	sudo "$MDADM" --stop "$MD" 2>/dev/null
@@ -75,14 +71,6 @@ read -r -a FLCS <<< "$(awk -v F="$F" '$1 !~ /^#/ && $6 == F && $1 < 2048 && !see
 spare0_disk() { awk -v r="$1" '$1 !~ /^#/ && $1 == r && $4 == "S0" {print $3}' "$RK_TMP/rowmap.tsv"; }
 lc_row()      { awk -v lc="$1" '$1 !~ /^#/ && $1 == lc {print $2}' "$RK_TMP/vec.tsv"; }
 
-mkpat() {	# mkpat <tag3> <lc> — exactly-chunk-sized 8-byte-tag file
-	yes "$1$(printf '%04d' "$2")" | head -c $((CHUNK_KB * 1024)) | \
-		sudo tee "$RK_TMP/$1$2" > /dev/null
-}
-wrchunk() { sudo dd if="$1" of="$MD" bs="${CHUNK_KB}k" seek="$2" count=1 \
-		oflag=direct conv=notrunc,fsync status=none; }
-rdchunk() { sudo dd if="$MD" of="$2" bs="${CHUNK_KB}k" skip="$1" count=1 \
-		iflag=direct status=none; }
 
 # ---- 1. create + baseline -----------------------------------------------------
 for d in "${MEMBERS[@]}"; do
@@ -104,7 +92,7 @@ sudo fio --name=base --filename="$MD" --direct=1 --bs=64k --rw=write \
 	--verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting \
 	--output="$RK_TMP/pop-fio-base.log" > /dev/null 2>&1 \
 	|| { rk_fail "baseline fio failed"; rk_summary; exit 1; }
-for lc in "${FLCS[@]}"; do mkpat DCL "$lc"; wrchunk "$RK_TMP/DCL$lc" "$lc"; done
+for lc in "${FLCS[@]}"; do rk_mkpat DCL "$lc"; rk_wrchunk "$RK_TMP/DCL$lc" "$lc"; done
 sync
 rk_pass "baseline data laid down (fio + ${#FLCS[@]} on-victim pattern chunks)"
 
@@ -127,16 +115,16 @@ fi
 # wait until at least two 16MiB checkpoints have plausibly landed
 ok=0
 for i in $(seq 1 120); do
-	mk=$(pop_mark); [ -n "$mk" ] && [ "$mk" -ge $((80 * 1024 * 2)) ] && { ok=1; break; }
+	mk=$(rk_pop_mark); [ -n "$mk" ] && [ "$mk" -ge $((80 * 1024 * 2)) ] && { ok=1; break; }
 	sleep 1
 done
-[ $ok = 1 ] || rk_fail "population made no progress (mark=$(pop_mark))"
+[ $ok = 1 ] || rk_fail "population made no progress (mark=$(rk_pop_mark))"
 sudo "$MDADM" --stop "$MD" > /dev/null 2>&1 || {
 	rk_fail "stop mid-population failed"; rk_summary; exit 1; }
 rk_pass "array stopped mid-population (mark was ${mk:-?} sectors)"
 SURV=()
 for d in "${MEMBERS[@]}"; do [ "$d" != "$FDEV" ] && SURV+=("$d"); done
-dmesg_window_close
+rk_dmesg_window_close
 rk_dmesg_clear
 sudo "$MDADM" --assemble --run "$MD" "${SURV[@]}" > /dev/null 2>&1 || {
 	rk_fail "degraded re-assemble failed"; rk_summary; exit 1; }
@@ -148,22 +136,21 @@ else
 fi
 rk_unthrottle
 rk_wait_idle
-if pop_show | grep -q "^populated"; then
-	rk_pass "population COMPLETE ($(pop_show))"
+if rk_pop_show | grep -q "^populated"; then
+	rk_pass "population COMPLETE ($(rk_pop_show))"
 else
-	rk_fail "population did not complete: $(pop_show)"; rk_summary; exit 1
+	rk_fail "population did not complete: $(rk_pop_show)"; rk_summary; exit 1
 fi
 
 # ---- 4. POPULATED reads + raw spare placement oracle ---------------------------
 ok=1
 for lc in "${FLCS[@]}"; do
-	rdchunk "$lc" "$RK_TMP/pr$lc"
+	rk_rdchunk "$lc" "$RK_TMP/pr$lc"
 	cmp -s "$RK_TMP/DCL$lc" "$RK_TMP/pr$lc" || { ok=0; break; }
 done
 [ $ok = 1 ] && rk_pass "victim's chunks read back exactly while POPULATED" \
 	    || rk_fail "POPULATED read mismatch at lc=$lc"
-do_s=$(sudo "$MDADM" --examine "${MEMBERS[$((F == 0 ? 1 : 0))]}" 2>/dev/null | \
-	sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p')
+do_s=$(rk_data_offset "${MEMBERS[$((F == 0 ? 1 : 0))]}")
 ok=1
 for lc in "${FLCS[@]}"; do
 	row=$(lc_row "$lc"); sd=$(spare0_disk "$row")
@@ -177,13 +164,13 @@ done
 
 # ---- 5. POPULATED writes land on the spare + scrub -----------------------------
 half=$(( ${#FLCS[@]} / 2 )); REWR=("${FLCS[@]:0:half}")
-for lc in "${REWR[@]}"; do mkpat DGW "$lc"; wrchunk "$RK_TMP/DGW$lc" "$lc"; done
+for lc in "${REWR[@]}"; do rk_mkpat DGW "$lc"; rk_wrchunk "$RK_TMP/DGW$lc" "$lc"; done
 sync
 ok=1
 for lc in "${REWR[@]}"; do
 	row=$(lc_row "$lc"); sd=$(spare0_disk "$row")
 	off=$(( (do_s + row * CS) * 512 ))
-	rdchunk "$lc" "$RK_TMP/pw$lc"
+	rk_rdchunk "$lc" "$RK_TMP/pw$lc"
 	cmp -s "$RK_TMP/DGW$lc" "$RK_TMP/pw$lc" || { ok=0; break; }
 	sudo dd if="${MEMBERS[$sd]}" of="$RK_TMP/sw$lc" bs="${CHUNK_KB}k" \
 		count=1 iflag=skip_bytes,direct skip=$off status=none
@@ -200,15 +187,15 @@ sudo "$MDADM" --stop "$MD" > /dev/null 2>&1
 sudo "$MDADM" --assemble --run "$MD" "${SURV[@]}" > /dev/null 2>&1 || {
 	rk_fail "POPULATED re-assemble failed"; rk_summary; exit 1; }
 rk_wait_idle
-if pop_show | grep -q "^populated"; then
+if rk_pop_show | grep -q "^populated"; then
 	rk_pass "assignment persisted across stop/re-assemble"
 else
-	rk_fail "assignment lost across re-assemble: $(pop_show)"
+	rk_fail "assignment lost across re-assemble: $(rk_pop_show)"
 fi
 
 # ---- 7. rebalance: --add retires the assignment, stock recovery rebuilds -------
 sudo dd if=/dev/zero of="$FDEV" bs=1M status=none 2>/dev/null || true
-dmesg_window_close
+rk_dmesg_window_close
 rk_dmesg_clear
 rk_add_disks "$FDEV"
 rk_wait_full
@@ -218,13 +205,13 @@ if [ "$deg" = 0 ] && sudo dmesg | grep -q "spare assignment(s) retired"; then
 else
 	rk_fail "rebalance failed (degraded=$deg)"
 fi
-pop_show | grep -q "^none" && rk_pass "assignment shows none after rebalance" \
-			   || rk_fail "assignment not cleared: $(pop_show)"
+rk_pop_show | grep -q "^none" && rk_pass "assignment shows none after rebalance" \
+			   || rk_fail "assignment not cleared: $(rk_pop_show)"
 ok=1
 for lc in "${FLCS[@]}"; do
 	exp="$RK_TMP/DCL$lc"
 	for r in "${REWR[@]}"; do [ "$r" = "$lc" ] && exp="$RK_TMP/DGW$lc"; done
-	rdchunk "$lc" "$RK_TMP/rb$lc"
+	rk_rdchunk "$lc" "$RK_TMP/rb$lc"
 	cmp -s "$exp" "$RK_TMP/rb$lc" || { ok=0; break; }
 done
 [ $ok = 1 ] && rk_pass "all content intact after rebalance" \
@@ -240,8 +227,8 @@ fi
 mm=$(rk_scrub)
 [ "$mm" = 0 ] && rk_pass "final scrub clean (mismatch_cnt=0)" \
 	      || rk_fail "final scrub mismatch_cnt=$mm"
-dmesg_window_close
-[ "$DMESG_BAD" = 0 ] && rk_pass "no kernel WARN/BUG during the run (all windows)" \
+rk_dmesg_window_close
+[ "$RK_DMESG_BAD" = 0 ] && rk_pass "no kernel WARN/BUG during the run (all windows)" \
 		     || rk_fail "kernel log had WARN/BUG — check dmesg"
 
 rk_summary

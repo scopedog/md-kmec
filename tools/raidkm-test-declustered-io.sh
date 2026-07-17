@@ -101,8 +101,7 @@ done
 sync
 sudo "$MDADM" --stop "$MD" || { rk_fail "stop failed"; rk_summary; exit 1; }
 
-do_s=$(sudo "$MDADM" --examine "${MEMBERS[0]}" 2>/dev/null | \
-	sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p')
+do_s=$(rk_data_offset "${MEMBERS[0]}")
 for lc in $ORACLE_LCS; do
 	read -r row disk <<< "$(awk -v lc=$lc '$1 == lc {print $2, $6}' "$RK_TMP/vec.tsv")"
 	off=$(( (do_s + row * CS) * 512 ))

@@ -29,7 +29,6 @@ FIO_SZ=$((64 * 1024 * 1024))
 MEMBERS=()
 
 auto_file() { echo "/sys/block/$MDNAME/md/rk_dcl_auto"; }
-pop_show()  { cat "/sys/block/$MDNAME/md/rk_dcl_populate" 2>/dev/null; }
 
 cleanup() {
 	sudo "$MDADM" --stop "$MD" 2>/dev/null
@@ -46,14 +45,6 @@ rk_setup_brd "$N" || exit 1
 DISKS=$(rk_pick_disks "$N") || { echo "ERROR: need $N devices" >&2; exit 1; }
 read -r -a MEMBERS <<< "$DISKS"
 
-mkpat() {	# mkpat <tag3> <lc>
-	yes "$1$(printf '%04d' "$2")" | head -c $((CHUNK_KB * 1024)) | \
-		sudo tee "$RK_TMP/$1$2" > /dev/null
-}
-wrchunk() { sudo dd if="$1" of="$MD" bs="${CHUNK_KB}k" seek="$2" count=1 \
-		oflag=direct conv=notrunc,fsync status=none; }
-rdchunk() { sudo dd if="$MD" of="$2" bs="${CHUNK_KB}k" skip="$1" count=1 \
-		iflag=direct status=none; }
 
 # ---- 1. create + baseline -----------------------------------------------------
 for d in "${MEMBERS[@]}"; do
@@ -76,7 +67,7 @@ sudo fio --name=base --filename="$MD" --direct=1 --bs=64k --rw=write \
 	--output="$RK_TMP/aa-fio-base.log" > /dev/null 2>&1 \
 	|| { rk_fail "baseline fio failed"; rk_summary; exit 1; }
 LCS=(0 7 23)
-for lc in "${LCS[@]}"; do mkpat AAR "$lc"; wrchunk "$RK_TMP/AAR$lc" "$lc"; done
+for lc in "${LCS[@]}"; do rk_mkpat AAR "$lc"; rk_wrchunk "$RK_TMP/AAR$lc" "$lc"; done
 sync
 rk_pass "baseline data laid down (fio + ${#LCS[@]} pattern chunks)"
 
@@ -96,10 +87,10 @@ done
 F1=1
 rk_fail_disks "${MEMBERS[$F1]}"
 sleep 3
-if pop_show | grep -q "^none"; then
+if rk_pop_show | grep -q "^none"; then
 	rk_pass "auto=0: failed member did not arm population"
 else
-	rk_fail "auto=0 but population armed: $(pop_show)"
+	rk_fail "auto=0 but population armed: $(rk_pop_show)"
 fi
 sudo "$MDADM" --remove "$MD" "${MEMBERS[$F1]}" > /dev/null 2>&1
 sudo "$MDADM" --zero-superblock "${MEMBERS[$F1]}" 2>/dev/null
@@ -117,17 +108,17 @@ F2=4
 rk_fail_disks "${MEMBERS[$F2]}"		# member stays attached, Faulty
 ok=0
 for i in $(seq 1 120); do
-	pop_show | grep -q "^populated" && { ok=1; break; }
+	rk_pop_show | grep -q "^populated" && { ok=1; break; }
 	sleep 1
 done
 if [ $ok = 1 ] && sudo dmesg | grep -q "population ARMED: disk $F2"; then
-	rk_pass "bare --fail auto-armed and population completed ($(pop_show))"
+	rk_pass "bare --fail auto-armed and population completed ($(rk_pop_show))"
 else
-	rk_fail "auto-arm did not complete: $(pop_show)"; rk_summary; exit 1
+	rk_fail "auto-arm did not complete: $(rk_pop_show)"; rk_summary; exit 1
 fi
 ok=1
 for lc in "${LCS[@]}"; do
-	rdchunk "$lc" "$RK_TMP/ar$lc"
+	rk_rdchunk "$lc" "$RK_TMP/ar$lc"
 	cmp -s "$RK_TMP/AAR$lc" "$RK_TMP/ar$lc" || { ok=0; break; }
 done
 sudo fio --name=basev --filename="$MD" --direct=1 --bs=64k --rw=read \
@@ -148,14 +139,14 @@ rk_add_disks "${MEMBERS[$F2]}"
 rk_wait_full
 deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
 if [ "$deg" = 0 ] && sudo dmesg | grep -q "spare assignment(s) retired" \
-   && pop_show | grep -q "^none"; then
+   && rk_pop_show | grep -q "^none"; then
 	rk_pass "replacement retired the assignment + rebuilt (degraded=0)"
 else
-	rk_fail "rebalance after auto-populate failed (degraded=$deg, $(pop_show))"
+	rk_fail "rebalance after auto-populate failed (degraded=$deg, $(rk_pop_show))"
 fi
 ok=1
 for lc in "${LCS[@]}"; do
-	rdchunk "$lc" "$RK_TMP/rb$lc"
+	rk_rdchunk "$lc" "$RK_TMP/rb$lc"
 	cmp -s "$RK_TMP/AAR$lc" "$RK_TMP/rb$lc" || { ok=0; break; }
 done
 mm=$(rk_scrub)
@@ -170,12 +161,12 @@ if [ "$SC" -ge 2 ]; then
 	# that guarantee IS the rescan (the one-shot park alone drops one)
 	ok=0
 	for i in $(seq 1 240); do
-		pop_show | grep -q "^populated $F3 " && \
-		pop_show | grep -q "^populated $F4 " && { ok=1; break; }
+		rk_pop_show | grep -q "^populated $F3 " && \
+		rk_pop_show | grep -q "^populated $F4 " && { ok=1; break; }
 		sleep 1
 	done
 	[ $ok = 1 ] && rk_pass "burst double-failure: BOTH auto-populated sequentially" \
-		    || { rk_fail "burst leg incomplete: $(pop_show | tr '\n' ';')"; rk_summary; exit 1; }
+		    || { rk_fail "burst leg incomplete: $(rk_pop_show | tr '\n' ';')"; rk_summary; exit 1; }
 	# replacement for F3 ONLY: retire-all fires, then the rescan must
 	# re-park + re-populate the still-missing F4 with no operator step
 	sudo "$MDADM" --remove "$MD" "${MEMBERS[$F3]}" > /dev/null 2>&1
@@ -185,13 +176,13 @@ if [ "$SC" -ge 2 ]; then
 	rk_wait_full
 	ok=0
 	for i in $(seq 1 240); do
-		pop_show | grep -q "^populated $F4 " && { ok=1; break; }
+		rk_pop_show | grep -q "^populated $F4 " && { ok=1; break; }
 		sleep 1
 	done
 	deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
 	[ $ok = 1 ] && [ "$deg" = 1 ] \
 		&& rk_pass "retire-one: still-missing member re-populated automatically (degraded=1)" \
-		|| rk_fail "retire-one re-arm failed (deg=$deg, $(pop_show | tr '\n' ';'))"
+		|| rk_fail "retire-one re-arm failed (deg=$deg, $(rk_pop_show | tr '\n' ';'))"
 	# restore: add F4's replacement, back to clean
 	sudo "$MDADM" --remove "$MD" "${MEMBERS[$F4]}" > /dev/null 2>&1
 	sudo "$MDADM" --zero-superblock "${MEMBERS[$F4]}" 2>/dev/null

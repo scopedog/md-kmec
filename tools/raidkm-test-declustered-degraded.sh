@@ -80,18 +80,6 @@ read -r -a CLCS <<< "$(awk -v F="$F" '$1 !~ /^#/ && $6 != F && $1 < 2048 {print 
 
 # an exactly-chunk-sized file of a repeated 8-byte tag ("DCL0020\n" — the tag
 # must be EXACTLY the repeat unit, see the io gate's 7-byte-tag trap)
-mkpat() {	# mkpat <tag3> <lc> -> $RK_TMP/<tag3><lc>
-	yes "$1$(printf '%04d' "$2")" | head -c $((CHUNK_KB * 1024)) | \
-		sudo tee "$RK_TMP/$1$2" > /dev/null
-}
-wrchunk() {	# wrchunk <patfile> <lc> : write one chunk through md
-	sudo dd if="$1" of="$MD" bs="${CHUNK_KB}k" seek="$2" count=1 \
-		oflag=direct conv=notrunc,fsync status=none
-}
-rdchunk() {	# rdchunk <lc> <out> : read one chunk through md
-	sudo dd if="$MD" of="$2" bs="${CHUNK_KB}k" skip="$1" count=1 \
-		iflag=direct status=none
-}
 
 # ---- 1. create + resync + healthy baseline ----------------------------------
 for d in "${MEMBERS[@]}"; do
@@ -118,7 +106,7 @@ sudo fio --name=dclbase --filename="$MD" --direct=1 --bs=64k --rw=write \
 	--output="$RK_TMP/dcl-fio-base.log" > /dev/null 2>&1 \
 	|| { rk_fail "healthy baseline fio failed"; rk_summary; exit 1; }
 for lc in "${FLCS[@]}" "${CLCS[@]}"; do
-	mkpat DCL "$lc"; wrchunk "$RK_TMP/DCL$lc" "$lc"
+	rk_mkpat DCL "$lc"; rk_wrchunk "$RK_TMP/DCL$lc" "$lc"
 done
 sync
 
@@ -136,7 +124,7 @@ fi
 for lc in "${FLCS[@]}"; do
 	read -r row grp lcol <<< "$(awk -v lc="$lc" \
 		'$1 !~ /^#/ && $1 == lc {print $2, $3, $5}' "$RK_TMP/vec.tsv")"
-	rdchunk "$lc" "$RK_TMP/dr$lc"
+	rk_rdchunk "$lc" "$RK_TMP/dr$lc"
 	if cmp -s "$RK_TMP/DCL$lc" "$RK_TMP/dr$lc"; then
 		rk_pass "degraded reconstruct-read: lc=$lc (row=$row grp=$grp lcol=$lcol on failed disk)"
 	else
@@ -145,7 +133,7 @@ for lc in "${FLCS[@]}"; do
 done
 ok=1
 for lc in "${CLCS[@]}"; do
-	rdchunk "$lc" "$RK_TMP/dr$lc"
+	rk_rdchunk "$lc" "$RK_TMP/dr$lc"
 	cmp -s "$RK_TMP/DCL$lc" "$RK_TMP/dr$lc" || ok=0
 done
 [ $ok = 1 ] && rk_pass "degraded control reads (surviving members) intact" \
@@ -164,12 +152,12 @@ fi
 # ---- 5. degraded writes -------------------------------------------------------
 half=$(( ${#FLCS[@]} / 2 )); REWR=("${FLCS[@]:0:half}")
 for lc in "${REWR[@]}"; do
-	mkpat DGW "$lc"; wrchunk "$RK_TMP/DGW$lc" "$lc"
+	rk_mkpat DGW "$lc"; rk_wrchunk "$RK_TMP/DGW$lc" "$lc"
 done
 sync
 ok=1
 for lc in "${REWR[@]}"; do
-	rdchunk "$lc" "$RK_TMP/dw$lc"
+	rk_rdchunk "$lc" "$RK_TMP/dw$lc"
 	cmp -s "$RK_TMP/DGW$lc" "$RK_TMP/dw$lc" || { ok=0; break; }
 done
 [ $ok = 1 ] && rk_pass "degraded rewrite of on-F chunks reads back (${REWR[*]})" \
@@ -197,7 +185,7 @@ if sudo "$MDADM" --assemble --run "$MD" "${SURV[@]}" > /dev/null 2>&1; then
 	rk_wait_idle
 	ok=1
 	for lc in "${REWR[@]}"; do
-		rdchunk "$lc" "$RK_TMP/ra$lc"
+		rk_rdchunk "$lc" "$RK_TMP/ra$lc"
 		cmp -s "$RK_TMP/DGW$lc" "$RK_TMP/ra$lc" || ok=0
 	done
 	[ $ok = 1 ] && rk_pass "degraded re-assemble: map stable, patterns intact" \
@@ -220,8 +208,7 @@ deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
 # the rebuilt member must carry the reconstructed chunks at exactly the
 # simulator's (row, disk) positions — expected content is the DGW rewrite for
 # rewritten chunks, the original DCL pattern for the rest.
-do_s=$(sudo "$MDADM" --examine "${MEMBERS[0]}" 2>/dev/null | \
-	sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p')
+do_s=$(rk_data_offset "${MEMBERS[0]}")
 ok=1
 for lc in "${FLCS[@]}"; do
 	row=$(awk -v lc="$lc" '$1 !~ /^#/ && $1 == lc {print $2}' "$RK_TMP/vec.tsv")

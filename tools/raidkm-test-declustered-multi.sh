@@ -44,11 +44,6 @@ MEMBERS=()
 
 [ "$SC" -ge 2 ] || { echo "ERROR: multi gate needs s >= 2" >&2; exit 1; }
 
-pop_show() { cat "/sys/block/$MDNAME/md/rk_dcl_populate" 2>/dev/null; }
-pop_mark() { pop_show | sed -n 's/.*mark \([0-9]*\)\/.*/\1/p'; }
-DMESG_BAD=0
-dmesg_window_close() { rk_dmesg_clean || DMESG_BAD=1; }
-
 cleanup() {
 	sudo "$MDADM" --stop "$MD" 2>/dev/null
 	local d
@@ -134,24 +129,6 @@ done
 	echo "ERROR: no chain rows among the picked chunks (seed/geometry?)" >&2
 	exit 1; }
 
-mkpat() { yes "$1$(printf '%04d' "$2")" | head -c $((CHUNK_KB * 1024)) | \
-		sudo tee "$RK_TMP/$1$2" > /dev/null; }
-wrchunk() { sudo dd if="$1" of="$MD" bs="${CHUNK_KB}k" seek="$2" count=1 \
-		oflag=direct conv=notrunc,fsync status=none; }
-rdchunk() { sudo dd if="$MD" of="$2" bs="${CHUNK_KB}k" skip="$1" count=1 \
-		iflag=direct status=none; }
-# rkdcl block version of a member (block at data_offset + data_size)
-blk_version() {	# blk_version <dev>
-	local do_s av_s
-	do_s=$(sudo "$MDADM" --examine "$1" 2>/dev/null | \
-		sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p')
-	av_s=$(sudo "$MDADM" --examine "$1" 2>/dev/null | \
-		sed -n 's/.*Avail Dev Size : \([0-9]*\) sectors.*/\1/p')
-	[ -n "$do_s" ] && [ -n "$av_s" ] || { echo -1; return; }
-	sudo dd if="$1" bs=1 skip=$(( (do_s + av_s) * 512 + 8 )) count=4 \
-		status=none 2>/dev/null | od -An -tu4 | tr -d ' '
-}
-
 # ---- 1. create + baseline -----------------------------------------------------
 for d in "${MEMBERS[@]}"; do
 	sudo dd if=/dev/zero of="$d" bs=1M status=none 2>/dev/null || true
@@ -169,7 +146,7 @@ sudo fio --name=base --filename="$MD" --direct=1 --bs=64k --rw=write \
 	--verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting \
 	--output="$RK_TMP/multi-fio-base.log" > /dev/null 2>&1 \
 	|| { rk_fail "baseline fio failed"; rk_summary; exit 1; }
-for lc in "${ALL_LCS[@]}"; do mkpat DCM "$lc"; wrchunk "$RK_TMP/DCM$lc" "$lc"; done
+for lc in "${ALL_LCS[@]}"; do rk_mkpat DCM "$lc"; rk_wrchunk "$RK_TMP/DCM$lc" "$lc"; done
 sync
 rk_pass "baseline laid down (${#ALL_LCS[@]} on-victim chunks, $nchain chain-row(s))"
 
@@ -194,8 +171,8 @@ else
 fi
 rk_unthrottle
 rk_wait_idle
-pop_show | grep -q "^populated $F1 " || {
-	rk_fail "F1 not POPULATED: $(pop_show)"; rk_summary; exit 1; }
+rk_pop_show | grep -q "^populated $F1 " || {
+	rk_fail "F1 not POPULATED: $(rk_pop_show)"; rk_summary; exit 1; }
 rk_pass "F1 POPULATED"
 
 # ---- 3. arm F2, stop mid-population, v3 resume ---------------------------------
@@ -205,10 +182,10 @@ echo "$F2" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 \
 rk_pass "population of F2=$F2 armed (spare col 1, second assignment)"
 ok=0
 for i in $(seq 1 120); do
-	mk=$(pop_mark); [ -n "$mk" ] && [ "$mk" -ge $((80 * 1024 * 2)) ] && { ok=1; break; }
+	mk=$(rk_pop_mark); [ -n "$mk" ] && [ "$mk" -ge $((80 * 1024 * 2)) ] && { ok=1; break; }
 	sleep 1
 done
-[ $ok = 1 ] || rk_fail "F2 population made no progress (mark=$(pop_mark))"
+[ $ok = 1 ] || rk_fail "F2 population made no progress (mark=$(rk_pop_mark))"
 sudo "$MDADM" --stop "$MD" > /dev/null 2>&1 || {
 	rk_fail "stop mid-population failed"; rk_summary; exit 1; }
 rk_pass "array stopped mid-second-population (mark was ${mk:-?} sectors)"
@@ -216,7 +193,8 @@ SURV=()
 for d in "${MEMBERS[@]}"; do
 	[ "$d" != "$FDEV1" ] && [ "$d" != "$FDEV2" ] && SURV+=("$d")
 done
-dmesg_window_close
+rk_udev_quiesce		# don't let udev md127-steal the members (crash-gate lesson)
+rk_dmesg_window_close
 rk_dmesg_clear
 sudo "$MDADM" --assemble --run "$MD" "${SURV[@]}" > /dev/null 2>&1 || {
 	rk_fail "double-degraded re-assemble failed"; rk_summary; exit 1; }
@@ -228,29 +206,28 @@ else
 fi
 rk_unthrottle
 rk_wait_idle
-if pop_show | grep -q "^populated $F2 "; then
+if rk_pop_show | grep -q "^populated $F2 "; then
 	rk_pass "F2 population COMPLETE"
 else
-	rk_fail "F2 population did not complete: $(pop_show)"; rk_summary; exit 1
+	rk_fail "F2 population did not complete: $(rk_pop_show)"; rk_summary; exit 1
 fi
 
 # ---- 4. both assignments visible; raw block is v3 ------------------------------
-if pop_show | grep -q "^populated $F1 -> spare 0" && \
-   pop_show | grep -q "^populated $F2 -> spare 1"; then
+if rk_pop_show | grep -q "^populated $F1 -> spare 0" && \
+   rk_pop_show | grep -q "^populated $F2 -> spare 1"; then
 	rk_pass "sysfs shows both assignments ($F1->S0, $F2->S1)"
 else
-	rk_fail "sysfs assignments wrong: $(pop_show)"
+	rk_fail "sysfs assignments wrong: $(rk_pop_show)"
 fi
-bv=$(blk_version "${SURV[0]}")
+bv=$(rk_rkdcl_version "${SURV[0]}")
 [ "$bv" = 3 ] && rk_pass "rkdcl block is VERSION 3 with 2 assignments (adaptive)" \
 	      || rk_fail "rkdcl block version=$bv (want 3)"
 
 # ---- 5. content + resolved-placement oracle (incl. chain rows) -----------------
-do_s=$(sudo "$MDADM" --examine "${SURV[0]}" 2>/dev/null | \
-	sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p')
+do_s=$(rk_data_offset "${SURV[0]}")
 ok=1
 for lc in "${ALL_LCS[@]}"; do
-	rdchunk "$lc" "$RK_TMP/mr$lc"
+	rk_rdchunk "$lc" "$RK_TMP/mr$lc"
 	cmp -s "$RK_TMP/DCM$lc" "$RK_TMP/mr$lc" || { ok=0; break; }
 done
 [ $ok = 1 ] && rk_pass "all on-victim chunks read back exactly (double-POPULATED)" \
@@ -268,13 +245,13 @@ done
 
 # ---- 6. writes land at resolved endpoints + scrub ------------------------------
 REWR=("${LCS1[0]}" "${LCS2[0]}")	# one chain row per victim
-for lc in "${REWR[@]}"; do mkpat DMW "$lc"; wrchunk "$RK_TMP/DMW$lc" "$lc"; done
+for lc in "${REWR[@]}"; do rk_mkpat DMW "$lc"; rk_wrchunk "$RK_TMP/DMW$lc" "$lc"; done
 sync
 ok=1
 for lc in "${REWR[@]}"; do
 	row=$(lc_row "$lc"); rd=$(resolved "$row" "$(lc_lcol "$lc")")
 	off=$(( (do_s + row * CS) * 512 ))
-	rdchunk "$lc" "$RK_TMP/mw$lc"
+	rk_rdchunk "$lc" "$RK_TMP/mw$lc"
 	cmp -s "$RK_TMP/DMW$lc" "$RK_TMP/mw$lc" || { ok=0; break; }
 	sudo dd if="${MEMBERS[$rd]}" of="$RK_TMP/mx$lc" bs="${CHUNK_KB}k" \
 		count=1 iflag=skip_bytes,direct skip=$off status=none
@@ -288,19 +265,20 @@ mm=$(rk_scrub)
 
 # ---- 7. both assignments survive stop/re-assemble ------------------------------
 sudo "$MDADM" --stop "$MD" > /dev/null 2>&1
+rk_udev_quiesce		# ditto: settle before re-assembling the survivors
 sudo "$MDADM" --assemble --run "$MD" "${SURV[@]}" > /dev/null 2>&1 || {
 	rk_fail "double-POPULATED re-assemble failed"; rk_summary; exit 1; }
 rk_wait_idle
-if pop_show | grep -q "^populated $F1 " && pop_show | grep -q "^populated $F2 "; then
+if rk_pop_show | grep -q "^populated $F1 " && rk_pop_show | grep -q "^populated $F2 "; then
 	rk_pass "both assignments persisted across stop/re-assemble"
 else
-	rk_fail "assignments lost across re-assemble: $(pop_show)"
+	rk_fail "assignments lost across re-assemble: $(rk_pop_show)"
 fi
 
 # ---- 8. rebalance: first --add retires ALL; rebuilds + re-population -----------
 sudo dd if=/dev/zero of="$FDEV1" bs=1M status=none 2>/dev/null || true
 sudo dd if=/dev/zero of="$FDEV2" bs=1M status=none 2>/dev/null || true
-dmesg_window_close
+rk_dmesg_window_close
 rk_dmesg_clear
 rk_add_disks "$FDEV1" "$FDEV2"
 rk_wait_full
@@ -310,22 +288,22 @@ if [ "$deg" = 0 ] && sudo dmesg | grep -q "2 spare assignment(s) retired"; then
 else
 	rk_fail "rebalance failed (degraded=$deg)"
 fi
-pop_show | grep -q "^none" && rk_pass "assignments show none after rebalance" \
-			   || rk_fail "assignments not cleared: $(pop_show)"
+rk_pop_show | grep -q "^none" && rk_pass "assignments show none after rebalance" \
+			   || rk_fail "assignments not cleared: $(rk_pop_show)"
 # Check a SURVIVOR: the retire journal deterministically covers live
 # members, while a freshly ADDED member may keep mdadm's verbatim clone of
 # the pre-retire v3 block (the async retire journal races mdadm's clone
 # write).  That stale copy is harmless — it loses the gen election, and the
 # published v2 module skips invalid blocks per-member — and the next
 # journal write converges it.
-bv=$(blk_version "${SURV[0]}")
+bv=$(rk_rkdcl_version "${SURV[0]}")
 [ "$bv" = 2 ] && rk_pass "rkdcl block back to VERSION 2 after retire (adaptive)" \
 	      || rk_fail "rkdcl block version=$bv after retire (want 2)"
 ok=1
 for lc in "${ALL_LCS[@]}"; do
 	exp="$RK_TMP/DCM$lc"
 	for r in "${REWR[@]}"; do [ "$r" = "$lc" ] && exp="$RK_TMP/DMW$lc"; done
-	rdchunk "$lc" "$RK_TMP/rb$lc"
+	rk_rdchunk "$lc" "$RK_TMP/rb$lc"
 	cmp -s "$exp" "$RK_TMP/rb$lc" || { ok=0; break; }
 done
 [ $ok = 1 ] && rk_pass "all content intact after rebalance" \
@@ -341,8 +319,8 @@ fi
 mm=$(rk_scrub)
 [ "$mm" = 0 ] && rk_pass "final scrub clean (mismatch_cnt=0)" \
 	      || rk_fail "final scrub mismatch_cnt=$mm"
-dmesg_window_close
-[ "$DMESG_BAD" = 0 ] && rk_pass "no kernel WARN/BUG during the run (all windows)" \
+rk_dmesg_window_close
+[ "$RK_DMESG_BAD" = 0 ] && rk_pass "no kernel WARN/BUG during the run (all windows)" \
 		     || rk_fail "kernel log had WARN/BUG — check dmesg"
 
 rk_summary

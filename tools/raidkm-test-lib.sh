@@ -319,3 +319,66 @@ rk_dmesg_clean() {
 		grep -civ 'appears to be on the same physical disk')
 	[ "${hits:-0}" -eq 0 ]
 }
+
+# ---- declustered (Phase 3/3b) shared helpers ---------------------------------
+# One home for the primitives every declustered gate used to carry privately
+# (pop_show, chunk-I/O oracles, the --examine offset scrape, the accumulated
+# dmesg verdict, the udev teardown discipline) — a format or message change
+# now lands in exactly one place.
+
+# Population sysfs state (multi-line since 3b: one line per assignment).
+rk_pop_show() { cat "/sys/block/$MDNAME/md/rk_dcl_populate" 2>/dev/null; }
+rk_pop_mark() { rk_pop_show | sed -n 's/.*mark \([0-9]*\)\/.*/\1/p'; }
+
+# Exactly-chunk-sized 8-byte-tag pattern file at $RK_TMP/<tag><lc>.
+rk_mkpat() {	# rk_mkpat <tag3> <lc>
+	yes "$1$(printf '%04d' "$2")" | head -c $((CHUNK_KB * 1024)) | \
+		sudo tee "$RK_TMP/$1$2" > /dev/null
+}
+rk_wrchunk() {	# rk_wrchunk <file> <lc>
+	sudo dd if="$1" of="$MD" bs="${CHUNK_KB}k" seek="$2" count=1 \
+		oflag=direct conv=notrunc,fsync status=none
+}
+rk_rdchunk() {	# rk_rdchunk <lc> <file>
+	sudo dd if="$MD" of="$2" bs="${CHUNK_KB}k" skip="$1" count=1 \
+		iflag=direct status=none
+}
+
+# Member SB geometry scrapes (mdadm --examine output — the ONE place that
+# knows the format).  "Avail Dev Size" == data_size; "Used Dev Size" is
+# omitted when equal, so Avail is the one to use for tail-region offsets.
+rk_data_offset() {	# rk_data_offset <dev> -> sectors (empty on failure)
+	sudo "$MDADM" --examine "$1" 2>/dev/null | \
+		sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p'
+}
+rk_avail_size() {	# rk_avail_size <dev> -> sectors (empty on failure)
+	sudo "$MDADM" --examine "$1" 2>/dev/null | \
+		sed -n 's/.*Avail Dev Size : \([0-9]*\) sectors.*/\1/p'
+}
+# rkdcl metadata block version of a member (block at data_offset + data_size).
+rk_rkdcl_version() {	# rk_rkdcl_version <dev> -> version (or -1)
+	local do_s av_s
+	do_s=$(rk_data_offset "$1"); av_s=$(rk_avail_size "$1")
+	[ -n "$do_s" ] && [ -n "$av_s" ] || { echo -1; return; }
+	sudo dd if="$1" bs=1 skip=$(( (do_s + av_s) * 512 + 8 )) count=4 \
+		status=none 2>/dev/null | od -An -tu4 | tr -d ' '
+}
+
+# Accumulated no-WARN/BUG verdict across gates that clear dmesg mid-run:
+# call rk_dmesg_window_close before each rk_dmesg_clear, then check
+# RK_DMESG_BAD at the end.
+RK_DMESG_BAD=0
+rk_dmesg_window_close() { rk_dmesg_clean || RK_DMESG_BAD=1; }
+
+# udev teardown discipline for array stop/re-assemble seams: teardown or
+# thaw events can trigger udev INCREMENTAL assembly of members into an
+# md127 that steals them from the next create/assemble (observed twice:
+# a population "resumed fine — on md127", and a 7-member inactive md127
+# wedging the next iteration's create).  Settle so udev's assembly (if
+# any) completes, tear every scanned array down, settle again so the
+# teardown events drain.
+rk_udev_quiesce() {
+	sudo udevadm settle 2>/dev/null
+	sudo "$MDADM" --stop --scan > /dev/null 2>&1
+	sudo udevadm settle 2>/dev/null
+}

@@ -46,9 +46,6 @@ SIM="$RK_TMP/declustered-sim"
 
 FLK=(); LOOPS=(); DEVS=()
 
-pop_show() { cat "/sys/block/$MDNAME/md/rk_dcl_populate" 2>/dev/null; }
-DMESG_BAD=0
-dmesg_window_close() { rk_dmesg_clean || DMESG_BAD=1; }
 
 global_cleanup() {
 	local d l tries
@@ -73,13 +70,8 @@ stack_setup() {
 	mkdir -p "$BACK"
 	global_cleanup
 	# Iteration boundary needs the same udev discipline as the post-crash
-	# assemble: teardown/creation events can trigger an incremental md127
-	# assembly of the previous iteration's members, which then holds the
-	# dm devices busy (observed: 7-member inactive md127 wedging iter4's
-	# create).  Settle, tear down anything udev built, settle again.
-	sudo udevadm settle 2>/dev/null
-	sudo "$MDADM" --stop --scan > /dev/null 2>&1
-	sudo udevadm settle 2>/dev/null
+	# assemble (observed: 7-member inactive md127 wedging iter4's create).
+	rk_udev_quiesce
 	for i in $(seq 1 "$N"); do
 		f="$BACK/disk$i.img"
 		sudo rm -f "$f"
@@ -155,14 +147,6 @@ if [ "$MULTI" = 1 ]; then
 	F2=$(awk -v f="$F" '$1 !~ /^#/ && $6 != f {print $6; exit}' "$RK_TMP/vec.tsv")
 fi
 
-mkpat() {
-	yes "$1$(printf '%04d' "$2")" | head -c $((CHUNK_KB * 1024)) | \
-		sudo tee "$RK_TMP/$1$2" > /dev/null
-}
-wrchunk() { sudo dd if="$1" of="$MD" bs="${CHUNK_KB}k" seek="$2" count=1 \
-		oflag=direct conv=notrunc,fsync status=none; }
-rdchunk() { sudo dd if="$MD" of="$2" bs="${CHUNK_KB}k" skip="$1" count=1 \
-		iflag=direct status=none; }
 
 rk_dmesg_clear
 for it in $(seq 1 "$ITERS"); do
@@ -180,7 +164,7 @@ for it in $(seq 1 "$ITERS"); do
 		--verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting \
 		--output="$RK_TMP/cr-fio-$it.log" > /dev/null 2>&1 \
 		|| { rk_fail "$tag: baseline fio failed"; break; }
-	for lc in "${FLCS[@]}"; do mkpat CRA "$lc"; wrchunk "$RK_TMP/CRA$lc" "$lc"; done
+	for lc in "${FLCS[@]}"; do rk_mkpat CRA "$lc"; rk_wrchunk "$RK_TMP/CRA$lc" "$lc"; done
 	sync
 	rk_pass "$tag: stack + create + baseline"
 
@@ -193,7 +177,7 @@ for it in $(seq 1 "$ITERS"); do
 		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
 			rk_fail "$tag: arming F failed"; break; }
 		rk_wait_idle
-		pop_show | grep -q "^populated $F " || {
+		rk_pop_show | grep -q "^populated $F " || {
 			rk_fail "$tag: first population did not complete"; break; }
 		FDEV2="${DEVS[$F2]}"
 		rk_fail_disks "$FDEV2"
@@ -208,7 +192,7 @@ for it in $(seq 1 "$ITERS"); do
 	fi
 	delay=${DCL_CRASH_DELAY:-$(( (RANDOM % 9) + 1 ))}	# 1..9s: pre-checkpoint AND mid-pass cells
 	sleep "$delay"
-	premark=$(pop_show | sed -n 's/.*mark \([0-9]*\)\/.*/\1/p')
+	premark=$(rk_pop_mark)
 	crash_now
 	sudo "$MDADM" --stop "$MD" > /dev/null 2>&1
 	crash_thaw
@@ -216,12 +200,8 @@ for it in $(seq 1 "$ITERS"); do
 	# The thaw's dm resume events can trigger udev INCREMENTAL assembly of
 	# the survivors into md127, stealing the members from the assemble
 	# below (observed: population resumed fine — on md127; our pop_show on
-	# $MDNAME read '').  Settle udev FIRST so its assembly (if any) is
-	# complete, THEN tear every scanned array down, then settle again so
-	# the teardown events are drained before we assemble.
-	sudo udevadm settle 2>/dev/null
-	sudo "$MDADM" --stop --scan > /dev/null 2>&1
-	sudo udevadm settle 2>/dev/null
+	# $MDNAME read '').
+	rk_udev_quiesce
 	sleep 0.2
 
 	SURV=()
@@ -230,7 +210,7 @@ for it in $(seq 1 "$ITERS"); do
 		[ "$MULTI" = 1 ] && [ "$d" = "${FDEV2:-}" ] && continue
 		SURV+=("$d")
 	done
-	dmesg_window_close; rk_dmesg_clear
+	rk_dmesg_window_close; rk_dmesg_clear
 	# --force: the dropped stop leaves DIRTY superblocks and the pool is
 	# degraded — md (correctly) refuses dirty+degraded without it.
 	sudo "$MDADM" --assemble --force --run "$MD" "${SURV[@]}" > /dev/null 2>&1 || {
@@ -238,15 +218,15 @@ for it in $(seq 1 "$ITERS"); do
 		break; }
 	# multi: F's assignment completed (and was journaled) BEFORE F2 failed,
 	# so every election outcome preserves it — assert that first.
-	if [ "$MULTI" = 1 ] && ! pop_show | grep -q "^populated $F "; then
-		echo "  DIAG: state: $(pop_show | tr '\n' '|')"
+	if [ "$MULTI" = 1 ] && ! rk_pop_show | grep -q "^populated $F "; then
+		echo "  DIAG: state: $(rk_pop_show | tr '\n' '|')"
 		rk_fail "$tag: first assignment lost across the crash"; break
 	fi
 	if [ "$MULTI" = 1 ]; then
-		state=$(pop_show | grep -v "^populated $F ")
+		state=$(rk_pop_show | grep -v "^populated $F ")
 		rearm="$F2"
 	else
-		state=$(pop_show)
+		state=$(rk_pop_show)
 		rearm="$F"
 	fi
 	case "$state" in
@@ -274,18 +254,18 @@ for it in $(seq 1 "$ITERS"); do
 	rk_unthrottle
 	rk_wait_idle
 	if [ "$MULTI" = 1 ]; then
-		pop_show | grep -q "^populated $F " && pop_show | grep -q "^populated $F2 " \
-			&& rk_pass "$tag: BOTH populations COMPLETE after crash ($(pop_show | tr '\n' ';'))" \
-			|| { rk_fail "$tag: populations did not complete: $(pop_show | tr '\n' ';')"; break; }
+		rk_pop_show | grep -q "^populated $F " && rk_pop_show | grep -q "^populated $F2 " \
+			&& rk_pass "$tag: BOTH populations COMPLETE after crash ($(rk_pop_show | tr '\n' ';'))" \
+			|| { rk_fail "$tag: populations did not complete: $(rk_pop_show | tr '\n' ';')"; break; }
 	else
-		pop_show | grep -q "^populated" \
-			&& rk_pass "$tag: population COMPLETE after crash ($(pop_show))" \
-			|| { rk_fail "$tag: population did not complete: $(pop_show)"; break; }
+		rk_pop_show | grep -q "^populated" \
+			&& rk_pass "$tag: population COMPLETE after crash ($(rk_pop_show))" \
+			|| { rk_fail "$tag: population did not complete: $(rk_pop_show)"; break; }
 	fi
 
 	ok=1
 	for lc in "${FLCS[@]}"; do
-		rdchunk "$lc" "$RK_TMP/cr$lc"
+		rk_rdchunk "$lc" "$RK_TMP/cr$lc"
 		cmp -s "$RK_TMP/CRA$lc" "$RK_TMP/cr$lc" || { ok=0; break; }
 	done
 	sudo fio --name=basev --filename="$MD" --direct=1 --bs=64k --rw=read \
@@ -306,8 +286,8 @@ for it in $(seq 1 "$ITERS"); do
 	done
 	sudo udevadm settle 2>/dev/null
 done
-dmesg_window_close
-[ "$DMESG_BAD" = 0 ] && rk_pass "no kernel WARN/BUG during the matrix (all windows)" \
+rk_dmesg_window_close
+[ "$RK_DMESG_BAD" = 0 ] && rk_pass "no kernel WARN/BUG during the matrix (all windows)" \
 		     || rk_fail "kernel log had WARN/BUG — check dmesg"
 
 rk_summary
