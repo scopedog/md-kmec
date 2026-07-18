@@ -10228,9 +10228,76 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
  * offset-split point (row < mark -> R, >= mark -> spare) for user I/O between
  * bands.  Returns *skipped=1 bands (raw sync bios, no stripes / recovery_active
  * dance); md advances curr_resync + R's recovery_offset so spare_active marks
- * R In_sync at the end.  FIRST CUT: serial chunk-sized sync_page_io — correct
- * but not yet parallel (the perf win over decode needs async bios; §5). */
+ * R In_sync at the end.
+ *
+ * PARALLEL: the band's chunk-copies are pulled off an atomic row cursor by a
+ * small pool of unbound workers, each doing blocking sync_page_io read+write
+ * on its own chunk buffer — queue depth == pool size with none of the
+ * submit-from-endio complexity.  rdevs are stable for the whole pass:
+ * remove_and_add_spares is excluded while MD_RECOVERY_RUNNING is set. */
 #define RKDCL_COPY_BAND_SECTORS	(16 * 1024 * 2)		/* 16 MiB per band */
+#define RKDCL_COPY_WORKERS	16
+
+struct rkdcl_copy_band {
+	struct r5conf	*conf;
+	struct md_rdev	*rdst;		/* replacement R at slot X	*/
+	int		X;
+	u32		sparecol;	/* lcol of the assignment spare	*/
+	u64		row_end;	/* first chunk-row past the band */
+	atomic64_t	next_row;	/* work cursor			*/
+	atomic_t	error;		/* first error aborts the band	*/
+};
+
+struct rkdcl_copy_worker {
+	struct work_struct	work;
+	struct rkdcl_copy_band	*band;
+	struct page		*pg;	/* one chunk buffer		*/
+};
+
+static void raidkm_dcl_copy_worker(struct work_struct *work)
+{
+	struct rkdcl_copy_worker *w =
+		container_of(work, struct rkdcl_copy_worker, work);
+	struct rkdcl_copy_band *b = w->band;
+	struct r5conf *conf = b->conf;
+	struct dcl_geom *ge = conf->dcl;
+	unsigned int chunk_bytes = conf->chunk_sectors << 9;
+
+	while (!atomic_read(&b->error)) {
+		u64 row = (u64)atomic64_fetch_inc(&b->next_row);
+		u32 lcolX, sd;
+		struct md_rdev *rsrc;
+
+		if (row >= b->row_end)
+			break;
+		lcolX = dcl_lcol(ge, row, b->X);
+		if (lcolX >= ge->ngroups * ge->g)
+			continue;	/* X is a spare column here: R holds
+					 * nothing this row (never read) */
+		sd = dcl_disk(ge, row, b->sparecol);	/* rotating source */
+		rsrc = conf->disks[sd].rdev;
+		if (!rsrc || test_bit(Faulty, &rsrc->flags)) {
+			/* copy source lost (second failure on the spare disk
+			 * for this row): abort the band; the array runs
+			 * POPULATED-degraded and the copy resumes once the
+			 * failure is handled */
+			atomic_set(&b->error, 1);
+			break;
+		}
+		/* read the spare's chunk, write it to R (data-relative) */
+		if (!sync_page_io(rsrc, row * conf->chunk_sectors, chunk_bytes,
+				  w->pg, REQ_OP_READ, false) ||
+		    !sync_page_io(b->rdst, row * conf->chunk_sectors,
+				  chunk_bytes, w->pg,
+				  REQ_OP_WRITE | REQ_SYNC, false)) {
+			pr_warn("md/raid:%s: declustered: copy I/O error at row %llu (spare disk %u -> replacement %d)\n",
+				mdname(conf->mddev),
+				(unsigned long long)row, sd, b->X);
+			atomic_set(&b->error, 1);
+			break;
+		}
+	}
+}
 
 static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 					sector_t sector_nr, int *skipped)
@@ -10238,14 +10305,15 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 	struct r5conf *conf = mddev->private;
 	struct dcl_geom *ge = conf->dcl;
 	int X = conf->reb[conf->reb_pop].disk;
-	u32 sparecol = ge->ngroups * ge->g + conf->reb[conf->reb_pop].spare;
 	u64 mark = (u64)atomic64_read(&conf->reb_mark);
-	sector_t band_end, s;
+	sector_t band_end;
 	unsigned int chunk_bytes = conf->chunk_sectors << 9;
-	struct md_rdev *rdst;
-	struct page *pg;
 	int order = get_order(chunk_bytes);
-	bool aborted = false;
+	struct rkdcl_copy_band band;
+	struct rkdcl_copy_worker wk[RKDCL_COPY_WORKERS];
+	struct md_rdev *rdst;
+	u64 row0 = sector_nr;
+	int i, nwk = 0;
 
 	/* resume fast-forward: everything below the restored mark is copied */
 	if (sector_nr + conf->chunk_sectors <= mark) {
@@ -10255,14 +10323,38 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 
 	rdst = conf->disks[X].rdev;	/* the replacement R at slot X */
 	if (!rdst || test_bit(Faulty, &rdst->flags)) {
-		/* replacement vanished — let md abort the recovery */
-		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
-		*skipped = 1;
-		return conf->chunk_sectors;
-	}
+		/* Replacement lost mid-copy.  An INTR alone would livelock
+		 * (raid5d re-nudges the RECOVER, which aborts here again) —
+		 * RETIRE the assignment instead: every X-slot becomes plain
+		 * failed and decodes via parity, which stayed consistent
+		 * through COPYING (writes below the mark hit R AND parity;
+		 * the below-mark spare content may be stale but is never
+		 * read once NONE).  Auto-arm's rescan then re-parks X for a
+		 * fresh population. */
+		int pop = conf->reb_pop;
+		int saved_spare = conf->reb[pop].spare;
+		int jerr;
 
-	pg = alloc_pages(GFP_KERNEL, order);
-	if (!pg) {
+		raid5_quiesce(mddev, 1);
+		conf->reb[pop].disk = -1;
+		conf->reb[pop].spare = -1;
+		conf->reb[pop].state = RKDCL_ASSIGN_NONE;
+		conf->nreb = 0;
+		WRITE_ONCE(conf->reb_pop, -1);
+		jerr = raidkm_dcl_journal_write(conf, true);
+		if (jerr) {	/* journal must land before the map moves;
+				 * restore INSIDE the quiesce and retry on the
+				 * next pass */
+			conf->reb[pop].disk = X;
+			conf->reb[pop].spare = saved_spare;
+			conf->reb[pop].state = RKDCL_ASSIGN_COPYING;
+			conf->nreb = pop + 1;
+			WRITE_ONCE(conf->reb_pop, pop);
+		}
+		raid5_quiesce(mddev, 0);
+		if (!jerr)
+			pr_warn("md/raid:%s: declustered: replacement for disk %d lost mid-copy — assignment retired, X decodes via parity (re-arm population)\n",
+				mdname(mddev), X);
 		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 		*skipped = 1;
 		return conf->chunk_sectors;
@@ -10270,42 +10362,62 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 
 	band_end = min_t(sector_t, sector_nr + RKDCL_COPY_BAND_SECTORS,
 			 mddev->dev_sectors);
+	sector_div(row0, conf->chunk_sectors);
+	band.conf = conf;
+	band.rdst = rdst;
+	band.X = X;
+	band.sparecol = ge->ngroups * ge->g + conf->reb[conf->reb_pop].spare;
+	band.row_end = (u64)band_end;
+	sector_div(band.row_end, conf->chunk_sectors);
+	/* workers copy whole chunks only; a partial tail (band_end ==
+	 * dev_sectors not chunk-aligned) is copied below, clamped, so the
+	 * rkdcl metadata block just past dev_sectors is never touched */
+	atomic64_set(&band.next_row, row0);
+	atomic_set(&band.error, 0);
+
+	for (i = 0; i < RKDCL_COPY_WORKERS; i++) {
+		wk[i].pg = alloc_pages(GFP_KERNEL, order);
+		if (!wk[i].pg)
+			break;
+		wk[i].band = &band;
+		INIT_WORK(&wk[i].work, raidkm_dcl_copy_worker);
+		nwk++;
+	}
+	if (!nwk) {
+		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+		*skipped = 1;
+		return conf->chunk_sectors;
+	}
 
 	/* quiesce so no user I/O straddles the mark advance for this band */
 	raid5_quiesce(mddev, 1);
-	for (s = sector_nr; s < band_end && !aborted; s += conf->chunk_sectors) {
-		u64 row = s;
-		u32 lcolX, sd;
-		struct md_rdev *rsrc;
+	for (i = 0; i < nwk; i++)
+		queue_work(system_unbound_wq, &wk[i].work);
+	for (i = 0; i < nwk; i++)
+		flush_work(&wk[i].work);
+	/* partial tail row (dev_sectors not chunk-aligned): clamped copy */
+	if (!atomic_read(&band.error) &&
+	    band.row_end * conf->chunk_sectors < (u64)band_end) {
+		u64 row = band.row_end;
+		u32 lcolX = dcl_lcol(ge, row, X);
+		unsigned int tail_bytes =
+			(band_end - row * conf->chunk_sectors) << 9;
 
-		sector_div(row, conf->chunk_sectors);
-		lcolX = dcl_lcol(ge, row, X);
-		if (lcolX >= ge->ngroups * ge->g)
-			continue;	/* X is a spare column here: R holds
-					 * nothing this row (never read) */
-		sd = dcl_disk(ge, row, sparecol);	/* rotating source */
-		rsrc = conf->disks[sd].rdev;
-		if (!rsrc || test_bit(Faulty, &rsrc->flags)) {
-			/* copy source lost (second failure on the spare disk
-			 * for this row): abort; the array runs POPULATED-
-			 * degraded and the copy resumes once handled */
-			set_bit(MD_RECOVERY_INTR, &mddev->recovery);
-			aborted = true;
-			break;
-		}
-		/* read the spare's chunk, write it to R (both data-relative) */
-		if (!sync_page_io(rsrc, row * conf->chunk_sectors, chunk_bytes,
-				  pg, REQ_OP_READ, false) ||
-		    !sync_page_io(rdst, row * conf->chunk_sectors, chunk_bytes,
-				  pg, REQ_OP_WRITE | REQ_SYNC, false)) {
-			pr_warn("md/raid:%s: declustered: copy I/O error at row %llu (spare disk %u -> replacement %d)\n",
-				mdname(mddev), (unsigned long long)row, sd, X);
-			set_bit(MD_RECOVERY_INTR, &mddev->recovery);
-			aborted = true;
-			break;
+		if (lcolX < ge->ngroups * ge->g) {
+			u32 sd = dcl_disk(ge, row, band.sparecol);
+			struct md_rdev *rsrc = conf->disks[sd].rdev;
+
+			if (!rsrc || test_bit(Faulty, &rsrc->flags) ||
+			    !sync_page_io(rsrc, row * conf->chunk_sectors,
+					  tail_bytes, wk[0].pg,
+					  REQ_OP_READ, false) ||
+			    !sync_page_io(rdst, row * conf->chunk_sectors,
+					  tail_bytes, wk[0].pg,
+					  REQ_OP_WRITE | REQ_SYNC, false))
+				atomic_set(&band.error, 1);
 		}
 	}
-	if (!aborted) {
+	if (!atomic_read(&band.error)) {
 		/* the band's R writes are durable; advance the offset-split
 		 * mark and journal it under the same quiesce (strict: the
 		 * mark asserts R content below it is durable) */
@@ -10315,9 +10427,15 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 	}
 	raid5_quiesce(mddev, 0);
 
-	__free_pages(pg, order);
+	for (i = 0; i < nwk; i++)
+		__free_pages(wk[i].pg, order);
+	if (atomic_read(&band.error)) {
+		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+		*skipped = 1;
+		return conf->chunk_sectors;
+	}
 	*skipped = 1;
-	return aborted ? conf->chunk_sectors : (band_end - sector_nr);
+	return band_end - sector_nr;
 }
 
 static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,

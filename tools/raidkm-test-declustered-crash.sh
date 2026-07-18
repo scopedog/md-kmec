@@ -24,6 +24,11 @@
 # to POPULATED, then a second member fails and the power cut lands mid-
 # SECOND-population, i.e. on the v3 two-assignment journal; the resume must
 # restore BOTH assignments and finish.  DCL_CRASH_DELAY pins the cut delay.
+# DCL_CRASH_COPY=1: Phase-4 variant — populate F, re-add its wiped device as
+# the replacement, and cut the power mid-COPY (or just after; both cells are
+# legit).  The re-assemble (INCLUDING the replacement) must resume the copy
+# from the strict-journaled band mark — R's above-mark garbage is fenced by
+# the offset-split — and finish to degraded=0 with byte-exact content.
 # Configurable: DCL_N/G/M/SC/NBASE/SEED (geometry), DCL_CRASH_ITERS (4),
 #               DCL_CRASH_DISK_MB (192), DCL_CRASH_BACK dir.
 # OPT-IN reliability gate — not part of the default raidkm-test.sh runner.
@@ -142,6 +147,10 @@ read -r -a FLCS <<< "$(awk -v F="$F" '$1 !~ /^#/ && $6 == F && $1 < 1536 && !see
 # cut lands on the v3 (two-assignment) journal and the resume must restore
 # BOTH assignments and finish the second population.
 MULTI=${DCL_CRASH_MULTI:-0}
+COPY=${DCL_CRASH_COPY:-0}
+if [ "$MULTI" = 1 ] && [ "$COPY" = 1 ]; then
+	echo "ERROR: DCL_CRASH_MULTI and DCL_CRASH_COPY are exclusive" >&2; exit 1
+fi
 if [ "$MULTI" = 1 ]; then
 	[ "$SC" -ge 2 ] || { echo "ERROR: DCL_CRASH_MULTI needs s >= 2" >&2; exit 1; }
 	F2=$(awk -v f="$F" '$1 !~ /^#/ && $6 != f {print $6; exit}' "$RK_TMP/vec.tsv")
@@ -171,7 +180,26 @@ for it in $(seq 1 "$ITERS"); do
 	FDEV="${DEVS[$F]}"
 	rk_fail_disks "$FDEV"
 	sudo "$MDADM" --remove "$MD" "$FDEV" > /dev/null 2>&1
-	if [ "$MULTI" = 1 ]; then
+	if [ "$COPY" = 1 ]; then
+		# populate at FULL speed to POPULATED, then re-add the wiped
+		# device as the replacement — the cut targets the COPY
+		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
+			rk_fail "$tag: arming failed"; break; }
+		rk_wait_idle
+		rk_pop_show | grep -q "^populated $F " || {
+			rk_fail "$tag: population did not complete"; break; }
+		sudo dd if=/dev/zero of="$FDEV" bs=1M count=8 status=none 2>/dev/null
+		sudo "$MDADM" --zero-superblock "$FDEV" 2>/dev/null
+		rk_add_disks "$FDEV"
+		# catch the copy mid-flight: poll for COPYING (or completion —
+		# the crash-after-complete cell is legit too), then cut NOW
+		for i in $(seq 1 300); do
+			rk_pop_show | grep -q "^copying $F " && break
+			rk_pop_show | grep -q "^none" && break
+			sleep 0.02
+		done
+		precopy=$(rk_pop_show | tr '\n' ';')
+	elif [ "$MULTI" = 1 ]; then
 		# first population runs to POPULATED at full speed; the crash
 		# targets the SECOND population (v3 journal on disk)
 		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
@@ -190,8 +218,12 @@ for it in $(seq 1 "$ITERS"); do
 		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
 			rk_fail "$tag: arming failed"; break; }
 	fi
-	delay=${DCL_CRASH_DELAY:-$(( (RANDOM % 9) + 1 ))}	# 1..9s: pre-checkpoint AND mid-pass cells
-	sleep "$delay"
+	if [ "$COPY" = 1 ]; then
+		delay=0		# the poll above IS the timing; cut immediately
+	else
+		delay=${DCL_CRASH_DELAY:-$(( (RANDOM % 9) + 1 ))}	# 1..9s: pre-checkpoint AND mid-pass cells
+		sleep "$delay"
+	fi
 	premark=$(rk_pop_mark)
 	crash_now
 	sudo "$MDADM" --stop "$MD" > /dev/null 2>&1
@@ -206,8 +238,10 @@ for it in $(seq 1 "$ITERS"); do
 
 	SURV=()
 	for d in "${DEVS[@]}"; do
-		[ "$d" = "$FDEV" ] && continue
-		[ "$MULTI" = 1 ] && [ "$d" = "${FDEV2:-}" ] && continue
+		if [ "$COPY" != 1 ]; then	# COPY re-assembles WITH R
+			[ "$d" = "$FDEV" ] && continue
+			[ "$MULTI" = 1 ] && [ "$d" = "${FDEV2:-}" ] && continue
+		fi
 		SURV+=("$d")
 	done
 	rk_dmesg_window_close; rk_dmesg_clear
@@ -222,6 +256,32 @@ for it in $(seq 1 "$ITERS"); do
 		echo "  DIAG: state: $(rk_pop_show | tr '\n' '|')"
 		rk_fail "$tag: first assignment lost across the crash"; break
 	fi
+	if [ "$COPY" = 1 ]; then
+		# Copy cells: COPYING resumed from the strict-journaled band
+		# mark, or the copy had completed before the cut (state none).
+		# POPULATED would mean the strict arm journal was lost — fail.
+		state=$(rk_pop_show)
+		case "$state" in
+		copying*)
+			rmark=$(sudo dmesg | sed -n 's/.*resuming copy of disk [0-9]* from mark \([0-9]*\).*/\1/p' | tail -1)
+			rk_pass "$tag: copy resumed from journaled mark ${rmark:-?} (pre-cut: ${precopy:-?})"
+			;;
+		none*)
+			rk_pass "$tag: copy complete at the cut (pre-cut: ${precopy:-?})"
+			;;
+		*)
+			echo "  DIAG: state: $state  dmesg: $(sudo dmesg | tail -6 | tr '\n' '|')"
+			rk_fail "$tag: unexpected copy state '$state' after crash"; break;;
+		esac
+		rk_wait_full
+		deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
+		if [ "$deg" = 0 ] && rk_pop_show | grep -q "^none"; then
+			rk_pass "$tag: copy finished after crash (degraded=0, retired)"
+		else
+			rk_fail "$tag: copy did not finish (degraded=$deg, $(rk_pop_show | tr '\n' ';'))"
+			break
+		fi
+	else
 	if [ "$MULTI" = 1 ]; then
 		state=$(rk_pop_show | grep -v "^populated $F ")
 		rearm="$F2"
@@ -262,6 +322,7 @@ for it in $(seq 1 "$ITERS"); do
 			&& rk_pass "$tag: population COMPLETE after crash ($(rk_pop_show))" \
 			|| { rk_fail "$tag: population did not complete: $(rk_pop_show)"; break; }
 	fi
+	fi	# !COPY
 
 	ok=1
 	for lc in "${FLCS[@]}"; do
