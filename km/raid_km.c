@@ -1734,11 +1734,19 @@ struct raidkm_csum_trailer {
 
 /* Region [*start, *start+*sectors) on rdev->bdev, i.e. the tail after the data
  * area.  False if the member has no room (e.g. array not created with a
- * reserved region), in which case csum stays in-core only. */
+ * reserved region), in which case csum stays in-core only.
+ *
+ * Declustered: the one-chunk rkdcl metadata/journal reserve sits FIRST at
+ * data_offset + dev_sectors (raidkm_dcl_load/journal_write depend on that
+ * fixed spot); the CRC region follows it.  mdadm carves both reserves at
+ * create (super1.c: the csum clamp then the dcl chunk clamp), so the tail
+ * holds csum-region + chunk in total.  conf->dcl is set in setup_conf before
+ * any region I/O (pages fault on demand; writeback runs at stop). */
 static bool raidkm_csum_region(struct r5conf *conf, struct md_rdev *rdev,
 			       sector_t *start, sector_t *sectors)
 {
-	sector_t region = rdev->data_offset + conf->mddev->dev_sectors;
+	sector_t region = rdev->data_offset + conf->mddev->dev_sectors +
+			  (conf->dcl ? conf->chunk_sectors : 0);
 	sector_t dev = bdev_nr_sectors(rdev->bdev);
 
 	if (dev <= region)
@@ -2139,6 +2147,7 @@ static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s, struct stripe
 		struct raidkm_csum_page *pg;
 		unsigned long blk;
 		u32 want, got;
+		int pd;
 
 		if (!test_bit(R5_CsumPending, &dev->flags))
 			continue;
@@ -2151,10 +2160,14 @@ static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s, struct stripe
 			 * verified on that pass. */
 			continue;
 		blk = raidkm_csum_blkidx(conf, sh->sector);
+		/* declustered: key by the PHYSICAL disk the block was read
+		 * from (read map; monotone marks make the recompute match the
+		 * issued bio -- same argument the endio rdev lookup uses). */
+		pd = raidkm_sh_pdisk(conf, sh, i);
 		if (rederive) {
 			/* resync: refresh an EXISTING stale entry; a miss stays
 			 * absent so --create resync doesn't store CRC-of-zeros. */
-			pg = raidkm_csum_get(s, raidkm_csum_key(i, blk));
+			pg = raidkm_csum_get(s, raidkm_csum_key(pd, blk));
 			if (pg && test_bit(STRIPE_SYNCING, &sh->state) &&
 			    raidkm_csum_get_slot(pg, blk, &want)) {
 				spin_lock(&pg->slock);
@@ -2162,11 +2175,11 @@ static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s, struct stripe
 					raidkm_block_crc(conf, dev->page, dev->offset));
 				spin_unlock(&pg->slock);
 			}
-		} else if (raidkm_csum_expected(s, i, blk, &want)) {
+		} else if (raidkm_csum_expected(s, pd, blk, &want)) {
 			got = raidkm_block_crc(conf, dev->page, dev->offset);
 			if (got != want) {
 				pr_warn_ratelimited("md/raid:%s: native csum mismatch disk %d sector %llu (want %08x got %08x)\n",
-					mdname(conf->mddev), i,
+					mdname(conf->mddev), pd,
 					(unsigned long long)sh->sector, want, got);
 				clear_bit(R5_UPTODATE, &dev->flags);
 				set_bit(R5_ReadError, &dev->flags);
@@ -2493,17 +2506,24 @@ again:
 		 * verify inline) or parks in the shard's pending xarray on a
 		 * miss -- ops_run_io is the md-thread stripe path and must not
 		 * FAULT the region cache (that would strand stripes).
+		 *
+		 * Declustered: the store is keyed by the PHYSICAL disk the
+		 * write lands on (the write map, mark-independent and stable
+		 * per row) -- slot i would collide across the ngroups stripes
+		 * that share this sh->sector, and the CRC must live with the
+		 * bytes so redirected reads verify against the disk they hit.
 		 */
-		if (conf->csum && op == REQ_OP_WRITE)
-			raidkm_csum_store(conf, i,
-				raidkm_csum_blkidx(conf, sh->sector),
-				raidkm_block_crc(conf, dev->page, dev->offset));
-
 		{
 			/* declustered D1: slot i lives on pdisk, not disk i;
 			 * writes follow the Phase-3 spare redirect */
 			int pd = raidkm_sh_pdisk_rw(conf, sh, i,
 						    op_is_write(op));
+
+			if (conf->csum && op == REQ_OP_WRITE)
+				raidkm_csum_store(conf, pd,
+					raidkm_csum_blkidx(conf, sh->sector),
+					raidkm_block_crc(conf, dev->page,
+							 dev->offset));
 
 			rdev = conf->disks[pd].rdev;
 			rrdev = conf->disks[pd].replacement;
@@ -4698,7 +4718,7 @@ static void raid5_end_read_request(struct bio * bi)
 {
 	struct stripe_head *sh = bi->bi_private;
 	struct r5conf *conf = sh->raid_conf;
-	int disks = sh->disks, i;
+	int disks = sh->disks, i, pd;
 	struct md_rdev *rdev = NULL;
 	sector_t s;
 
@@ -4713,15 +4733,20 @@ static void raid5_end_read_request(struct bio * bi)
 		BUG();
 		return;
 	}
+	/* declustered: the physical disk this read was issued to (read map;
+	 * stable for an issued read -- marks only advance, and mapping
+	 * retreats happen under a full quiesce with no stripes in flight).
+	 * Keys the rdev lookup AND the csum verify below. */
+	pd = raidkm_sh_pdisk(conf, sh, i);
 	if (test_bit(R5_ReadRepl, &sh->dev[i].flags))
 		/* If replacement finished while this request was outstanding,
 		 * 'replacement' might be NULL already.
 		 * In that case it moved down to 'rdev'.
 		 * rdev is not removed until all requests are finished.
 		 */
-		rdev = conf->disks[raidkm_sh_pdisk(conf, sh, i)].replacement;
+		rdev = conf->disks[pd].replacement;
 	if (!rdev)
-		rdev = conf->disks[raidkm_sh_pdisk(conf, sh, i)].rdev;
+		rdev = conf->disks[pd].rdev;
 
 	if (use_new_offset(conf, sh))
 		s = sh->sector + rdev->new_data_offset;
@@ -4769,7 +4794,7 @@ static void raid5_end_read_request(struct bio * bi)
 				unsigned long blk =
 					raidkm_csum_blkidx(conf, sh->sector);
 				u32 want;
-				int hit = raidkm_csum_peek(conf, i, blk, &want);
+				int hit = raidkm_csum_peek(conf, pd, blk, &want);
 
 				if (hit == 0)
 					defer = false;	/* no stored CRC */
@@ -12927,11 +12952,14 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 				       mdname(mddev));
 				goto abort;
 			}
-			if (conf->csum) {
-				pr_err("md/raid:%s: declustered + native checksums not supported yet\n",
-				       mdname(mddev));
-				goto abort;
-			}
+			/* Native checksum + declustered is supported: CRCs are
+			 * keyed by (PHYSICAL pool disk, device block) — the
+			 * write map keys stores, the read map keys verifies —
+			 * and the CRC region sits one chunk past dev_sectors,
+			 * after the rkdcl reserve (see raidkm_csum_region).
+			 * Pre-support dcl modules refuse this combination
+			 * here; pre-dcl modules reject the DCL layout bit —
+			 * both fail closed. */
 		}
 	} else if (conf->effective_level == 6) {
 		conf->m = 2;
@@ -13794,8 +13822,16 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 	 * from the spare instead of decoding.  Any other shape (multiple
 	 * assignments, POPULATING, chained hosts) falls back to the
 	 * validated retire-all leg — copy-aware partial retire is a follow-up.
+	 *
+	 * Native checksum: the copy workers move bytes with raw sync_page_io,
+	 * BYPASSING the stripe write path that stores CRCs — the replacement
+	 * would end up with content whose CRCs still live under the spare
+	 * disk's keys (absent under R's → silently re-derived, trusting a
+	 * possibly-torn copy).  Take the decode leg instead: its stripe-path
+	 * writes store R's CRCs, and its reads csum-VERIFY every decode
+	 * source.  Copy-with-CRC-migration is a follow-up optimization.
 	 */
-	copy_eligible = conf->dcl && conf->reb_pop < 0 &&
+	copy_eligible = conf->dcl && !conf->csum && conf->reb_pop < 0 &&
 			conf->nreb == 1 &&
 			conf->reb[0].state == RKDCL_ASSIGN_POPULATED &&
 			conf->disks[conf->reb[0].disk].rdev == NULL &&
