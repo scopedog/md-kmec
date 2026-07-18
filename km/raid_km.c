@@ -10345,6 +10345,47 @@ static void raidkm_dcl_rescue_worker(struct work_struct *work)
 #define RKDCL_COPY_BAND_SECTORS	(64 * 1024 * 2)		/* 64 MiB per band */
 #define RKDCL_COPY_WORKERS	16
 
+/* Phase-4 copy CRC migration: the raw chunk copy bypasses the stripe write
+ * path that stores CRCs, so move each copied block's stored CRC from the
+ * rotating spare disk's key to the replacement's (slot X) key alongside the
+ * bytes.  MIGRATE, never recompute: recomputing from the copied bytes would
+ * bless a torn or silently-rotted copy, while the migrated CRC keeps
+ * end-to-end integrity across the move — a corrupt spare block is copied
+ * verbatim but its original CRC travels with it, so the first read of R
+ * detects the mismatch and the established ReadError heal decodes the block
+ * from parity (which the §5 invariant keeps consistent with logical
+ * content).  Best-effort by design: an absent source slot (never written /
+ * dropped store / rotted page) or a failed store just leaves R's slot to
+ * the documented stale-slot backstop (false-mismatch -> confirmed heal
+ * repairs), so migration never aborts a band.  A post-quiesce user write to
+ * a migrated block supersedes any still-parked migration value in place
+ * (raidkm_csum_store's pending protocol).  Sleepable context only (copy
+ * worker / copy_request tail, inside the band quiesce); the shard mutex is
+ * dropped before the store so its pending-cap throttle can never wait on a
+ * worker that needs the mutex we hold. */
+static void raidkm_dcl_csum_migrate(struct r5conf *conf, u64 row,
+				    unsigned int sectors, int src, int dst)
+{
+	unsigned long blk0, nblk, i;
+
+	if (!conf->csum)
+		return;
+	blk0 = raidkm_csum_blkidx(conf, row * conf->chunk_sectors);
+	nblk = sectors >> RAID5_STRIPE_SHIFT(conf);
+	for (i = 0; i < nblk; i++) {
+		struct raidkm_csum_shard *s =
+			raidkm_csum_shard_for(conf->csum, blk0 + i);
+		bool present;
+		u32 want;
+
+		mutex_lock(&s->lock);
+		present = raidkm_csum_expected(s, src, blk0 + i, &want);
+		mutex_unlock(&s->lock);
+		if (present)
+			raidkm_csum_store(conf, dst, blk0 + i, want);
+	}
+}
+
 struct rkdcl_copy_band {
 	struct r5conf	*conf;
 	struct md_rdev	*rdst;		/* replacement R at slot X	*/
@@ -10403,6 +10444,9 @@ static void raidkm_dcl_copy_worker(struct work_struct *work)
 			atomic_set(&b->error, 1);
 			break;
 		}
+		/* native checksum: the block CRCs move with the bytes */
+		raidkm_dcl_csum_migrate(conf, row, conf->chunk_sectors,
+					sd, b->X);
 	}
 }
 
@@ -10512,6 +10556,11 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 					mdname(mddev),
 					(unsigned long long)row);
 				atomic_set(&band.error, 1);
+			} else {
+				/* migrate the copied whole blocks' CRCs (a
+				 * sub-4K remainder can't hold a CRC'd block) */
+				raidkm_dcl_csum_migrate(conf, row,
+					tail_bytes >> 9, sd, X);
 			}
 		}
 	}
@@ -13823,15 +13872,13 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 	 * assignments, POPULATING, chained hosts) falls back to the
 	 * validated retire-all leg — copy-aware partial retire is a follow-up.
 	 *
-	 * Native checksum: the copy workers move bytes with raw sync_page_io,
-	 * BYPASSING the stripe write path that stores CRCs — the replacement
-	 * would end up with content whose CRCs still live under the spare
-	 * disk's keys (absent under R's → silently re-derived, trusting a
-	 * possibly-torn copy).  Take the decode leg instead: its stripe-path
-	 * writes store R's CRCs, and its reads csum-VERIFY every decode
-	 * source.  Copy-with-CRC-migration is a follow-up optimization.
+	 * Native checksum composes with the copy: each copied block's stored
+	 * CRC is MIGRATED from the spare disk's key to R's alongside the
+	 * bytes (raidkm_dcl_csum_migrate in the copy workers), so R's
+	 * content stays verified end-to-end — a torn or rotted copy is
+	 * caught by the migrated CRC on first read and healed by decode.
 	 */
-	copy_eligible = conf->dcl && !conf->csum && conf->reb_pop < 0 &&
+	copy_eligible = conf->dcl && conf->reb_pop < 0 &&
 			conf->nreb == 1 &&
 			conf->reb[0].state == RKDCL_ASSIGN_POPULATED &&
 			conf->disks[conf->reb[0].disk].rdev == NULL &&

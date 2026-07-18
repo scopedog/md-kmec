@@ -22,10 +22,15 @@
 #      corrupt the SPARE-hosted copy raw on the spare-column disk -> read
 #      heals and dmesg names the SPARE disk index (CRCs are keyed by
 #      PHYSICAL disk, not slot).
-#   6. --add replacement: with csum the copy-from-spare fast path is
-#      REFUSED (raw copy would bypass CRC stores) -> retire + decode-rebuild
-#      leg runs, degraded returns to 0, content intact, final scrub clean.
-#   7. no kernel WARN/BUG across every dmesg window.
+#   6. --add replacement: the copy-from-spare fast path runs WITH csum —
+#      each copied block's CRC is MIGRATED from the spare disk's key to the
+#      replacement's (raidkm_dcl_csum_migrate); degraded returns to 0,
+#      content intact, final scrub clean with ZERO csum mismatches (the
+#      scrub re-verifies every copied block against its migrated CRC).
+#   7. corrupt-after-copy: corrupting the replacement's copied content raw
+#      is detected against the MIGRATED CRC and healed — an absent CRC
+#      would silently trust the corruption.
+#   8. no kernel WARN/BUG across every dmesg window.
 set -u
 
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
@@ -235,7 +240,7 @@ plc="${FLCS[0]}"; prow=$(lc_row "$plc"); sd=$(spare0_disk "$prow")
 corrupt_raw "${MEMBERS[$sd]}" "$prow"
 heal_read "$plc" "$RK_TMP/CSM$plc" "$sd" "spare-hosted heal (physical-disk keying)"
 
-# ---- 6. --add replacement takes the DECODE leg, not raw copy -------------------
+# ---- 6. --add replacement takes the COPY path, CRCs MIGRATED -------------------
 rk_dmesg_window_close
 rk_dmesg_clear
 sudo "$MDADM" --zero-superblock "$FDEV" 2>/dev/null
@@ -245,10 +250,11 @@ rk_wait_full
 [ "$(cat "/sys/block/$MDNAME/md/degraded" 2>/dev/null)" = 0 ] \
 	&& rk_pass "replacement rebuilt to degraded=0" \
 	|| rk_fail "degraded=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null) after rebuild"
-if sudo dmesg | grep -q "resuming copy of disk\|declustered: copy of disk"; then
-	rk_fail "csum array took the raw copy-from-spare path (CRCs would be lost)"
+if sudo dmesg | grep -q "copy-from-spare rebalance armed for disk $F" &&
+   sudo dmesg | grep -q "copy of disk $F.*COMPLETE"; then
+	rk_pass "csum array took the COPY path (CRC migration, not decode)"
 else
-	rk_pass "csum array took the retire+decode rebuild leg (no raw copy)"
+	rk_fail "copy path not taken: $(sudo dmesg | grep -E 'rebalance armed|retired|copy of disk' | tail -2 | tr '\n' '|')"
 fi
 ok=1
 for lc in "${FLCS[@]}" "$HLC" "$H2LC"; do
@@ -260,8 +266,27 @@ done
 mm=$(rk_scrub)
 [ "$mm" = 0 ] && rk_pass "final scrub clean (mismatch_cnt=0)" \
 	      || rk_fail "final scrub mismatch_cnt=$mm"
+# The scrub read EVERY block of R against the MIGRATED CRCs; a migration bug
+# shows as csum mismatches that the check pass silently heals (mismatch_cnt
+# stays 0 by design), so assert the dmesg count directly.
+mmc=$(sudo dmesg | grep -c "native csum mismatch")
+[ "$mmc" = 0 ] && rk_pass "zero csum mismatches through copy + readback + scrub (CRCs migrated exactly)" \
+	       || rk_fail "$mmc csum mismatches after copy — migrated CRCs disagree with copied bytes"
 
-# ---- 7. kernel health ----------------------------------------------------------
+# ---- 7. corrupt-after-copy: the migrated CRC actually protects R ---------------
+# Corrupt R's copy of a victim chunk raw; the read must DETECT (mismatch
+# attributed to physical disk F) and heal.  An absent CRC (migration silently
+# skipped) would trust the corruption and fail the byte compare instead.
+plc2="${FLCS[1]}"; prow2=$(lc_row "$plc2")
+corrupt_raw "${MEMBERS[$F]}" "$prow2"
+sudo "$MDADM" --stop "$MD" > /dev/null 2>&1 || { rk_fail "stop failed"; rk_summary; exit 1; }
+sudo "$MDADM" --assemble "$MD" "${MEMBERS[@]}" > /dev/null 2>&1 &&
+   grep -q "$MDNAME : active raidkm" /proc/mdstat ||
+	{ rk_fail "re-assemble failed"; rk_summary; exit 1; }
+rk_wait_idle
+heal_read "$plc2" "$RK_TMP/CSM$plc2" "$F" "post-copy heal (migrated CRC protects R)"
+
+# ---- 8. kernel health ----------------------------------------------------------
 rk_dmesg_window_close
 [ "${RK_DMESG_BAD:-0}" = 0 ] && rk_pass "no kernel WARN/BUG during the run (all windows)" \
 			     || rk_fail "kernel WARN/BUG seen — check dmesg"
