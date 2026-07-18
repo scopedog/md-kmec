@@ -135,14 +135,16 @@ else
 	rk_fail "no resume-from-mark line (got '$rmark')"
 fi
 rk_unthrottle
-rk_wait_idle
-if rk_pop_show | grep -q "^populated"; then
+# progress-aware wait: tolerate the deferred-md_start_sync + reap/re-arm idle
+# windows a plain rk_wait_idle would mistake for completion (see rk_wait_populated).
+if rk_wait_populated; then
 	rk_pass "population COMPLETE ($(rk_pop_show))"
 else
 	echo "  DIAG: array_state=$(cat /sys/block/$MDNAME/md/array_state 2>&1) sync_action=$(cat /sys/block/$MDNAME/md/sync_action 2>&1)"
+	echo "  DIAG: degraded=$(cat /sys/block/$MDNAME/md/degraded 2>&1) sync_completed=$(cat /sys/block/$MDNAME/md/sync_completed 2>&1)"
 	echo "  DIAG: mdstat: $(grep -A1 "$MDNAME" /proc/mdstat | tr '\n' ' ')"
-	echo "  DIAG: dmesg tail: $(sudo dmesg | tail -6 | tr '\n' '|')"
-	rk_fail "population did not complete: $(rk_pop_show)"; rk_summary; exit 1
+	echo "  DIAG: dmesg tail: $(sudo dmesg | tail -8 | tr '\n' '|')"
+	rk_fail "population stalled (mark frozen ${RK_POP_STALL}s while idle): $(rk_pop_show)"; rk_summary; exit 1
 fi
 
 # ---- 4. POPULATED reads + raw spare placement oracle ---------------------------

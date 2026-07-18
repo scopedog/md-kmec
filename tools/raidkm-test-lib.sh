@@ -258,6 +258,38 @@ rk_wait_full() {
 	done
 }
 
+# rk_wait_populated : wait for an armed declustered population to reach the
+# "populated" state.  A plain rk_wait_idle is WRONG here for the same reason
+# rk_wait_full exists: after --assemble --run ARMS a resume, md starts the
+# population sync via deferred md_start_sync work and rides the idempotent
+# raid5d re-arm across md_check_recovery reap cycles — so /proc/mdstat is
+# momentarily idle both before the first pass appears AND between passes.
+# rk_wait_idle samples that window and returns early, yielding a spurious
+# "did not complete" with the mark frozen at exactly the resume value
+# (observed once on a heavily-loaded GCP box; see notes).  Here LIVENESS is
+# the pop mark advancing: a transient idle window is fine as long as the mark
+# is still climbing (or a sync is visibly running); only a mark that stays put
+# for RK_POP_STALL seconds while mdstat is idle is a genuine kernel stall.
+# returns 0 iff populated, 1 on a real stall (caller dumps DIAG).
+RK_POP_STALL=${RK_POP_STALL:-60}
+rk_wait_populated() {
+	local last=-1 mk stall=0 i
+	for i in $(seq 1 2400); do		# ~20 min hard ceiling
+		rk_pop_show | grep -q "^populated" && return 0
+		mk=$(rk_pop_mark); : "${mk:=0}"
+		if [ "$mk" -gt "$last" ]; then
+			last=$mk; stall=0		# forward progress
+		elif grep -qiE 'resync|recovery|reshape|check' /proc/mdstat; then
+			stall=0				# sync running (slow/throttled), not stalled
+		else
+			stall=$((stall + 1))		# idle AND no progress
+			[ "$stall" -ge $((RK_POP_STALL * 2)) ] && return 1
+		fi
+		sleep 0.5
+	done
+	return 1
+}
+
 # rk_write <MiB> : fill the array with random data, remember its checksum.
 rk_write() {
 	sudo dd if=/dev/urandom of="$RK_TMP/src" bs=1M count="$1" status=none 2>/dev/null

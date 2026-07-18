@@ -21,9 +21,13 @@ byte-identical parity to the ISA-L m=2 encode (see "Architectural
 commitments" below).  Parity placement is selectable per array via
 `--layout`: **rotating** (the default — generalized left-symmetric,
 spreads parity and read traffic across all members, matching stock
-RAID6's own default placement) or **parity-last** (dedicated parity
-on the tail m disks, which keeps the cheap offline add-a-parity grow).
-The parity-disk count **m** is set separately with `--parity-count`.
+RAID6's own default placement), **parity-last** (dedicated parity
+on the tail m disks, which keeps the cheap offline add-a-parity grow),
+or **declustered** (narrow *k+m* groups scattered over a wider pool by a
+balanced permutation, with a **distributed spare** — so a single-disk
+rebuild is parallelised across the whole pool instead of bottlenecked on
+one replacement; see *Declustered parity* below).  The parity-disk count
+**m** is set separately with `--parity-count`.
 
 The earlier standalone implementation lives on the `proto`
 branch and the `v0-proto` tag.  Benchmarks of that prototype
@@ -105,6 +109,8 @@ These are load-bearing for the design and not up for negotiation:
 | **LVM-managed raidkm** (`lvcreate --type raidkm`) | ✅ done (2026-06-05) — the lvm2 raidkm fork provisions level-71 LVs via two segtypes `raidkm` (rotating) / `raidkm_n` (parity-last) carrying `parity_count` (m). Validated base + GFNI, m=2/3/4: create/activate/I/O/reassembly/degraded; `lvconvert --repair` (raidkm-aware leg replacement + rebuild); and **dmeventd** monitoring + auto-repair (level-agnostic plugin, no code change). Reshape via dm/LVM is out of scope (the data-offset out-of-place reshape doesn't fit raidkm — mdadm-only); the kernel reshape gate stays on. See `notes/dm-raid-design.md` |
 | **Checksum-driven self-healing** — reconstruct silently-corrupt blocks from parity, up to m per stripe | ✅ done (2026-07-02) — driven by a per-block integrity signal (md-kmec's own **native checksums**, next row, or a stacked `dm-integrity`; T10-PI passthrough next), md-kmec turns an integrity-flagged read error into an m-erasure **reconstruction**: the corrupt block is rebuilt from parity and rewritten, on both the read path and the m-way scrub, with mixed data+parity corruption healed in a **single repair pass** (durable `R5_IntegrityHeal` marker). A read-only `healed_blocks` sysfs counter reports repairs. **Validated to m=8** — heals 8 simultaneous silent corruptions in one stripe (data-only, parity-only, and mixed 4+4), deterministically, beyond RAID-Z3's 3. The integrity layer supplies the *detection*; md-kmec supplies the *reconstruction*. See `tools/raidkm-test-selfheal.sh` (runs on native checksums with `NATIVE=1`, or on `dm-integrity`) |
 | **Native per-block checksums** — built-in per-4K CRC-32C integrity, no stacking required | ✅ done (2026-07-14) — `mdadm --create … --checksum=crc32c` (bare `--checksum` also works; `--integrity=crc32c` is a retained alias) gives every 4 KiB block a CRC-32C that raidkm computes, stores, and verifies itself. CRCs persist in a **reserved region** at each member's tail (~0.1% of capacity, carved at create; SB layout bit `0x200`) in self-checking pages (per-page CRC + generation trailer, so a rotted region page is detected and dropped, never trusted), served through a bounded **demand-paged cache**, auto-sized at array start to cover every member's whole CRC region (~1 page per 4 MiB of member capacity; clamped to ~1.6% of RAM with a logged hint when a huge array is clamped below full coverage — undersizing costs region-page faults, never correctness; override via `raidkm_csum_cache_pages`). Reads verify **inline in the bio completion** (lock-free expected-CRC lookup + `crc32c`, the dm-integrity inline-mode shape) including a **verified chunk-aligned read bypass**; stores land at write issue; a fast-path mismatch is never trusted — it is **rechecked** through the stripe cache before feeding the self-heal above. Real-NVMe validated (8× local SSD, m=2, fio direct): **reads and writes at 96–101% of the no-checksum baseline** (random read 100.0%), ahead of `dm-integrity` **bitmap** on all four workloads and of **journal** on writes (2.1–2.3×) and random read (1.26×), tying it on sequential read — with 0 false mismatches. Crash semantics: CRCs are recomputed over the resync window after an unclean shutdown (same class as dm-integrity bitmap; journal's crash-atomic tags are the stronger guarantee its ~2× write cost buys). Concurrency-hardened by a three-lens adversarial review (verify-fence ordering, workqueue isolation, rdev pinning). Design + benchmark: `notes/native-checksum-read-redesign-2026-07-14.md`; gates: `tools/raidkm-test-csum-thrash.sh` (cache-eviction round-trip) and the self-heal suite in `NATIVE=1` mode. **Real-NVMe re-gate (2026-07-15)** on 4K-logical local SSD under KASAN + lockdep: functional 12/12, csum-thrash, self-heal 60/60, randrw churn 0 WARNs, 0 splats — the re-gate found and fixed a `skip_copy`×checksum read/write invariant `WARN_ON` (`need_this_block` now defers a read overlapping a draining `skip_copy` write) |
+| **Declustered parity — wide-pool layout with distributed spare** (`--layout=declustered`) | ✅ done (2026-07-16) — narrow *k+m* groups scattered over an N-disk pool by a seeded, rotation-expanded balanced permutation (clean-room, dRAID-*lineage* combinatorics — Holland & Gibson design theory, **no OpenZFS/CDDL code**), with **distributed spare** columns instead of a dedicated hot spare. Capacity balance is **exact by construction** and the rebuild read/write load is rotation-symmetric, so a failed disk's reconstruction spreads across every survivor. **Headline: rebuilding a failed 16 GB member on an 80-disk pool (g=13) took 44.9 s vs 785.1 s for a classic 78+2 array — 17.5×** (it also beats a narrow 11+2 classic, because the distributed spare removes the single-writer bottleneck). Geometry via `--group-width=g [--spare-columns=s] [--dcl-nbase=n] [--dcl-seed=x]`; the permutation seed + geometry live in a per-member on-disk **rkdcl** metadata block (4 KiB tail reserve, crc + generation), the kernel regenerates the identical permutation from the seed. Constraint C1 `(N−s) mod g == 0` (mdadm validates + suggests a legal `s`). Declustering is *m-agnostic* — validated m=2..5 on real NVMe (incl. the single-group-row `ngroups=1` edge). v1 excludes write-intent bitmap / native checksum / resize / reshape on a declustered array (refused at create, not run wrong). See *Declustered parity* below and `notes/declustered-parity-design.md` |
+| **Declustered population + rebalance — rebuild into / migrate out of the distributed spare** | ✅ done (2026-07-17) — when a member fails, **population** reconstructs its content into the distributed spare columns as a raidkm-owned sync action (`echo <idx> > /sys/block/mdN/md/rk_dcl_populate`, or automatic with `rk_dcl_auto=1`), advancing a crash-safe journaled prefix mark (rkdcl v2, FUA+PREFLUSH every 16 MiB). **Sequential multi-assignment** (up to `s` failed disks, one populating at a time) uses **chained redirects** — a spare column can rotate onto another failed disk, so the slot→disk map resolves through the active assignments; the on-disk journal is **adaptive v2/v3** (a published v2 module fails *closed* rather than silently dropping an assignment). Adding a replacement **rebalances** by **copy-from-spare** (16-worker parallel copy straight from the already-populated spare — no GF decode, array never degraded during it; per-band quiesce + offset-split, strict-journaled per band) instead of a decode rebuild, falling back to the validated decode leg on any persistent copy fault. Power-loss crash matrices (dm-flakey) green for population, second-population, and mid-copy resume. Hardened by **two adversarial multi-agent reviews** (16 findings fixed: journal quorum, arm-publication barriers, auto-arm rescan, a copy-abort progress-contract data-loss bug, wedge-to-decode fallbacks). Validated under KASAN + on stock-RHEL real NVMe. See *Declustered parity* below, `notes/declustered-population-design.md`, `notes/declustered-rebalance-copy-design.md` |
 
 ### How level 71 is integrated into raid5.c
 
@@ -813,6 +819,105 @@ mdadm --grow /dev/md70 --add-parity /dev/ram5   # m=2 → m=3 (rotating), online
 
 To add a **hot spare** (not part of the array yet), use MANAGE-mode `--add`
 without `--grow`: `mdadm /dev/md70 --add /dev/ram5`.
+
+## Declustered parity
+
+Wide erasure-coded pools have a rebuild problem: a classic *k+m* array with one
+dedicated spare funnels the entire reconstruction of a failed member through
+that one replacement disk, so rebuild time grows with member size and the array
+stays degraded (and exposed to a second failure) the whole time. **Declustered
+parity** fixes this by making the stripe *narrower than the pool*: `k+m` groups
+are scattered over an `N`-disk pool by a balanced permutation, and the spare is
+**distributed** as a rotating set of spare columns rather than one disk. When a
+member dies, its lost chunks live on — and are rebuilt across — *every* survivor
+in parallel, so single-disk rebuild parallelises ~`(N−1)/g` instead of
+bottlenecking on one writer.
+
+The construction is **clean-room**: the rotation/difference permutation is
+classic design-theory combinatorics (Holland & Gibson lineage); it is the same
+*idea* as OpenZFS dRAID but shares **no CDDL code** — this is a GPL
+implementation. Capacity balance is exact by construction, and the per-survivor
+rebuild load is rotation-symmetric.
+
+> **The headline (wide-pool rebuild):** rebuilding a failed 16 GB member on
+> an **N=80, g=13 (11+2)** pool took **44.9 s** vs **785.1 s** for a classic
+> 78+2 array — **17.5×**. It even beats a narrow 11+2 classic (51.9 s), because
+> the distributed spare removes the single-writer bottleneck.
+
+### Creating a declustered array
+
+```sh
+mdadm --create /dev/md0 --level=raidkm --parity-count=2 \
+      --layout=declustered --group-width=6 --spare-columns=2 \
+      --raid-devices=14 /dev/sd[b-o]
+```
+
+- `--group-width=g` — the stripe width `k+m` (here 6 = 4+2). Each row of the
+  pool holds `ngroups = (N−s)/g` independent groups plus `s` spare columns.
+- `--spare-columns=s` (optional) — distributed-spare capacity, in columns per
+  row (≈ `s` disks' worth of spare, spread across all members). Defaults to the
+  smallest legal value; `s ≥ m` lets the pool absorb `m` concurrent failures.
+- `--dcl-nbase=n` / `--dcl-seed=x` (optional, advanced) — the number of base
+  permutations and the acceptance-search seed. `mdadm` runs the acceptance
+  search at create time (float scoring is userspace-only) and records the
+  winning seed + geometry in a per-member on-disk **rkdcl** metadata block; the
+  kernel regenerates the *identical* permutation from that seed alone.
+
+**Constraint C1:** `(N − s) mod g == 0` (groups tile a row without wrapping).
+`mdadm` validates this and suggests a legal `--spare-columns` if you miss it.
+For example N=80 wants g=13/s=2 (good) but g=16 would force s=16 (12.5%
+overhead) — so `mdadm` steers you.
+
+### Rebuilding a failed member (population)
+
+A declustered array does **not** rebuild onto a single replacement. Instead it
+**populates** the failed member's content into the distributed spare columns:
+
+```sh
+# a member failed; reconstruct it into the distributed spare
+echo <failed-index> > /sys/block/md0/md/rk_dcl_populate
+cat /sys/block/md0/md/rk_dcl_populate      # populating <X> -> spare <j> mark A/B
+```
+
+Or set `echo 1 > /sys/block/md0/md/rk_dcl_auto` to arm population **automatically**
+the moment a member fails (off by default; not persisted). Population runs as a
+raidkm-owned sync action with a **crash-safe journaled prefix mark** (FUA +
+PREFLUSH every 16 MiB) — a power loss mid-rebuild resumes from the mark on the
+next assembly. Up to `s` failures can be populated **sequentially** (one at a
+time); because a spare column can rotate onto *another* failed disk, the
+slot→disk map resolves through the active assignments (**chained redirects**),
+and the on-disk journal is **adaptive v2/v3** so an older module fails *closed*
+rather than silently dropping an assignment.
+
+### Migrating back to a fresh disk (rebalance)
+
+When you add a replacement, the array **rebalances** — it copies the failed
+member's already-reconstructed content straight from the distributed spare onto
+the new disk (`--layout`-transparent; just `--add` the replacement):
+
+```sh
+mdadm /dev/md0 --add /dev/sdp        # copy-from-spare onto the replacement
+```
+
+This **copy-from-spare** path (16 parallel workers, no GF decode, the array
+never degraded during it — reads are served live from the replacement below the
+copy mark and from the spare above it, split at a strict-journaled per-band
+mark) is faster and safer than a decode rebuild, and falls back to the validated
+decode leg on any persistent copy fault. After it completes the spare columns
+are freed and the pool is whole again.
+
+### What v1 does not do
+
+A declustered array currently refuses (at create, rather than running wrong):
+write-intent bitmap, native checksums, online resize, and reshape
+(`--grow --add-data/--add-parity`). These compose with declustering in
+principle but are not yet wired; a non-declustered raidkm array has them all.
+
+Design and validation detail: [`notes/declustered-parity-design.md`](notes/declustered-parity-design.md)
+(layout + on-disk format), [`notes/declustered-population-design.md`](notes/declustered-population-design.md)
+(population, sequential multi-assignment), and
+[`notes/declustered-rebalance-copy-design.md`](notes/declustered-rebalance-copy-design.md)
+(copy-from-spare rebalance). Gates: `tools/raidkm-test-declustered-*.sh`.
 
 ## Managing raidkm via device-mapper and LVM
 
