@@ -17,10 +17,12 @@
 #      written to the on-victim logical chunks (byte-for-byte) — proves the
 #      copy moved X's real content, not garbage;
 #   5. fio read-verify + scrub clean;
-#   6. CONCURRENT WRITES during the copy (throttled): a write issued while
-#      COPYING reads back correctly after completion;
-#   7. crash mid-copy (dm-flakey) -> resume from journaled mark -> exact;
-#   8. no kernel WARN/BUG.
+#   6. CONCURRENT WRITES during the copy (throttled — the copy honors the
+#      per-array sync_speed_max): a write issued while COPYING reads back
+#      correctly after completion;
+#   7. no kernel WARN/BUG.
+# Crash-mid-copy coverage lives in raidkm-test-declustered-crash.sh with
+# DCL_CRASH_COPY=1 (dm-flakey power cut + resume from the journaled mark).
 set -u
 
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
@@ -114,7 +116,7 @@ else
 fi
 rk_wait_full
 deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
-if [ "$deg" = 0 ] && sudo dmesg | grep -q "copy of disk $F .* COMPLETE" \
+if [ "$deg" = 0 ] && sudo dmesg | grep -qE "copy of disk $F( .*)? COMPLETE" \
    && rk_pop_show | grep -q "^none"; then
 	rk_pass "copy complete: degraded=0, assignment retired"
 else
@@ -158,7 +160,7 @@ mm=$(rk_scrub)
 # lands mid-COPYING; verify it reads back after completion.
 F2=$(awk -v f="$F" '$1 !~ /^#/ && $6 != f {print $6; exit}' "$RK_TMP/vec.tsv")
 FDEV2="${MEMBERS[$F2]}"
-read -r -a F2LCS <<< "$(awk -v F="$F2" '$1 !~ /^#/ && $6 == F2 && $1 < 2048 && !seen[$5]++ {print $1}' \
+read -r -a F2LCS <<< "$(awk -v F="$F2" '$1 !~ /^#/ && $6 == F && $1 < 2048 && !seen[$5]++ {print $1}' \
 	"$RK_TMP/vec.tsv" | head -3 | tr '\n' ' ')"
 rk_fail_disks "$FDEV2"; sudo "$MDADM" --remove "$MD" "$FDEV2" > /dev/null 2>&1
 echo "$F2" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1

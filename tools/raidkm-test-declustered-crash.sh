@@ -64,7 +64,11 @@ global_cleanup() {
 			sleep 0.2
 		done
 	done
-	for l in $(sudo losetup -l 2>/dev/null | awk '/raidkm-dcl-crash/ {print $1}'); do
+	# detach every loop backing a file under $BACK — matching the
+	# literal $BACK path, NOT a hardcoded substring (a DCL_CRASH_BACK
+	# override otherwise leaks a loop + its 192MB image every iteration
+	# until the backing fs fills)
+	for l in $(sudo losetup -l 2>/dev/null | awk -v b="$BACK/" 'index($0,b){print $1}'); do
 		sudo losetup -d "$l" >/dev/null 2>&1
 	done
 }
@@ -74,13 +78,19 @@ stack_setup() {
 	FLK=(); LOOPS=(); DEVS=()
 	mkdir -p "$BACK"
 	global_cleanup
+	sudo rm -f "$BACK"/disk*.img	# purge any leaked backing files
 	# Iteration boundary needs the same udev discipline as the post-crash
 	# assemble (observed: 7-member inactive md127 wedging iter4's create).
 	rk_udev_quiesce
 	for i in $(seq 1 "$N"); do
 		f="$BACK/disk$i.img"
 		sudo rm -f "$f"
-		sudo dd if=/dev/zero of="$f" bs=1M count="$DISK_MB" status=none
+		# dd failure (ENOSPC on an undersized DCL_CRASH_BACK) must fail
+		# HERE — a short file makes a zero-size loop and a confusing
+		# "zero-length target" dm error much later
+		sudo dd if=/dev/zero of="$f" bs=1M count="$DISK_MB" status=none || {
+			echo "ERROR: backing file $f short — is $BACK large enough for $N x ${DISK_MB}MB?" >&2
+			return 1; }
 		loop=$(sudo losetup --show -f --direct-io=on "$f") || return 1
 		flk="rkdclcr$i"
 		sectors=$(sudo blockdev --getsz "$loop")
@@ -192,13 +202,15 @@ for it in $(seq 1 "$ITERS"); do
 		sudo "$MDADM" --zero-superblock "$FDEV" 2>/dev/null
 		rk_add_disks "$FDEV"
 		# catch the copy mid-flight: poll for COPYING (or completion —
-		# the crash-after-complete cell is legit too), then cut NOW
+		# the crash-after-complete cell is legit too), then cut NOW.
+		# One capture per iteration (repeated sudo forks would widen
+		# the poll period well past the copy window).
 		for i in $(seq 1 300); do
-			rk_pop_show | grep -q "^copying $F " && break
-			rk_pop_show | grep -q "^none" && break
+			precopy=$(rk_pop_show)
+			case "$precopy" in copying*|none*) break;; esac
 			sleep 0.02
 		done
-		precopy=$(rk_pop_show | tr '\n' ';')
+		precopy=$(echo "$precopy" | tr '\n' ';')
 	elif [ "$MULTI" = 1 ]; then
 		# first population runs to POPULATED at full speed; the crash
 		# targets the SECOND population (v3 journal on disk)

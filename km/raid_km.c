@@ -186,7 +186,7 @@ static inline int raidkm_dcl_redirect(struct r5conf *conf, int disk,
 	if (likely(!nreb))
 		return disk;
 	for (hops = 0; hops <= nreb; hops++) {
-		bool covered, to_spare;
+		bool to_spare;
 		int i;
 
 		for (i = 0; i < nreb; i++)
@@ -194,9 +194,9 @@ static inline int raidkm_dcl_redirect(struct r5conf *conf, int disk,
 				break;
 		if (i == nreb)
 			return disk;		/* live endpoint */
-		/* covered == this row's whole chunk is below the mark */
-		covered = (row + 1) * conf->chunk_sectors <=
-			  (u64)atomic64_read(&conf->reb_mark);
+		/* "covered" == this row's whole chunk is below the mark.
+		 * Only the transient states pay the atomic mark read — the
+		 * long-lived POPULATED steady state must stay two loads. */
 		switch (conf->reb[i].state) {
 		case RKDCL_ASSIGN_POPULATED:
 			to_spare = true;	/* always served from spare */
@@ -204,13 +204,16 @@ static inline int raidkm_dcl_redirect(struct r5conf *conf, int disk,
 		case RKDCL_ASSIGN_POPULATING:
 			/* writes redirect for ALL rows (§1); reads below the
 			 * mark are on the spare, above it decode on the fly */
-			to_spare = for_write || covered;
+			to_spare = for_write ||
+				(row + 1) * conf->chunk_sectors <=
+					(u64)atomic64_read(&conf->reb_mark);
 			break;
 		case RKDCL_ASSIGN_COPYING:
 			/* Phase 4 offset-split: below the mark the content is
 			 * on R (the replacement == this slot's natural disk,
 			 * so DON'T redirect); at/above it still on the spare */
-			to_spare = !covered;
+			to_spare = (row + 1) * conf->chunk_sectors >
+					(u64)atomic64_read(&conf->reb_mark);
 			break;
 		default:
 			to_spare = false;	/* NONE: no redirect */
@@ -10218,6 +10221,85 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 	return RAID5_STRIPE_SECTORS(conf);
 }
 
+/* Declustered: retire ALL spare assignments — the §5-safe escape hatch.
+ * Parity is always consistent with logical content, so turning the
+ * redirect off makes every assigned X-slot a plain failed-decodable slot;
+ * any surviving replacement then rebuilds by the validated decode leg and
+ * auto-arm re-populates still-missing disks.  Under a full quiesce,
+ * journal-FIRST (strict): on journal failure everything is restored inside
+ * the quiesce and the caller retries later (raid5d straggler rescue).
+ * Callers must NOT already hold the quiesce.  mddev-locked or sync-thread
+ * context (blocking OK). */
+static int raidkm_dcl_retire_all(struct mddev *mddev, const char *why)
+{
+	struct r5conf *conf = mddev->private;
+	int saved_nreb = conf->nreb, saved_pop = conf->reb_pop;
+	int i, err;
+
+	if (!saved_nreb)
+		return 0;
+	raid5_quiesce(mddev, 1);
+	/* shrink-first: entries above nreb are untouched, so the failure
+	 * path can restore by just re-widening the count */
+	conf->nreb = 0;
+	WRITE_ONCE(conf->reb_pop, -1);
+	err = raidkm_dcl_journal_write(conf, true);
+	if (err) {	/* journal must land before the map moves; restore
+			 * INSIDE the quiesce so no I/O sees the NONE window */
+		conf->nreb = saved_nreb;
+		WRITE_ONCE(conf->reb_pop, saved_pop);
+	} else {
+		/* scrub the retired entries: a later arm's publication
+		 * window must never expose a stale POPULATED entry */
+		for (i = 0; i < saved_nreb; i++) {
+			conf->reb[i].disk  = -1;
+			conf->reb[i].spare = -1;
+			conf->reb[i].state = RKDCL_ASSIGN_NONE;
+		}
+	}
+	raid5_quiesce(mddev, 0);
+	if (!err)
+		pr_info("md/raid:%s: declustered: %d spare assignment(s) retired (%s)\n",
+			mdname(mddev), saved_nreb, why);
+	else
+		pr_warn("md/raid:%s: declustered: retire (%s) journal failed (%d); will retry\n",
+			mdname(mddev), why, err);
+	return err;
+}
+
+/* Phase-4 COPYING rescue (queued by raid5d, which itself must never
+ * quiesce — it is the thread that drains stripes).  Two conditions need a
+ * retire that no sync pass can deliver: the replacement is absent/Faulty
+ * (md will never start another RECOVER, so copy_request's own retire is
+ * unreachable — the array would wedge COPYING with --add -EBUSY forever),
+ * and a completed copy whose retire journal failed (the completion branch
+ * ran; nothing else will).  Re-validates under mddev_lock; a lost trylock
+ * just waits for raid5d to re-queue. */
+static void raidkm_dcl_rescue_worker(struct work_struct *work)
+{
+	struct r5conf *conf =
+		container_of(work, struct r5conf, dcl_rescue_work);
+	struct mddev *mddev = conf->mddev;
+	int pop;
+
+	if (!mddev_trylock(mddev))
+		return;
+	pop = conf->reb_pop;
+	if (pop >= 0 && conf->reb[pop].state == RKDCL_ASSIGN_COPYING) {
+		int X = conf->reb[pop].disk;
+		struct md_rdev *rdev = conf->disks[X].rdev;
+
+		if (!rdev || test_bit(Faulty, &rdev->flags))
+			raidkm_dcl_retire_all(mddev,
+					      "replacement absent mid-copy");
+		else if ((u64)atomic64_read(&conf->reb_mark) >=
+			 mddev->dev_sectors)
+			raidkm_dcl_retire_all(mddev,
+					      "copy complete (deferred retire)");
+	}
+	mddev_unlock(mddev);
+}
+
 /* Declustered Phase 4: one BAND of the copy-from-spare rebalance
  * (notes/declustered-rebalance-copy-design.md).  Rides the stock RECOVER md
  * starts for the freshly-added replacement R at slot X; this branch replaces
@@ -10235,7 +10317,7 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
  * on its own chunk buffer — queue depth == pool size with none of the
  * submit-from-endio complexity.  rdevs are stable for the whole pass:
  * remove_and_add_spares is excluded while MD_RECOVERY_RUNNING is set. */
-#define RKDCL_COPY_BAND_SECTORS	(16 * 1024 * 2)		/* 16 MiB per band */
+#define RKDCL_COPY_BAND_SECTORS	(64 * 1024 * 2)		/* 64 MiB per band */
 #define RKDCL_COPY_WORKERS	16
 
 struct rkdcl_copy_band {
@@ -10312,8 +10394,18 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 	struct rkdcl_copy_band band;
 	struct rkdcl_copy_worker wk[RKDCL_COPY_WORKERS];
 	struct md_rdev *rdst;
+	unsigned long t0 = jiffies;
 	u64 row0 = sector_nr;
 	int i, nwk = 0;
+
+	/*
+	 * PROGRESS CONTRACT: every nonzero return claims sectors that are
+	 * durable on R (below the journaled mark).  Abort paths return 0 —
+	 * md's no-progress convention — so md's cursor / R's
+	 * recovery_offset can NEVER run ahead of the mark, and a resumed
+	 * pass can never leave an uncopied gap below it, whatever md
+	 * records at an INTR.
+	 */
 
 	/* resume fast-forward: everything below the restored mark is copied */
 	if (sector_nr + conf->chunk_sectors <= mark) {
@@ -10323,41 +10415,14 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 
 	rdst = conf->disks[X].rdev;	/* the replacement R at slot X */
 	if (!rdst || test_bit(Faulty, &rdst->flags)) {
-		/* Replacement lost mid-copy.  An INTR alone would livelock
-		 * (raid5d re-nudges the RECOVER, which aborts here again) —
-		 * RETIRE the assignment instead: every X-slot becomes plain
-		 * failed and decodes via parity, which stayed consistent
-		 * through COPYING (writes below the mark hit R AND parity;
-		 * the below-mark spare content may be stale but is never
-		 * read once NONE).  Auto-arm's rescan then re-parks X for a
-		 * fresh population. */
-		int pop = conf->reb_pop;
-		int saved_spare = conf->reb[pop].spare;
-		int jerr;
-
-		raid5_quiesce(mddev, 1);
-		conf->reb[pop].disk = -1;
-		conf->reb[pop].spare = -1;
-		conf->reb[pop].state = RKDCL_ASSIGN_NONE;
-		conf->nreb = 0;
-		WRITE_ONCE(conf->reb_pop, -1);
-		jerr = raidkm_dcl_journal_write(conf, true);
-		if (jerr) {	/* journal must land before the map moves;
-				 * restore INSIDE the quiesce and retry on the
-				 * next pass */
-			conf->reb[pop].disk = X;
-			conf->reb[pop].spare = saved_spare;
-			conf->reb[pop].state = RKDCL_ASSIGN_COPYING;
-			conf->nreb = pop + 1;
-			WRITE_ONCE(conf->reb_pop, pop);
-		}
-		raid5_quiesce(mddev, 0);
-		if (!jerr)
-			pr_warn("md/raid:%s: declustered: replacement for disk %d lost mid-copy — assignment retired, X decodes via parity (re-arm population)\n",
-				mdname(mddev), X);
+		/* Replacement lost mid-copy: retire (§5-safe — X decodes via
+		 * parity; below-mark spare may be stale but is never read
+		 * once NONE) instead of livelocking on INTR re-nudges.
+		 * Journal failure keeps COPYING; raid5d's rescue retries. */
+		raidkm_dcl_retire_all(mddev, "replacement lost mid-copy");
 		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 		*skipped = 1;
-		return conf->chunk_sectors;
+		return 0;
 	}
 
 	band_end = min_t(sector_t, sector_nr + RKDCL_COPY_BAND_SECTORS,
@@ -10376,7 +10441,7 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 	atomic_set(&band.error, 0);
 
 	for (i = 0; i < RKDCL_COPY_WORKERS; i++) {
-		wk[i].pg = alloc_pages(GFP_KERNEL, order);
+		wk[i].pg = alloc_pages(GFP_KERNEL | __GFP_NOWARN, order);
 		if (!wk[i].pg)
 			break;
 		wk[i].band = &band;
@@ -10384,9 +10449,13 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 		nwk++;
 	}
 	if (!nwk) {
+		/* can't buffer even one chunk (huge chunk order or severe
+		 * fragmentation): fall back to the validated decode leg
+		 * rather than livelocking on retries */
+		raidkm_dcl_retire_all(mddev, "copy buffers unavailable");
 		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 		*skipped = 1;
-		return conf->chunk_sectors;
+		return 0;
 	}
 
 	/* quiesce so no user I/O straddles the mark advance for this band */
@@ -10413,8 +10482,12 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 					  REQ_OP_READ, false) ||
 			    !sync_page_io(rdst, row * conf->chunk_sectors,
 					  tail_bytes, wk[0].pg,
-					  REQ_OP_WRITE | REQ_SYNC, false))
+					  REQ_OP_WRITE | REQ_SYNC, false)) {
+				pr_warn("md/raid:%s: declustered: copy tail-row %llu failed\n",
+					mdname(mddev),
+					(unsigned long long)row);
 				atomic_set(&band.error, 1);
+			}
 		}
 	}
 	if (!atomic_read(&band.error)) {
@@ -10423,17 +10496,43 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 		 * mark asserts R content below it is durable) */
 		atomic64_set(&conf->reb_mark, band_end);
 		conf->reb_journal_mark = band_end;
-		raidkm_dcl_journal_write(conf, true);
+		if (raidkm_dcl_journal_write(conf, true)) {
+			/* mark not durable: roll the runtime mark back so
+			 * the offset-split never leads the journal, and
+			 * make no progress claim */
+			atomic64_set(&conf->reb_mark, mark);
+			conf->reb_journal_mark = mark;
+			atomic_set(&band.error, 1);
+		}
 	}
 	raid5_quiesce(mddev, 0);
 
 	for (i = 0; i < nwk; i++)
 		__free_pages(wk[i].pg, order);
 	if (atomic_read(&band.error)) {
+		/* persistent copy failure (dead source disk, I/O error,
+		 * journal failure): fall back to the decode leg — retire
+		 * (journal failure there keeps COPYING for raid5d's rescue
+		 * to retry; either way no progress is claimed) */
+		raidkm_dcl_retire_all(mddev, "copy band failed");
 		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 		*skipped = 1;
-		return conf->chunk_sectors;
+		return 0;
 	}
+
+	/* honor the per-array sync_speed_max (the *skipped return bypasses
+	 * md's own pacing): sleep off any excess over the cap */
+	if (mddev->sync_speed_max > 0) {
+		unsigned long min_jiff = msecs_to_jiffies(
+			(unsigned long)(band_end - sector_nr) / 2 * 1000 /
+			(unsigned long)mddev->sync_speed_max);
+		unsigned long spent = jiffies - t0;
+
+		if (spent < min_jiff &&
+		    !test_bit(MD_RECOVERY_INTR, &mddev->recovery))
+			schedule_timeout_interruptible(min_jiff - spent);
+	}
+
 	*skipped = 1;
 	return band_end - sector_nr;
 }
@@ -10475,26 +10574,24 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		if (conf->dcl && conf->reb_pop >= 0 &&
 		    conf->reb[conf->reb_pop].state == RKDCL_ASSIGN_COPYING) {
 			/* Phase-4 copy finish: the copy rides md's RECOVER for
-			 * R.  On a full pass RETIRE the assignment (redirect
-			 * off — R now serves slot X natively; the copy changed
-			 * no logical content, so this is §5-safe); md's reap
-			 * then calls spare_active -> R In_sync, degraded--.
-			 * On an interrupt just journal the mark; the RECOVER
-			 * (and this branch) resumes from it. */
+			 * R.  On a FULL RECOVER pass retire the assignment
+			 * (redirect off — R serves slot X natively; the copy
+			 * changed no logical content, §5-safe); md's reap then
+			 * calls spare_active -> R In_sync, degraded--.  Only a
+			 * genuine RECOVER may retire (a check/resync that ran
+			 * concurrently never advanced R).  Retire journal
+			 * failure keeps COPYING — raid5d's rescue retries.
+			 * On an interrupt just checkpoint the mark. */
 			u64 mark = (u64)atomic64_read(&conf->reb_mark);
+			int rd = conf->reb[conf->reb_pop].disk;
 
 			if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+			    test_bit(MD_RECOVERY_RECOVER, &mddev->recovery) &&
 			    mark >= mddev->dev_sectors) {
-				struct rkdcl_reb *r = &conf->reb[conf->reb_pop];
-				int rd = r->disk, rs = r->spare;
-
-				r->disk = r->spare = -1;
-				r->state = RKDCL_ASSIGN_NONE;
-				conf->nreb = 0;		/* single assignment */
-				conf->reb_pop = -1;
-				raidkm_dcl_journal_write(conf, true);
-				pr_info("md/raid:%s: declustered: copy of disk %d from spare col %d COMPLETE — replacement rebuilt, assignment retired\n",
-					mdname(mddev), rd, rs);
+				if (!raidkm_dcl_retire_all(mddev,
+							   "copy complete"))
+					pr_info("md/raid:%s: declustered: copy of disk %d COMPLETE — replacement rebuilt\n",
+						mdname(mddev), rd);
 			} else {
 				raidkm_dcl_journal_write(conf, false);
 			}
@@ -10543,10 +10640,17 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		return reshape_request(mddev, sector_nr, skipped);
 
 	/* Declustered Phase 4: a copy-from-spare rebalance rides md's RECOVER
-	 * for the added replacement — intercept every sync address (RECOVER,
-	 * not REQUESTED) and copy instead of decode. */
+	 * for the added replacement — intercept ONLY a genuine RECOVER pass.
+	 * A dirty-assemble RESYNC or a user check/repair while COPYING must
+	 * fall through to the normal machinery (which runs with degraded
+	 * semantics for R's !In_sync slots): hijacking them would silently
+	 * skip the parity work they exist to do AND mis-drive the copy from
+	 * a pass whose reap never activates R. */
 	if (conf->dcl && conf->reb_pop >= 0 &&
-	    conf->reb[conf->reb_pop].state == RKDCL_ASSIGN_COPYING)
+	    conf->reb[conf->reb_pop].state == RKDCL_ASSIGN_COPYING &&
+	    test_bit(MD_RECOVERY_RECOVER, &mddev->recovery) &&
+	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
+	    !test_bit(MD_RECOVERY_SYNC, &mddev->recovery))
 		return raidkm_dcl_copy_request(mddev, sector_nr, skipped);
 
 	/* Declustered Phase 3: while a population is armed, ANY requested
@@ -10889,14 +10993,25 @@ static void raid5d(struct md_thread *thread)
 		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	}
 	/* A COPYING assignment rides md's own RECOVER for the recovering
-	 * replacement — just nudge md_check_recovery to (re)start it; the
-	 * copy_request branch intercepts the RECOVER sync addresses. */
+	 * replacement — nudge md_check_recovery to (re)start it; the
+	 * copy_request branch intercepts the RECOVER sync addresses.  When
+	 * no RECOVER can ever service it (replacement absent/Faulty) or the
+	 * copy is done but its retire journal needs a retry, queue the
+	 * rescue worker instead: raid5d must never quiesce itself, and a
+	 * bare re-nudge would spin forever. */
 	if (conf->dcl && conf->reb_pop >= 0 &&
 	    conf->reb[conf->reb_pop].state == RKDCL_ASSIGN_COPYING &&
-	    md_is_rdwr(mddev) &&
-	    !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
-	    !test_bit(MD_RECOVERY_NEEDED, &mddev->recovery))
-		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	    md_is_rdwr(mddev)) {
+		int cX = conf->reb[conf->reb_pop].disk;
+		struct md_rdev *crdev = conf->disks[cX].rdev;
+
+		if (!crdev || test_bit(Faulty, &crdev->flags) ||
+		    (u64)atomic64_read(&conf->reb_mark) >= mddev->dev_sectors)
+			queue_work(system_unbound_wq, &conf->dcl_rescue_work);
+		else if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
+			 !test_bit(MD_RECOVERY_NEEDED, &mddev->recovery))
+			set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	}
 
 	/* Declustered auto-arm RESCAN: the error-handler park (reb_want) is
 	 * a one-shot single slot, so on its own it drops (a) the second of
@@ -12803,6 +12918,8 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		if (raidkm_layout_is_dcl(mddev->new_layout)) {
 			if (raidkm_dcl_load(conf, mddev))
 				goto abort;
+			INIT_WORK(&conf->dcl_rescue_work,
+				  raidkm_dcl_rescue_worker);
 			/* v1 exclusions — refuse rather than run wrong */
 			if (mddev->bitmap_info.offset ||
 			    mddev->bitmap_info.file) {
@@ -13683,39 +13800,19 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 			conf->reb[0].state == RKDCL_ASSIGN_POPULATED &&
 			conf->disks[conf->reb[0].disk].rdev == NULL &&
 			(rdev->raid_disk < 0 ||
-			 rdev->raid_disk == conf->reb[0].disk);
+			 rdev->raid_disk == conf->reb[0].disk) &&
+			/* the copy buffers are chunk-order contiguous pages;
+			 * a chunk too large to buffer takes the decode leg */
+			get_order((unsigned int)conf->chunk_sectors << 9) <=
+				MAX_PAGE_ORDER;
 
 	if (conf->dcl && !copy_eligible) {
 		if (conf->reb_pop >= 0)
 			return -EBUSY;
 		if (conf->nreb) {
-			int saved_nreb = conf->nreb;
-			int ri;
-
-			raid5_quiesce(mddev, 1);
-			conf->nreb = 0;
-			ret = raidkm_dcl_journal_write(conf, true);
-			if (ret) {	/* journal must land before the map moves;
-					 * restore INSIDE the quiesce so no write
-					 * slips through the retired window (reb[]
-					 * entries are untouched above nreb) */
-				conf->nreb = saved_nreb;
-			} else {
-				/* Scrub the retired entries (still inside the
-				 * quiesce): a later arm's publication window
-				 * must never expose a stale POPULATED entry
-				 * to the lock-free readers. */
-				for (ri = 0; ri < saved_nreb; ri++) {
-					conf->reb[ri].disk  = -1;
-					conf->reb[ri].spare = -1;
-					conf->reb[ri].state = RKDCL_ASSIGN_NONE;
-				}
-			}
-			raid5_quiesce(mddev, 0);
+			ret = raidkm_dcl_retire_all(mddev, "replacement add");
 			if (ret)
 				return ret;
-			pr_info("md/raid:%s: declustered: %d spare assignment(s) retired; recovery will rebuild the replacement (re-arm population for any still-missing disks)\n",
-				mdname(mddev), saved_nreb);
 		}
 	}
 
@@ -13761,26 +13858,57 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		}
 	}
 out:
-	/* Phase 4: R admitted (recovering) at the POPULATED assignment's
-	 * slot X — arm COPYING so the RECOVER md is about to start copies
-	 * from the spare instead of decoding.  Journal-first; on journal
-	 * failure fall back to the plain (decode) recovery by leaving the
-	 * assignment POPULATED (retire happens at the next --add attempt or
-	 * via the completion path once redundancy is confirmed). */
-	if (!err && copy_eligible && rdev->raid_disk == conf->reb[0].disk) {
-		atomic64_set(&conf->reb_mark, 0);
-		conf->reb_journal_mark = 0;
-		conf->reb[0].state = RKDCL_ASSIGN_COPYING;
-		WRITE_ONCE(conf->reb_pop, 0);
-		if (raidkm_dcl_journal_write(conf, true)) {
-			conf->reb[0].state = RKDCL_ASSIGN_POPULATED;
-			WRITE_ONCE(conf->reb_pop, -1);
-			pr_warn("md/raid:%s: declustered: copy-rebalance journal failed; falling back to decode recovery\n",
-				mdname(mddev));
-		} else {
-			pr_info("md/raid:%s: declustered: copy-from-spare rebalance armed for disk %d (spare col %d) -> replacement\n",
-				mdname(mddev), conf->reb[0].disk,
-				conf->reb[0].spare);
+	/* Phase 4: copy_eligible deferred the retire-all in the hope that
+	 * the replacement fills the assignment's slot X.  Resolve now that
+	 * the admit picked a slot:
+	 *
+	 *  - landed at X: arm COPYING under a full quiesce (a lock-free
+	 *    reader must never pair the NEW state with the STALE mark
+	 *    (dev_sectors from the completed population): covered=true
+	 *    would route a write to blank R and lose it from the spare).
+	 *  - landed elsewhere (another empty slot won), or the COPYING
+	 *    journal failed: the deferred retire-all is REQUIRED before any
+	 *    stock RECOVER runs — under POPULATED the redirect sends slot-X
+	 *    rebuild writes to the spare, so R would reach In_sync without
+	 *    ever being written (latent garbage exposed at a later retire).
+	 *  - retire journal ALSO failed: un-admit R and fail the add — no
+	 *    state may run stock recovery under a live assignment. */
+	if (!err && copy_eligible) {
+		bool at_x = (rdev->raid_disk == conf->reb[0].disk);
+		int jerr = 0;
+
+		if (at_x) {
+			raid5_quiesce(mddev, 1);
+			atomic64_set(&conf->reb_mark, 0);
+			conf->reb_journal_mark = 0;
+			conf->reb[0].state = RKDCL_ASSIGN_COPYING;
+			WRITE_ONCE(conf->reb_pop, 0);
+			jerr = raidkm_dcl_journal_write(conf, true);
+			if (jerr) {
+				conf->reb[0].state = RKDCL_ASSIGN_POPULATED;
+				WRITE_ONCE(conf->reb_pop, -1);
+			}
+			raid5_quiesce(mddev, 0);
+			if (!jerr)
+				pr_info("md/raid:%s: declustered: copy-from-spare rebalance armed for disk %d (spare col %d) -> replacement\n",
+					mdname(mddev), conf->reb[0].disk,
+					conf->reb[0].spare);
+		}
+		if (!at_x || jerr) {
+			jerr = raidkm_dcl_retire_all(mddev, at_x ?
+				"copy arm journal failed" :
+				"replacement filled a different slot");
+			if (jerr) {
+				/* can't journal ANY safe state: un-admit R
+				 * (md's add path unbinds the rdev on error)
+				 * rather than run stock recovery under a
+				 * live assignment */
+				p = conf->disks + rdev->raid_disk;
+				if (p->rdev == rdev)
+					WRITE_ONCE(p->rdev, NULL);
+				log_modify(conf, rdev, false);
+				err = jerr;
+			}
 		}
 	}
 	print_raid5_conf(conf);

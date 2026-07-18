@@ -986,6 +986,14 @@ struct r5conf {
 						 * error handler under
 						 * device_lock, serviced by
 						 * raid5d), -1 if none	*/
+	struct work_struct	dcl_rescue_work; /* Phase-4 COPYING rescue:
+						 * retire when the replacement
+						 * is absent/Faulty or a
+						 * completed copy's retire
+						 * journal needs a retry —
+						 * queued by raid5d, runs in
+						 * process context (raid5d
+						 * itself must never quiesce) */
 	bool			dcl_auto;	/* arm population on member
 						 * failure (sysfs rk_dcl_auto,
 						 * default off, not persisted) */

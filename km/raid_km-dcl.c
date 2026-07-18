@@ -139,11 +139,21 @@ static bool dcl_selftest_chains(struct dcl_geom *ge)
 				if (i < nas) {
 					probe = as[i].disk;
 				} else {
+					/* live probe: restart the collision
+					 * scan after each bump — a single
+					 * pass can land on an earlier entry
+					 * when disks are unsorted */
 					probe = (as[0].disk + 1) % ge->N;
-					for (k2 = 0; k2 < nas; k2++)
-						if (as[k2].disk == probe)
+					k2 = 0;
+					while (k2 < nas) {
+						if (as[k2].disk == probe) {
 							probe = (probe + 1) %
 								ge->N;
+							k2 = 0;
+						} else {
+							k2++;
+						}
+					}
 				}
 				for (cc = 0; cc < gcols; cc++)
 					if (dcl_chain_traverses(ge, as, nas,
@@ -299,11 +309,13 @@ static int dcl_selftest_set(const char *val, const struct kernel_param *kp)
 	}
 	ge.seed = seed;
 
-	/* geometry limits: doc §4 C1 + field caps */
-	if (ge.m < 2 || ge.g <= ge.m || ge.N < ge.g + ge.s || ge.N > 255 ||
-	    !ge.nbase || ge.nbase > DCL_ST_MAX_NBASE ||
+	/* geometry limits: doc §4 C1 + field caps.  s >= 1 matches mdadm's
+	 * rkdcl_validate_geometry AND protects the chain sweep, whose
+	 * synthetic assignment set indexes reb[nas-1] with nas=min(s,3). */
+	if (ge.m < 2 || ge.g <= ge.m || !ge.s || ge.N < ge.g + ge.s ||
+	    ge.N > 255 || !ge.nbase || ge.nbase > DCL_ST_MAX_NBASE ||
 	    (ge.N - ge.s) % ge.g) {
-		pr_err("raidkm: dcl_selftest bad geometry (C1: (N-s)%%g==0; N<=255, m>=2, nbase<=%u)\n",
+		pr_err("raidkm: dcl_selftest bad geometry (C1: (N-s)%%g==0; N<=255, m>=2, s>=1, nbase<=%u)\n",
 		       DCL_ST_MAX_NBASE);
 		return -EINVAL;
 	}
@@ -396,12 +408,19 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 			u32 j  = le32_to_cpu(blk->assign[i].spare);
 			u32 st = le32_to_cpu(blk->assign[i].state);
 
-			/* table entries are ACTIVE by definition */
+			/* table entries are ACTIVE by definition.  COPYING
+			 * only reaches v3 once multi-assignment copy exists
+			 * (today build_blk emits v2 for nreb==1), but the
+			 * three v2/v3 sites (verify/load/build) must agree
+			 * on the format ahead of that. */
 			if (st != RKDCL_ASSIGN_POPULATING &&
-			    st != RKDCL_ASSIGN_POPULATED)
+			    st != RKDCL_ASSIGN_POPULATED &&
+			    st != RKDCL_ASSIGN_COPYING)
 				return -EINVAL;
-			if (st == RKDCL_ASSIGN_POPULATING && ++npop > 1)
-				return -EINVAL;	/* sequential rule */
+			/* at most ONE in-flight pass (sequential rule) */
+			if ((st == RKDCL_ASSIGN_POPULATING ||
+			     st == RKDCL_ASSIGN_COPYING) && ++npop > 1)
+				return -EINVAL;
 			if (x >= le32_to_cpu(blk->pool_disks) ||
 			    j >= le32_to_cpu(blk->spare_cols))
 				return -EINVAL;
@@ -555,8 +574,9 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 			conf->reb[i].disk  = le32_to_cpu(blk->assign[i].disk);
 			conf->reb[i].spare = le32_to_cpu(blk->assign[i].spare);
 			conf->reb[i].state = le32_to_cpu(blk->assign[i].state);
-			if (conf->reb[i].state == RKDCL_ASSIGN_POPULATING)
-				conf->reb_pop = i;
+			if (conf->reb[i].state == RKDCL_ASSIGN_POPULATING ||
+			    conf->reb[i].state == RKDCL_ASSIGN_COPYING)
+				conf->reb_pop = i;	/* pass mid-flight */
 		}
 		conf->nreb = n;
 	}
@@ -615,6 +635,8 @@ void raidkm_dcl_free(struct r5conf *conf)
 {
 	if (!conf->dcl)
 		return;
+	/* the raid5d thread is already stopped, so no re-queue can race */
+	cancel_work_sync(&conf->dcl_rescue_work);
 	kvfree(conf->dcl->base);
 	kvfree(conf->dcl->ibase);
 	kfree(conf->dcl);

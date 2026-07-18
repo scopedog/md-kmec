@@ -139,6 +139,9 @@ rk_wait_idle
 if rk_pop_show | grep -q "^populated"; then
 	rk_pass "population COMPLETE ($(rk_pop_show))"
 else
+	echo "  DIAG: array_state=$(cat /sys/block/$MDNAME/md/array_state 2>&1) sync_action=$(cat /sys/block/$MDNAME/md/sync_action 2>&1)"
+	echo "  DIAG: mdstat: $(grep -A1 "$MDNAME" /proc/mdstat | tr '\n' ' ')"
+	echo "  DIAG: dmesg tail: $(sudo dmesg | tail -6 | tr '\n' '|')"
 	rk_fail "population did not complete: $(rk_pop_show)"; rk_summary; exit 1
 fi
 

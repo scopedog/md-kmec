@@ -578,13 +578,22 @@ static int check_chains(const struct dcl_geom *ge, const struct dcl_assign *as,
 			if (i < nas) {
 				probe = as[i].disk;
 			} else {
-				/* one live (unassigned) probe per row */
+				/* live probe: restart the collision scan
+				 * after each bump — a single pass can land
+				 * on an earlier entry when disks are
+				 * unsorted */
 				u32 k2;
 
 				probe = (as[0].disk + 1) % ge->N;
-				for (k2 = 0; k2 < nas; k2++)
-					if (as[k2].disk == probe)
+				k2 = 0;
+				while (k2 < nas) {
+					if (as[k2].disk == probe) {
 						probe = (probe + 1) % ge->N;
+						k2 = 0;
+					} else {
+						k2++;
+					}
+				}
 			}
 			for (cc = 0; cc < gcols; cc++)
 				if (dcl_chain_traverses(ge, as, nas, row,
