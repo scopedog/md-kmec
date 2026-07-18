@@ -844,6 +844,38 @@ rebuild load is rotation-symmetric.
 > 78+2 array — **17.5×**. It even beats a narrow 11+2 classic (51.9 s), because
 > the distributed spare removes the single-writer bottleneck.
 
+### Rebuild load — where the win comes from
+
+The wall-clock headline above follows from *where the rebuild I/O lands*. A
+classic rebuild **funnels every reconstructed byte onto the one hot spare** — so
+rebuild throughput is capped by a single disk's write speed no matter how wide
+the array — while a declustered rebuild spreads those writes across the whole
+pool. Measured with exact per-disk I/O counters
+(`tools/raidkm-bench-declustered-rebuild-load.sh`), which makes the ratios
+device-count-independent (so they hold on any box, not just a wide physical rig):
+
+| Pool | Group | Rebuild-write funnelling¹ | Survivor read at rebalance² |
+|------|-------|---------------------------|-----------------------------|
+| N=14 | g=6 (4+2)   | **14.2×** | **5.0×**  |
+| N=42 | g=10 (8+2)  | **42.5×** | **9.3×**  |
+| N=80 | g=13 (11+2) | **85.0×** | **12.6×** |
+
+¹ **Write funnelling** = busiest single disk's write during the rebuild, classic
+÷ declustered. In the N=80 classic rebuild all 255 MiB of write hit the one
+spare (write spread 13.4× across the 13 members); declustered's busiest disk
+wrote just 3 MiB (spread 1.5×). The ratio ≈ N — the wider the pool, the more the
+single-writer bottleneck is removed.
+
+² **Survivor read** = total bytes read off survivors to bring a fresh disk back,
+copy-from-spare rebalance ÷ decode rebuild. Decode reads *g−1* survivors per lost
+chunk; copy-from-spare reads the already-populated spare (~1 disk's worth). The
+ratio ≈ g−1. (Copy front-loads a one-time population decode paid when the disk
+first failed; the harness reports it separately.)
+
+Counters are exact regardless of device count; the wall-clock headline needs
+many physical spindles, but these distribution ratios are the mechanism it
+follows from.
+
 ### Creating a declustered array
 
 ```sh
