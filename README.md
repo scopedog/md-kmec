@@ -960,6 +960,13 @@ block's CRC from the spare disk's key to the replacement's alongside the bytes
 travels with it, so the first read of the new disk detects the mismatch and heals
 by decode). Gate: `tools/raidkm-test-declustered-csum.sh`.
 
+Chunk-aligned reads take the same **direct read bypass** as classic raidkm
+(2026-07-19): a healthy declustered array serves an in-chunk read straight from
+the mapped pool disk (forward permutation + redirect chain), never touching the
+stripe cache; with native checksums the bypass read is still verified at
+completion against the physical disk's CRCs, and a mismatch is rechecked and
+healed through the stripe cache. Gate: `tools/raidkm-test-declustered-aligned.sh`.
+
 ### What v1 does not do
 
 A declustered array currently refuses (at create, rather than running wrong):

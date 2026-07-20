@@ -352,6 +352,29 @@ static inline int raidkm_dcl_group_of(struct r5conf *conf, sector_t logical)
 	return dcol / ge->k;
 }
 
+/* Declustered: the physical pool disk a chunk-aligned bypass READ of this
+ * logical sector is served from — the forward map for the slot's group
+ * column, then the READ-side redirect chain (the same map the stripe path's
+ * endio rdev lookups and csum keying use; safe against concurrent mark
+ * movement by the monotone-mark/quiesced-retreat argument there, and the
+ * degraded==0 bypass gate means an active assignment is never in the way
+ * in practice).  Identity (== slot) on non-declustered arrays. */
+static inline int raidkm_dcl_read_pdisk(struct r5conf *conf, sector_t logical,
+					sector_t member_sector, int slot)
+{
+	sector_t row;
+	int disk;
+
+	if (!conf->dcl)
+		return slot;
+	row = member_sector;
+	sector_div(row, conf->chunk_sectors);
+	disk = dcl_disk(conf->dcl, row,
+			raidkm_dcl_group_of(conf, logical) * conf->dcl->g +
+			slot);
+	return raidkm_dcl_redirect(conf, disk, row, false);
+}
+
 static inline void lock_device_hash_lock(struct r5conf *conf, int hash)
 	__acquires(&conf->device_lock)
 {
@@ -8285,7 +8308,7 @@ static bool raidkm_csum_bio_verifiable(struct r5conf *conf, struct bio *bio)
 static int raidkm_csum_verify_abio(struct r5conf *conf, struct bio *bio,
 				   bool may_block)
 {
-	int dd_idx;
+	int dd_idx, member;
 	sector_t msec = raid5_compute_sector(conf, bio->bi_iter.bi_sector, 0,
 					     &dd_idx, NULL);
 	unsigned long blk = raidkm_csum_blkidx(conf, msec);
@@ -8297,6 +8320,12 @@ static int raidkm_csum_verify_abio(struct r5conf *conf, struct bio *bio,
 
 	if (raidkm_csum_rederive(conf))
 		return 0;			/* resync window: CRCs stale */
+
+	/* CRCs are keyed by PHYSICAL disk; on declustered arrays that is the
+	 * mapped/redirected member the bypass read was served from, not the
+	 * in-group slot (identity when !conf->dcl). */
+	member = raidkm_dcl_read_pdisk(conf, bio->bi_iter.bi_sector, msec,
+				       dd_idx);
 
 	bio_for_each_segment(bvl, bio, iter) {
 		unsigned int off = 0, len = bvl.bv_len;
@@ -8320,12 +8349,12 @@ static int raidkm_csum_verify_abio(struct r5conf *conf, struct bio *bio,
 				int hit;
 
 				mutex_lock(&s->lock);
-				hit = raidkm_csum_expected(s, dd_idx, blk, &want);
+				hit = raidkm_csum_expected(s, member, blk, &want);
 				mutex_unlock(&s->lock);
 				if (hit && crc != want)
 					goto bad;
 			} else {
-				int hit = raidkm_csum_peek(conf, dd_idx, blk,
+				int hit = raidkm_csum_peek(conf, member, blk,
 							   &want);
 
 				if (hit < 0) {
@@ -8438,7 +8467,7 @@ static int raid5_read_one_chunk(struct mddev *mddev, struct bio *raid_bio)
 	struct bio *align_bio;
 	struct md_rdev *rdev;
 	sector_t sector, end_sector;
-	int dd_idx;
+	int dd_idx, pdisk;
 	bool did_inc;
 
 	if (!in_chunk_boundary(mddev, raid_bio)) {
@@ -8453,10 +8482,15 @@ static int raid5_read_one_chunk(struct mddev *mddev, struct bio *raid_bio)
 	if (r5c_big_stripe_cached(conf, sector))
 		return 0;
 
-	rdev = conf->disks[dd_idx].replacement;
+	/* declustered: dd_idx is the in-group slot; the member holding it is
+	 * the mapped (and possibly redirected) physical pool disk */
+	pdisk = raidkm_dcl_read_pdisk(conf, raid_bio->bi_iter.bi_sector,
+				      sector, dd_idx);
+
+	rdev = conf->disks[pdisk].replacement;
 	if (!rdev || test_bit(Faulty, &rdev->flags) ||
 	    rdev->recovery_offset < end_sector) {
-		rdev = conf->disks[dd_idx].rdev;
+		rdev = conf->disks[pdisk].rdev;
 		if (!rdev)
 			return 0;
 		if (test_bit(Faulty, &rdev->flags) ||
@@ -9103,7 +9137,7 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 	 * later we might have to read it again in order to reconstruct
 	 * data on failed drives.
 	 */
-	if (rw == READ && mddev->degraded == 0 && !conf->dcl &&
+	if (rw == READ && mddev->degraded == 0 &&
 	    mddev->reshape_position == MaxSector &&
 	    (!conf->csum || raidkm_csum_bio_verifiable(conf, bi))) {
 		/*
@@ -9114,6 +9148,15 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 		 * mismatch re-reads through the stripe cache, which rechecks
 		 * and heals.  Only unaligned/partial-block reads -- which the
 		 * per-4K CRCs cannot check -- still take the stripe path.
+		 *
+		 * Declustered arrays take the bypass too: the member is the
+		 * dcl forward map + READ-side redirect for the slot
+		 * (raidkm_dcl_read_pdisk), the returned sector is already the
+		 * device sector, and the retry/recheck leg
+		 * (retry_aligned_read) is (sector, group) stripe-identity
+		 * aware.  The degraded==0 gate keeps the bypass off while a
+		 * spare assignment is mid-flight (a live assignment implies a
+		 * failed or still-recovering member).
 		 */
 		bi = chunk_aligned_read(mddev, bi);
 		if (!bi)
