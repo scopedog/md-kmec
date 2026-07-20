@@ -994,6 +994,19 @@ struct r5conf {
 						 * queued by raid5d, runs in
 						 * process context (raid5d
 						 * itself must never quiesce) */
+	struct mutex		dcl_retire_mutex; /* serializes reb[] retires
+						 * (retire_one/retire_all) and
+						 * the copy band against each
+						 * other: the sync thread holds
+						 * no reconfig lock, the rescue
+						 * worker only mddev_lock, and
+						 * raid5_quiesce is a state
+						 * machine — without this two
+						 * retires can double-compact
+						 * reb[] and a mid-band rescue
+						 * would break the band's
+						 * quiesce nesting.  Order:
+						 * mutex BEFORE raid5_quiesce. */
 	bool			dcl_auto;	/* arm population on member
 						 * failure (sysfs rk_dcl_auto,
 						 * default off, not persisted) */

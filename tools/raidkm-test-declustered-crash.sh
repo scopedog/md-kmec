@@ -29,6 +29,10 @@
 # legit).  The re-assemble (INCLUDING the replacement) must resume the copy
 # from the strict-journaled band mark — R's above-mark garbage is fenced by
 # the offset-split — and finish to degraded=0 with byte-exact content.
+# DCL_CRASH_MCOPY=1 (needs s >= 2): §13 multi-assignment-copy variant —
+# BOTH populations complete, F's wiped device is re-added, the cut lands
+# mid-COPY on the v3 COPYING@F+POPULATED@F2 journal; the resume must keep
+# F2's assignment, finish F's copy, and PARTIAL-retire to degraded=1.
 # Configurable: DCL_N/G/M/SC/NBASE/SEED (geometry), DCL_CRASH_ITERS (4),
 #               DCL_CRASH_DISK_MB (192), DCL_CRASH_BACK dir.
 # OPT-IN reliability gate — not part of the default raidkm-test.sh runner.
@@ -158,11 +162,18 @@ read -r -a FLCS <<< "$(awk -v F="$F" '$1 !~ /^#/ && $6 == F && $1 < 1536 && !see
 # BOTH assignments and finish the second population.
 MULTI=${DCL_CRASH_MULTI:-0}
 COPY=${DCL_CRASH_COPY:-0}
-if [ "$MULTI" = 1 ] && [ "$COPY" = 1 ]; then
-	echo "ERROR: DCL_CRASH_MULTI and DCL_CRASH_COPY are exclusive" >&2; exit 1
+# DCL_CRASH_MCOPY=1 (needs s >= 2): §13 multi-assignment-copy variant —
+# populate F AND F2 to POPULATED, re-add F's wiped device, cut mid-COPY.
+# The v3 journal carries COPYING@F + POPULATED@F2 across the crash; the
+# resume must keep F2's assignment intact, finish F's copy from the
+# journaled band mark, and the completion's PARTIAL retire leaves exactly
+# F2's assignment active (degraded back to 1, not 0).
+MCOPY=${DCL_CRASH_MCOPY:-0}
+if [ $((MULTI + COPY + MCOPY)) -gt 1 ]; then
+	echo "ERROR: DCL_CRASH_MULTI/_COPY/_MCOPY are exclusive" >&2; exit 1
 fi
-if [ "$MULTI" = 1 ]; then
-	[ "$SC" -ge 2 ] || { echo "ERROR: DCL_CRASH_MULTI needs s >= 2" >&2; exit 1; }
+if [ "$MULTI" = 1 ] || [ "$MCOPY" = 1 ]; then
+	[ "$SC" -ge 2 ] || { echo "ERROR: this variant needs s >= 2" >&2; exit 1; }
 	F2=$(awk -v f="$F" '$1 !~ /^#/ && $6 != f {print $6; exit}' "$RK_TMP/vec.tsv")
 fi
 
@@ -211,6 +222,44 @@ for it in $(seq 1 "$ITERS"); do
 			sleep 0.02
 		done
 		precopy=$(echo "$precopy" | tr '\n' ';')
+	elif [ "$MCOPY" = 1 ]; then
+		# BOTH populations run to POPULATED at full speed; the cut
+		# targets the multi-assignment COPY of F (F2's stays live)
+		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
+			rk_fail "$tag: arming F failed"; break; }
+		rk_wait_idle
+		rk_pop_show | grep -q "^populated $F " || {
+			rk_fail "$tag: first population did not complete"; break; }
+		FDEV2="${DEVS[$F2]}"
+		rk_fail_disks "$FDEV2"
+		sudo "$MDADM" --remove "$MD" "$FDEV2" > /dev/null 2>&1
+		echo "$F2" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
+			rk_fail "$tag: arming F2 failed"; break; }
+		rk_wait_idle
+		rk_pop_show | grep -q "^populated $F2 " || {
+			rk_fail "$tag: second population did not complete"; break; }
+		sudo dd if=/dev/zero of="$FDEV" bs=1M count=8 status=none 2>/dev/null
+		sudo "$MDADM" --zero-superblock "$FDEV" 2>/dev/null
+		# throttle so the cut deterministically lands MID-copy (the copy
+		# honors sync_speed_max per band); the post-crash assemble is a
+		# fresh array at default speed, so the resume completes fast.
+		# Without this a fast box finishes the copy inside crash_now's
+		# suspend loop and every cell degenerates to complete-at-cut.
+		rk_throttle 8192
+		rk_add_disks "$FDEV"
+		for i in $(seq 1 300); do
+			precopy=$(rk_pop_show | grep -v "^populated $F2 ")
+			case "$precopy" in copying*|""|none*) break;; esac
+			sleep 0.02
+		done
+		# random extra delay so some iterations cut MID-band (bands
+		# journal every ~8s at the 8192 KB/s throttle): mixes mark-0
+		# and deeper-mark resume cells instead of always cutting at
+		# the first sight of COPYING
+		case "$precopy" in copying*)
+			sleep "${DCL_CRASH_DELAY:-$(( RANDOM % 12 ))}"
+			precopy=$(rk_pop_show | grep -v "^populated $F2 ");; esac
+		precopy=$(echo "$precopy" | tr '\n' ';')
 	elif [ "$MULTI" = 1 ]; then
 		# first population runs to POPULATED at full speed; the crash
 		# targets the SECOND population (v3 journal on disk)
@@ -230,7 +279,7 @@ for it in $(seq 1 "$ITERS"); do
 		echo "$F" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1 || {
 			rk_fail "$tag: arming failed"; break; }
 	fi
-	if [ "$COPY" = 1 ]; then
+	if [ "$COPY" = 1 ] || [ "$MCOPY" = 1 ]; then
 		delay=0		# the poll above IS the timing; cut immediately
 	else
 		delay=${DCL_CRASH_DELAY:-$(( (RANDOM % 9) + 1 ))}	# 1..9s: pre-checkpoint AND mid-pass cells
@@ -250,9 +299,13 @@ for it in $(seq 1 "$ITERS"); do
 
 	SURV=()
 	for d in "${DEVS[@]}"; do
-		if [ "$COPY" != 1 ]; then	# COPY re-assembles WITH R
+		# COPY/MCOPY re-assemble WITH R (F's device); MCOPY and MULTI
+		# leave F2's device out (its assignment must survive the crash)
+		if [ "$COPY" != 1 ] && [ "$MCOPY" != 1 ]; then
 			[ "$d" = "$FDEV" ] && continue
-			[ "$MULTI" = 1 ] && [ "$d" = "${FDEV2:-}" ] && continue
+		fi
+		if [ "$MULTI" = 1 ] || [ "$MCOPY" = 1 ]; then
+			[ "$d" = "${FDEV2:-}" ] && continue
 		fi
 		SURV+=("$d")
 	done
@@ -268,23 +321,81 @@ for it in $(seq 1 "$ITERS"); do
 		echo "  DIAG: state: $(rk_pop_show | tr '\n' '|')"
 		rk_fail "$tag: first assignment lost across the crash"; break
 	fi
-	if [ "$COPY" = 1 ]; then
+	# mcopy: F2's POPULATED assignment was strict-journaled long before
+	# the cut — every election outcome must preserve it.
+	if [ "$MCOPY" = 1 ] && ! rk_pop_show | grep -q "^populated $F2 "; then
+		echo "  DIAG: state: $(rk_pop_show | tr '\n' '|')"
+		rk_fail "$tag: second assignment lost across the crash"; break
+	fi
+	if [ "$COPY" = 1 ] || [ "$MCOPY" = 1 ]; then
 		# Copy cells: COPYING resumed from the strict-journaled band
-		# mark, or the copy had completed before the cut (state none).
-		# POPULATED would mean the strict arm journal was lost — fail.
-		state=$(rk_pop_show)
+		# mark, or the copy had completed before the cut (state none;
+		# for mcopy "none" means F's entry gone, F2's line remains).
+		# POPULATED@F is the pre-arm cell (cut beat the arm journal):
+		# the kernel's unarmed-recovery guard must take the decode leg.
+		if [ "$MCOPY" = 1 ]; then
+			state=$(rk_pop_show | grep -v "^populated $F2 ")
+		else
+			state=$(rk_pop_show)
+		fi
 		case "$state" in
 		copying*)
 			rmark=$(sudo dmesg | sed -n 's/.*resuming copy of disk [0-9]* from mark \([0-9]*\).*/\1/p' | tail -1)
 			rk_pass "$tag: copy resumed from journaled mark ${rmark:-?} (pre-cut: ${precopy:-?})"
 			;;
-		none*)
+		""|none*)
 			rk_pass "$tag: copy complete at the cut (pre-cut: ${precopy:-?})"
+			;;
+		populated*)
+			# pre-arm cell: the cut beat the COPYING arm journal but
+			# R's slot-assigning SB (written by --add) survived.  The
+			# kernel's unarmed-recovery guard must retire the
+			# assignment(s) and let the decode leg rebuild R — the
+			# end-state asserts below (copy: degraded=0+none; mcopy:
+			# the fallback branch) cover it.
+			rk_pass "$tag: cut landed before the copy armed (pre-arm cell; guard takes the decode leg)"
 			;;
 		*)
 			echo "  DIAG: state: $state  dmesg: $(sudo dmesg | tail -6 | tr '\n' '|')"
 			rk_fail "$tag: unexpected copy state '$state' after crash"; break;;
 		esac
+		if [ "$MCOPY" = 1 ]; then
+			# F's copy finishes; degraded 2 -> 1 lands at the reap
+			# (spare_active), which can trail the sysfs state change
+			# — poll it rather than read once
+			for i in $(seq 1 240); do
+				rk_pop_show | grep -q "^copying" || break
+				sleep 0.5
+			done
+			for i in $(seq 1 120); do
+				deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
+				[ "$deg" = 1 ] && break
+				sleep 0.5
+			done
+			if sudo dmesg | grep -qE "[0-9]+ spare assignment\(s\) retired"; then
+				# FALLBACK cell: a copy abort (band failure, or
+				# the unarmed-recovery guard on a pre-arm cut)
+				# retired ALL assignments and the decode leg
+				# rebuilt R — legit, distinct from the
+				# partial-retire happy path.  Content + scrub
+				# below still gate correctness (the scrub reads
+				# every row through the read map, so hosted-row
+				# garbage on R cannot hide).
+				if [ "$deg" = 1 ] && rk_pop_show | grep -q "^none"; then
+					rk_pass "$tag: copy fell back to retire-all + decode (legit fallback cell)"
+				else
+					rk_fail "$tag: fallback end-state wrong (degraded=$deg, $(rk_pop_show | tr '\n' ';'))"
+					break
+				fi
+			elif [ "$deg" = 1 ] &&
+			   rk_pop_show | grep -q "^populated $F2 " &&
+			   ! rk_pop_show | grep -qE "^(populated|copying|populating) $F "; then
+				rk_pass "$tag: copy finished after crash (partial retire; F2's assignment intact)"
+			else
+				rk_fail "$tag: mcopy end-state wrong (degraded=$deg, $(rk_pop_show | tr '\n' ';'))"
+				break
+			fi
+		else
 		rk_wait_full
 		deg=$(cat /sys/block/$MDNAME/md/degraded 2>/dev/null || echo -1)
 		if [ "$deg" = 0 ] && rk_pop_show | grep -q "^none"; then
@@ -292,6 +403,7 @@ for it in $(seq 1 "$ITERS"); do
 		else
 			rk_fail "$tag: copy did not finish (degraded=$deg, $(rk_pop_show | tr '\n' ';'))"
 			break
+		fi
 		fi
 	else
 	if [ "$MULTI" = 1 ]; then
