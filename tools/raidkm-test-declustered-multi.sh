@@ -420,8 +420,16 @@ fi
 # RECOVER never rebuilds hosted spare content).  The fresh add lands at the
 # LOWEST empty slot, so the leg needs an empty slot below both victims:
 # disk 0 plays that role, and a victim that IS disk 0 is substituted by
-# another live disk (any member works as a population victim) — the leg
-# therefore runs on every seed.
+# another live disk (any member works as a population victim).
+#
+# This leg fails a THIRD disk on top of the two POPULATED assignments, so the
+# array must tolerate degraded = assignments + 1.  At m=2 with both spare
+# columns populated, degraded already == max_degraded and the kernel correctly
+# refuses the third --fail (the disk stays a live member), so the non-assigned-
+# slot scenario cannot be set up.  Run it only where redundancy is left to
+# spare (m > 2); at m=2 proceeding would dd-zero a still-live member and
+# corrupt the array.
+if [ "$M" -gt 2 ]; then
 V1=$F1; V2=$F2
 [ "$V1" = 0 ] && { V1=1; [ "$V2" = 1 ] && V1=2; }
 [ "$V2" = 0 ] && { V2=1; [ "$V1" = 1 ] && V2=2; }
@@ -439,9 +447,18 @@ echo "$V2" | sudo tee "/sys/block/$MDNAME/md/rk_dcl_populate" > /dev/null 2>&1
 rk_wait_populated || rk_fail "step9: V2=$V2 re-population stalled: $(rk_pop_show)"
 rk_fail_disks "$FDEV3"
 sudo "$MDADM" --remove "$MD" "$FDEV3" > /dev/null 2>&1
-sudo dd if=/dev/zero of="$FDEV3" bs=1M status=none 2>/dev/null || true
-sudo "$MDADM" --zero-superblock "$FDEV3" 2>/dev/null || true
-rk_add_disks "$FDEV3"
+# DEFENSIVE: never dd-zero a device the kernel did not actually release.  If the
+# --fail/--remove did not take (device still a live array member), zeroing it
+# would silently corrupt the array — the fault this leg is guarded against.
+F3H="/sys/block/$(basename "$FDEV3")/holders"
+for _w in 1 2 3 4; do [ -z "$(ls "$F3H" 2>/dev/null)" ] && break; sleep 0.5; done
+if [ -n "$(ls "$F3H" 2>/dev/null)" ]; then
+	rk_fail "step9: $FDEV3 still an array member after --fail/--remove (kernel refused the 3rd fail) — refusing to dd-zero a live disk"
+else
+	sudo dd if=/dev/zero of="$FDEV3" bs=1M status=none 2>/dev/null || true
+	sudo "$MDADM" --zero-superblock "$FDEV3" 2>/dev/null || true
+	rk_add_disks "$FDEV3"
+fi
 for i in $(seq 1 60); do
 	sudo dmesg | grep -q "spare assignment(s) retired (replacement filled a different slot)" && break
 	sleep 0.5
@@ -467,6 +484,9 @@ for lc in "${ALL_LCS[@]}"; do
 done
 [ $ok = 1 ] && rk_pass "step9: content intact through retire-all + decode rebuilds" \
 	    || rk_fail "step9: content mismatch at lc=$lc"
+else
+	echo "  SKIP: step9 retire-all-fallback leg — needs m>2 (at m=$M/s=$SC a 3rd concurrent failure is beyond tolerance; the kernel correctly refuses it, so the non-assigned-slot scenario cannot be set up)"
+fi
 mm=$(rk_scrub)
 [ "$mm" = 0 ] && rk_pass "final scrub clean (mismatch_cnt=0)" \
 	      || rk_fail "final scrub mismatch_cnt=$mm"
