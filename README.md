@@ -316,6 +316,25 @@ random-I/O table above.  *(brd is RAM-backed and compute-bound; on real disks
 the rebuild is capped by disk write bandwidth, so the gap narrows — the full win
 shows on fast NVMe or when the rebuild is CPU/EC-bound.)*
 
+A three-way rebuild comparison on real NVMe (16 × local SSD, RHEL 10.2,
+`raidkm-standard-benchmark.sh --rebuild-victim`, 16 GiB member) — **declustered**
+vs **classic** on the current build, vs **classic on the pre-declustered build**
+(the parent of the first declustered commit, to isolate any personality
+overhead the declustered code adds to the classic path):
+
+| pool | declustered populate | classic recover (current) | classic recover (pre-dcl) | speedup |
+|---|---|---|---|---|
+| N=14 g=6 (4+2)   | 27.9 s | 57.1 s | 56.8 s | **2.05×** |
+| N=80 g=13 (11+2) | 48.3 s | 761.5 s | 777.5 s | **15.8×** |
+
+Two readings.  **Declustering wins the rebuild** — 15.8× at N=80 (the classic
+78+2 recover is single-writer-bound at ~21 MB/s; the distributed spare fans
+reconstruction across the whole pool).  And **the declustered code adds no
+overhead to the classic path** — current-classic and pre-dcl-classic recover in
+the same time at both scales.  Steady-state fio (6-workload suite, same run)
+shows no classic-path regression either.  See
+`notes/dcl-3way-2026-07-21/RESULTS.md`.
+
 #### Worker-thread tuning detail (single box, RHEL 10.1)
 
 Earlier single-box measurement on the AMD Ryzen 5800X VM (`md-kmec-rhel10`,
@@ -569,7 +588,9 @@ md-kmec/
 │   ├── raidkm-test-reshape-crash.sh    # power-loss/torn-write recovery of the COW reshape (fault-inject build)
 │   ├── raidkm-test-selfheal.sh        # checksum-driven self-heal (NATIVE=1 or dm-integrity)
 │   ├── raidkm-test-csum-thrash.sh     # native-checksum region-cache eviction round-trip
-│   ├── raidkm-standard-benchmark.sh   # fio harness, reused from prototype
+│   ├── raidkm-standard-benchmark.sh   # fio harness (6 workloads) + Test-7
+│   │                                    # rebuild/populate wall-clock item
+│   │                                    # (--rebuild-victim=DEV)
 │   └── raidkm-create.sh               # sysfs array creation; needs adapting
 │                                    # to "raidkm" name / level 71
 └── km/
