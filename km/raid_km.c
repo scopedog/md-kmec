@@ -9071,8 +9071,28 @@ static enum stripe_result make_stripe_request(struct mddev *mddev,
 			ret = STRIPE_SCHEDULE_AND_RETRY;
 			goto out;
 		}
-		if (loc == LOC_AHEAD_OF_RESHAPE)
+		if (loc == LOC_AHEAD_OF_RESHAPE) {
+			/*
+			 * add-parity / add-data change the group width and
+			 * parity count; the dcl stripe path is single-geometry,
+			 * so a stripe built for the un-migrated (old-geometry)
+			 * region would encode it with the wrong width/parity =
+			 * silent corruption.  These reshapes are offline-only
+			 * (rejected at start when the array is in use), but if
+			 * I/O still races one — e.g. a mount slipped in after the
+			 * reshape began — fail it rather than corrupt.  Fail-safe
+			 * and hang-free (no wait).  Pool expansion and spare-count
+			 * keep g and m, so they fall through to the online
+			 * previous-geometry path.
+			 */
+			if (conf->prev_dcl &&
+			    (conf->prev_dcl->g != conf->dcl->g ||
+			     conf->prev_dcl->m != conf->dcl->m)) {
+				bi->bi_status = BLK_STS_IOERR;
+				return STRIPE_FAIL;
+			}
 			previous = 1;
+		}
 	}
 
 	new_sector = raid5_compute_sector(conf, logical_sector, previous,
@@ -9831,6 +9851,11 @@ out:
  * home for this device row.  No decode — the staged row already carries its
  * own per-group parity.  conf->dcl must already be the NEW map.
  */
+/* defined with the band code below; re-keys the row's CRCs after a home write */
+static void raidkm_dcl_reshape_csum_rekey(struct r5conf *conf, sector_t row,
+					  struct page **band, int Nnew,
+					  int npages);
+
 static int raidkm_dcl_replay_commit(struct r5conf *conf, sector_t row)
 {
 	struct dcl_geom *nge = conf->dcl;
@@ -9865,6 +9890,11 @@ static int raidkm_dcl_replay_commit(struct r5conf *conf, sector_t row)
 	}
 	err = raidkm_reshape_write_units(conf, band, Nnew, npages, home,
 					 false, total);
+	/* a COMMIT-phase crash may have lost the band's CRC re-key stores;
+	 * re-run it from the replayed (scratch) bytes — same content, same
+	 * CRCs, closes the stale-key window for the torn band. */
+	if (!err && conf->csum)
+		raidkm_dcl_reshape_csum_rekey(conf, row, band, Nnew, npages);
 out:
 	for (j = 0; j < total; j++)
 		if (band[j])
@@ -9882,38 +9912,94 @@ out:
  * raidkm_reshape_dcl_cow resumes from the right band.  On a bad/foreign journal
  * (mid-reshape but unusable) fail closed rather than run on a stale map.
  */
+/* defined later; the dcl recover rebuilds the group EC tables on a g/m change */
+static int raidkm_build_ec(int m, int k, gfp_t gfp, unsigned char **a_out,
+			   unsigned char **gg_out, unsigned char **gb_out);
+
 static int raidkm_dcl_reshape_recover(struct r5conf *conf,
 				      struct raidkm_reshape_journal *rj)
 {
 	struct mddev *mddev = conf->mddev;
 	int chunk = conf->chunk_sectors;
 	struct dcl_geom *oge = conf->dcl, *nge;
-	u32 oldN = le32_to_cpu(rj->old_raid_disks);
-	u32 newN = le32_to_cpu(rj->new_raid_disks);
-	u32 g = le32_to_cpu(rj->dcl_g), s = le32_to_cpu(rj->dcl_s);
-	u32 nbase = le32_to_cpu(rj->dcl_nbase), m = le32_to_cpu(rj->old_m);
+	u32 oldN  = le32_to_cpu(rj->old_raid_disks);
+	u32 newN  = le32_to_cpu(rj->new_raid_disks);
+	u32 old_g = le32_to_cpu(rj->dcl_old_g), old_s = le32_to_cpu(rj->dcl_old_s);
+	u32 new_g = le32_to_cpu(rj->dcl_g),     new_s = le32_to_cpu(rj->dcl_s);
+	u32 old_m = le32_to_cpu(rj->old_m),     new_m = le32_to_cpu(rj->new_m);
+	u32 nbase = le32_to_cpu(rj->dcl_nbase);
 	u64 old_seed = le64_to_cpu(rj->dcl_old_seed);
 	u64 new_seed = le64_to_cpu(rj->dcl_new_seed);
 	u64 row = le64_to_cpu(rj->frontier_row);
 	u32 phase = le32_to_cpu(rj->phase);
+	u32 old_k = old_g - old_m, new_k = new_g - new_m;
+	bool ec_change;
 	sector_t resume_row;
 	int err;
 
-	/* the journal must describe THIS array: the OLD geom rebuilt from the
-	 * rkdcl block has to match it exactly, and the assembled pool size must
-	 * be the recorded new size. */
-	if (!oge || oge->N != oldN || oge->g != g || oge->s != s ||
-	    oge->nbase != nbase || oge->seed != old_seed ||
-	    (u32)conf->m != m || (u32)conf->raid_disks != newN ||
-	    newN <= oldN || (newN - s) % g) {
-		pr_warn("md/raid:%s: dcl reshape recover: foreign/mismatched journal (N %u->%u g%u m%u s%u) — refusing\n",
-			mdname(mddev), oldN, newN, g, m, s);
+	/*
+	 * The journal must describe THIS array: the OLD geom rebuilt from the
+	 * (not-yet-finalized) rkdcl block has to match the journal's OLD side
+	 * exactly, and conf must already carry the NEW parity count and pool
+	 * size (both set from new_layout at assembly).  Handles every forward
+	 * transition — pool expansion (g/m/s fixed), add-parity (m,g up),
+	 * add-data (k,g up) and spare-count (s changes, newN == oldN).  A
+	 * capacity shrink (newN < oldN) is not a supported reshape.
+	 */
+	if (!oge || oge->N != oldN || oge->g != old_g || oge->s != old_s ||
+	    oge->m != old_m || oge->nbase != nbase || oge->seed != old_seed ||
+	    (u32)conf->m != new_m || (u32)conf->raid_disks != newN ||
+	    newN < oldN || new_g < new_m + 1 || new_s < 1 ||
+	    (newN - new_s) % new_g) {
+		pr_warn("md/raid:%s: dcl reshape recover: foreign/mismatched journal (N %u->%u g %u->%u m %u->%u s %u->%u) — refusing\n",
+			mdname(mddev), oldN, newN, old_g, new_g, old_m, new_m,
+			old_s, new_s);
 		return -EINVAL;
 	}
+	ec_change = (new_m != old_m || new_k != old_k);
 
-	nge = raidkm_dcl_geom_new(newN, g, m, s, nbase, new_seed);
+	nge = raidkm_dcl_geom_new(newN, new_g, new_m, new_s, nbase, new_seed);
 	if (!nge)
 		return -ENOMEM;
+
+	/*
+	 * A group-geometry change (add-parity / add-data) alters the per-group
+	 * (k,m), so the assembly-time EC tables — sized from the OLD on-disk k —
+	 * no longer match the NEW map the migration writes with.  Rebuild both
+	 * sets exactly as raidkm_dcl_start_reshape does for the live reshape: the
+	 * NEW set for nge (used by migrate_band_dcl's encode) and the OLD set for
+	 * oge (the un-migrated region).  Done before touching conf so a failure
+	 * leaves it recoverable.
+	 */
+	if (ec_change) {
+		unsigned char *na, *ngg, *ngb, *pa, *pgg, *pgb;
+
+		if (raidkm_build_ec(new_m, new_k, GFP_KERNEL, &na, &ngg, &ngb)) {
+			raidkm_dcl_geom_destroy(nge);
+			return -ENOMEM;
+		}
+		if (raidkm_build_ec(old_m, old_k, GFP_KERNEL, &pa, &pgg, &pgb)) {
+			kfree(na);
+			kfree(ngg);
+			kfree(ngb);
+			raidkm_dcl_geom_destroy(nge);
+			return -ENOMEM;
+		}
+		kfree(conf->ec_a_matrix);
+		kfree(conf->ec_g_tbls_gfni);
+		kfree(conf->ec_g_tbls_base);
+		conf->ec_a_matrix    = na;
+		conf->ec_g_tbls_gfni = ngg;
+		conf->ec_g_tbls_base = ngb;
+		kfree(conf->prev_ec_a_matrix);
+		kfree(conf->prev_ec_g_tbls_gfni);
+		kfree(conf->prev_ec_g_tbls_base);
+		conf->prev_ec_a_matrix    = pa;
+		conf->prev_ec_g_tbls_gfni = pgg;
+		conf->prev_ec_g_tbls_base = pgb;
+		conf->prev_m = old_m;
+		conf->max_degraded = max_t(int, new_m, old_m);
+	}
 
 	/* install the dual map; from here free_conf frees both on any abort */
 	conf->prev_dcl = oge;
@@ -9965,13 +10051,17 @@ static int raidkm_reshape_recover(struct r5conf *conf)
 
 	err = raidkm_reshape_jread(conf, &rj);
 	if (err == -ENOENT) {
-		/* No journal.  A declustered array whose pool size (raid_disks)
-		 * already exceeds its on-disk geometry (conf->dcl->N, read from
-		 * the not-yet-finalized rkdcl block) is a reshape interrupted
-		 * with an unreadable journal — fail closed rather than run on a
-		 * stale map. */
-		if (conf->dcl && (u32)conf->dcl->N != (u32)conf->raid_disks) {
-			pr_warn("md/raid:%s: dcl pool size %d != geometry %u with no reshape journal — refusing\n",
+		/* No journal.  We are only called with the superblock saying a
+		 * reshape is in flight, and a declustered reshape writes its
+		 * first journal record (in raidkm_dcl_start_reshape) BEFORE the
+		 * superblock records the reshape — so a journal-less mid-reshape
+		 * dcl array is a reshape interrupted with an unreadable journal.
+		 * Fail closed rather than run on a stale map: resuming without
+		 * the dual map would fall through to the stock reshape path.
+		 * (Keying on pool size alone would miss a spare-count change,
+		 * which keeps raid_disks == dcl->N.) */
+		if (conf->dcl) {
+			pr_warn("md/raid:%s: dcl reshape in progress (pool %d, geometry N=%u) but no readable reshape journal — refusing\n",
 				mdname(mddev), conf->raid_disks, conf->dcl->N);
 			return -EINVAL;
 		}
@@ -9980,11 +10070,18 @@ static int raidkm_reshape_recover(struct r5conf *conf)
 	if (err)
 		return err;
 
-	/* Declustered pool expansion has its own recovery (the classic band
-	 * math below assumes a single-stripe geometry).  A stale journal on a
-	 * healthy, finalized array (dcl->N == raid_disks) is ignored. */
+	/* Declustered reshape has its own recovery (the classic band math below
+	 * assumes a single-stripe geometry).  A stale journal on a healthy,
+	 * finalized array is ignored: at finalize the rkdcl block is rewritten to
+	 * the NEW geometry, so if the loaded conf->dcl already matches the
+	 * journal's NEW side there is nothing to resume.  (Keying only on N would
+	 * miss a spare-count change, which keeps N and only moves g/s/seed.) */
 	if (le32_to_cpu(rj.kind) == RAIDKM_RESHAPE_KIND_DCL_POOL) {
-		if (conf->dcl && (u32)conf->dcl->N == (u32)conf->raid_disks)
+		if (conf->dcl &&
+		    (u32)conf->dcl->N == le32_to_cpu(rj.new_raid_disks) &&
+		    (u32)conf->dcl->g == le32_to_cpu(rj.dcl_g) &&
+		    (u32)conf->dcl->s == le32_to_cpu(rj.dcl_s) &&
+		    conf->dcl->seed == le64_to_cpu(rj.dcl_new_seed))
 			return 0;
 		return raidkm_dcl_reshape_recover(conf, &rj);
 	}
@@ -10187,6 +10284,83 @@ static sector_t raidkm_reshape_cow(struct mddev *mddev, sector_t sector_nr,
  * the row index is not permuted and the wider pool packs data denser into lower
  * rows (design §2.1).  v1: non-degraded read only (like the classic band).
  * ==========================================================================*/
+
+/*
+ * dcl+csum reshape: verify a migrated source block against its stored CRC
+ * before it is re-encoded under the new geometry.  The band's raw reads bypass
+ * the stripe verify path, and the NEW parity is computed FROM these bytes — a
+ * silently-rotted source block would otherwise be blessed into the new
+ * geometry (its migrated CRC would flag it later, but the heal would then
+ * decode the same rotted bytes straight back out of the new parity).  Failing
+ * the band instead leaves the row in the OLD geometry, where the steady-state
+ * recheck-then-heal path can still repair the block from the OLD parity; the
+ * reshape resumes/re-triggers after a scrub.  An absent slot verifies nothing,
+ * matching steady state.  Sleepable (band worker), mirroring
+ * raidkm_dcl_csum_migrate's shard-mutex use.
+ */
+static int raidkm_dcl_reshape_verify_src(struct r5conf *conf, int disk,
+					 sector_t dev_sector, struct page *pg)
+{
+	unsigned long blk = raidkm_csum_blkidx(conf, dev_sector);
+	struct raidkm_csum_shard *s = raidkm_csum_shard_for(conf->csum, blk);
+	bool present;
+	u32 want, got;
+
+	mutex_lock(&s->lock);
+	present = raidkm_csum_expected(s, disk, blk, &want);
+	mutex_unlock(&s->lock);
+	if (!present)
+		return 0;
+	got = raidkm_block_crc(conf, pg, 0);
+	if (got != want) {
+		pr_err("md/raid:%s: dcl reshape: CRC mismatch on migrate read (disk %d sector %llu, stored %08x got %08x) — failing the band; scrub/heal the array and resume\n",
+		       mdname(conf->mddev), disk,
+		       (unsigned long long)dev_sector, want, got);
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * dcl+csum reshape: re-key the row's CRCs after the home write.  Every
+ * physical location the band overwrote had an OLD-geometry CRC stored under
+ * the same (disk, blk) key; left alone each becomes a false mismatch on first
+ * read (the heal backstop self-corrects those, but a whole reshape's worth is
+ * a storm).  Store the CRC of the bytes written for every cell, matching the
+ * steady-state write path's store-what-you-wrote: for migrated data this
+ * equals the ORIGINAL stored CRC by construction — the band verified every
+ * source block against it (raidkm_dcl_reshape_verify_src, mismatch fails the
+ * band), and the in-memory band page is what was written — so end-to-end
+ * detection survives the move exactly as raidkm_dcl_csum_migrate's
+ * migrate-never-recompute rule intends.  Best-effort: a failed store leaves a
+ * stale slot to the recheck-then-heal backstop, and a crash between the home
+ * write and this pass loses at most one band's stores the same way (the
+ * recover path re-runs this after replaying a torn COMMIT).  Sleepable.
+ */
+static void raidkm_dcl_reshape_csum_rekey(struct r5conf *conf, sector_t row,
+					  struct page **band, int Nnew,
+					  int npages)
+{
+	sector_t home = row * conf->chunk_sectors;
+	int d, po;
+
+	for (d = 0; d < Nnew; d++) {
+		struct md_rdev *rdev = conf->disks[d].rdev;
+
+		if (!rdev || test_bit(Faulty, &rdev->flags))
+			continue;
+		for (po = 0; po < npages; po++) {
+			sector_t sec = home +
+				(sector_t)po * RAIDKM_PAGE_SECTORS;
+
+			raidkm_csum_store(conf, d,
+					  raidkm_csum_blkidx(conf, sec),
+					  raidkm_block_crc(conf,
+						band[d * npages + po], 0));
+		}
+	}
+}
+
 static int raidkm_reshape_migrate_band_dcl(struct r5conf *conf,
 		struct raidkm_reshape_ctx *ctx, sector_t row, sector_t last_band)
 {
@@ -10255,7 +10429,7 @@ static int raidkm_reshape_migrate_band_dcl(struct r5conf *conf,
 			if (!rdev || test_bit(Faulty, &rdev->flags)) {
 				err = -EIO; goto out;		/* v1: non-degraded */
 			}
-			for (po = 0; po < npages; po++)
+			for (po = 0; po < npages; po++) {
 				if (!sync_page_io(rdev,
 						  ao.row * chunk +
 						  (sector_t)po * RAIDKM_PAGE_SECTORS,
@@ -10264,6 +10438,16 @@ static int raidkm_reshape_migrate_band_dcl(struct r5conf *conf,
 						  REQ_OP_READ, false)) {
 					err = -EIO; goto out;
 				}
+				if (conf->csum) {
+					err = raidkm_dcl_reshape_verify_src(
+						conf, ao.disk,
+						ao.row * chunk +
+						(sector_t)po * RAIDKM_PAGE_SECTORS,
+						band[ndisk * npages + po]);
+					if (err)
+						goto out;
+				}
+			}
 		}
 	}
 
@@ -10329,6 +10513,8 @@ static int raidkm_reshape_migrate_band_dcl(struct r5conf *conf,
 #ifdef RAIDKM_FAULT_INJECT
 	if (act == RAIDKM_INJ_TORN) { err = raidkm_reshape_park(mddev); goto out; }
 #endif
+	if (conf->csum)
+		raidkm_dcl_reshape_csum_rekey(conf, row, band, Nnew, npages);
 
 	/* ---- DONE ---- */
 	err = raidkm_reshape_jwrite(conf, ctx, RAIDKM_PH_DONE,
@@ -10385,16 +10571,18 @@ static sector_t raidkm_reshape_dcl_cow(struct mddev *mddev, sector_t sector_nr,
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.jseq		= (u64)row * 4 + RAIDKM_RJ_SLOTS;
-	ctx.old_m		= conf->m;		/* m unchanged for pool grow */
+	ctx.old_m		= conf->prev_m;	/* differs from new_m on add-parity */
 	ctx.new_m		= conf->m;
 	ctx.old_raid_disks	= conf->previous_raid_disks;
 	ctx.new_raid_disks	= conf->raid_disks;
 	ctx.chunk_sectors	= chunk;
 	ctx.scratch_rows	= chunk / RAIDKM_PAGE_SECTORS;
 	ctx.kind		= RAIDKM_RESHAPE_KIND_DCL_POOL;
-	ctx.dcl_g		= nge->g;
+	ctx.dcl_g		= nge->g;		/* NEW group geometry */
 	ctx.dcl_s		= nge->s;
 	ctx.dcl_nbase		= nge->nbase;
+	ctx.dcl_old_g		= conf->prev_dcl->g;	/* OLD, for a g/m/s change */
+	ctx.dcl_old_s		= conf->prev_dcl->s;
 	ctx.dcl_old_seed	= conf->prev_dcl->seed;
 	ctx.dcl_new_seed	= nge->seed;
 	ctx.frontier_row	= row;		/* recovery resumes from here */
@@ -10481,11 +10669,13 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr, int *sk
 	 * the COW-staged migration instead of the stripe-cache reshape: it avoids
 	 * the rotating-layout corruption AND the data_offset out-of-place shift, so
 	 * the same path can later be driven under device-mapper. */
-	if (is_raidkm(conf) && conf->previous_raid_disks < conf->raid_disks) {
-		if (conf->dcl)
-			return raidkm_reshape_dcl_cow(mddev, sector_nr, skipped);
+	/* declustered reshapes are detected by the dual map (prev_dcl set), which
+	 * also covers a spare-count change where the pool size is unchanged
+	 * (delta_disks == 0, previous_raid_disks == raid_disks). */
+	if (is_raidkm(conf) && conf->dcl && conf->prev_dcl)
+		return raidkm_reshape_dcl_cow(mddev, sector_nr, skipped);
+	if (is_raidkm(conf) && conf->previous_raid_disks < conf->raid_disks)
 		return raidkm_reshape_cow(mddev, sector_nr, skipped);
-	}
 
 	if (sector_nr == 0) {
 		/* If restarting in the middle, skip the initial sectors */
@@ -12527,13 +12717,17 @@ static ssize_t
 raidkm_store_dcl_reshape(struct mddev *mddev, const char *page, size_t len)
 {
 	struct r5conf *conf;
-	unsigned int newN;
+	unsigned int newN, newlay = 0, g, s;
 	unsigned long long newseed;
-	int err;
+	int nf, err;
 
 	if (len >= PAGE_SIZE)
 		return -EINVAL;
-	if (sscanf(page, "%u:%llx", &newN, &newseed) != 2)
+	/* "<newN>:<seed_hex>[:<newlayout_hex>]" — the optional new layout word
+	 * carries a group-geometry change (add-parity/add-data/spare-count);
+	 * omit it for a pure pool expansion (g/m/s unchanged). */
+	nf = sscanf(page, "%u:%llx:%x", &newN, &newseed, &newlay);
+	if (nf < 2)
 		return -EINVAL;
 
 	err = mddev_lock(mddev);
@@ -12544,18 +12738,76 @@ raidkm_store_dcl_reshape(struct mddev *mddev, const char *page, size_t len)
 		err = -ENODEV;
 		goto out;
 	}
-	if (newN <= (unsigned int)conf->raid_disks ||
-	    (newN - conf->dcl->s) % conf->dcl->g) {
-		err = -EINVAL;			/* must widen the pool; C1 for N' */
+	if (nf < 3)
+		newlay = (unsigned int)mddev->layout;
+	/* the layout word must keep the declustered bit: a non-dcl word would
+	 * misroute the (delta_disks == 0) spare-count case down the classic
+	 * in-place-reshape path in raid5_run / check_reshape.  It must also
+	 * keep the native-checksum bit: a reshape only moves/re-keys CRCs, it
+	 * cannot enable or disable the feature — a word missing the bit would
+	 * silently drop checksumming when finish_reshape persists it. */
+	if (!raidkm_layout_is_dcl((int)newlay) ||
+	    raidkm_layout_has_csum((int)newlay) !=
+	    raidkm_layout_has_csum(mddev->layout)) {
+		err = -EINVAL;
 		goto out;
+	}
+	g = RAIDKM_LAYOUT_DCL_G(newlay);
+	s = RAIDKM_LAYOUT_DCL_S(newlay);
+	/* newN == raid_disks is allowed for a spare-count change (only the
+	 * layout word / s moves); otherwise the pool must grow. */
+	if (newN < (unsigned int)conf->raid_disks || !g || (newN - s) % g ||
+	    (newN == (unsigned int)conf->raid_disks &&
+	     newlay == (unsigned int)mddev->layout)) {
+		err = -EINVAL;
+		goto out;
+	}
+	/*
+	 * Capacity ~ ngroups * k.  A spare-count *increase* (or a pool shrink)
+	 * lowers ngroups and therefore shrinks the array.  A capacity-shrinking
+	 * reshape needs the array-size-first + backup-file ordering of a shrink
+	 * (userspace must evacuate the tail before the layout collapses into it);
+	 * that path is deferred, so reject it here rather than migrate over live
+	 * data.  Spare-count *decrease*, add-parity, add-data and pool expansion
+	 * all keep or grow the data-column count and fall through.
+	 */
+	{
+		unsigned int nm = raidkm_layout_m(newlay);
+		unsigned int new_ng = (newN - s) / g;
+
+		if (g <= nm || new_ng == 0 ||
+		    new_ng * (g - nm) <
+		    (unsigned int)conf->dcl->ngroups * (unsigned int)conf->dcl->k) {
+			pr_warn("md/raid:%s: declustered: reshape to N=%u g=%u m=%u s=%u would shrink capacity; capacity-shrinking reshapes (spare-count increase / pool shrink) are not yet supported\n",
+				mdname(mddev), newN, g, nm, s);
+			err = -EINVAL;
+			goto out;
+		}
 	}
 	if (mddev->reshape_position != MaxSector || conf->prev_dcl) {
 		err = -EBUSY;			/* a reshape is already in flight */
 		goto out;
 	}
+	/*
+	 * add-parity / add-data / spare-count — every reshape that changes the
+	 * layout word (group width, parity count or spare-column count) — are
+	 * OFFLINE-ONLY.  The dcl stripe path is single-geometry, so concurrent
+	 * I/O to the not-yet-migrated region is unsafe (add-parity/add-data
+	 * silently corrupt it); the whole layout-changing class is gated offline
+	 * for a uniform, conservative policy.  Refuse to start unless the array
+	 * is idle (no mounts / open writers).  A pure pool expansion keeps the
+	 * layout word (only N and the seed move) and stays fully online.
+	 */
+	if (newlay != (unsigned int)mddev->layout &&
+	    atomic_read(&mddev->openers) > 0) {
+		pr_warn("md/raid:%s: declustered: add-parity/add-data/spare-count reshape is offline-only; the array has %d open handle(s) — unmount / close it and retry\n",
+			mdname(mddev), atomic_read(&mddev->openers));
+		err = -EBUSY;
+		goto out;
+	}
 	conf->reshape_new_seed = newseed;
 	mddev->delta_disks = (int)newN - conf->raid_disks;
-	mddev->new_layout = mddev->layout;		/* g/m/s unchanged */
+	mddev->new_layout = (int)newlay;
 	mddev->new_chunk_sectors = mddev->chunk_sectors;
 	mddev->new_level = mddev->level;
 	err = mddev->pers->check_reshape(mddev);	/* grows conf->disks */
@@ -13864,10 +14116,22 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 			INIT_WORK(&conf->dcl_rescue_work,
 				  raidkm_dcl_rescue_worker);
 			mutex_init(&conf->dcl_retire_mutex);
-			/* v1 exclusions — refuse rather than run wrong */
-			if (mddev->bitmap_info.offset ||
-			    mddev->bitmap_info.file) {
-				pr_err("md/raid:%s: declustered + write-intent bitmap not supported yet\n",
+			/*
+			 * Write-intent bitmap: SUPPORTED (internal).  The
+			 * stripe write tracking (raidkm_bitmap_startwrite /
+			 * _endwrite on sh->sector) and the sync skip/gate
+			 * calls in raid5_sync_request both use the per-device
+			 * stripe-sector domain, which is exactly the domain
+			 * the declustered row iteration uses — one row's
+			 * ngroups group-stripes share sh->sector, and the
+			 * bitmap's per-chunk counter absorbs the multiple
+			 * writers.  Spare population / copy-from-spare stay
+			 * mark-journaled via the rkdcl block, independent of
+			 * the bitmap.  File-backed bitmaps are untested with
+			 * the dcl path — keep refusing those.
+			 */
+			if (mddev->bitmap_info.file) {
+				pr_err("md/raid:%s: declustered + file-backed bitmap not supported\n",
 				       mdname(mddev));
 				goto abort;
 			}
@@ -14267,13 +14531,18 @@ static int raid5_run(struct mddev *mddev)
 		sector_div(here_old, chunk_sectors * (old_disks - old_md));
 		/* here_old is the first stripe that we might need to read
 		 * from */
-		if (mddev->delta_disks == 0) {
+		if (mddev->delta_disks == 0 &&
+		    !raidkm_layout_is_dcl(mddev->new_layout)) {
 			/* We cannot be sure it is safe to start an in-place
 			 * reshape.  It is only safe if user-space is monitoring
 			 * and taking constant backups.
 			 * mdadm always starts a situation like this in
 			 * readonly mode so it can take control before
 			 * allowing any writes.  So just check for that.
+			 * (A declustered spare-count change is also delta_disks
+			 * == 0, but it is CoW-staged + journal-recoverable and
+			 * offline-only, so it takes the COW branch below instead
+			 * of this backup-monitored classic path.)
 			 */
 			if (abs(min_offset_diff) >= mddev->chunk_sectors &&
 			    abs(min_offset_diff) >= mddev->new_chunk_sectors)
@@ -14283,14 +14552,17 @@ static int raid5_run(struct mddev *mddev)
 					mdname(mddev));
 				return -EINVAL;
 			}
-		} else if (mddev->level == RAID_KM_LEVEL && mddev->delta_disks > 0 &&
-			   (new_md == old_md || new_md == old_md + 1)) {
-			/* COW disk-adding reshape (add-parity m -> m+1, or
-			 * add-data k -> k+1): the stock frontier math does not
-			 * apply.  For add-parity read and write are the same
-			 * sectors (here_new == here_old since the data-disk
-			 * count is unchanged); for add-data the new geometry is
-			 * more compact so a forward migration never overwrites
+		} else if (mddev->level == RAID_KM_LEVEL &&
+			   (raidkm_layout_is_dcl(mddev->new_layout) ||
+			    (mddev->delta_disks > 0 &&
+			     (new_md == old_md || new_md == old_md + 1)))) {
+			/* COW reshape.  Declustered (pool-expansion / add-parity /
+			 * add-data / spare-count, the last with delta_disks == 0)
+			 * and classic raidkm add-parity/add-data: the stock
+			 * frontier math does not apply.  For add-parity read and
+			 * write are the same sectors (here_new == here_old since
+			 * the data-disk count is unchanged); for add-data / a
+			 * denser dcl packing a forward migration never overwrites
 			 * a not-yet-vacated source row.  Either way the per-band
 			 * COW stages to scratch before overwriting home, and
 			 * recovery is journal-driven (raidkm_reshape_recover) —
@@ -14299,7 +14571,7 @@ static int raid5_run(struct mddev *mddev)
 			 * normal dm/LVM activation path: the reshape is stamped
 			 * into the superblocks by one table load and actually
 			 * runs on the next. */
-			pr_debug("md/raid:%s: raidkm disk-adding reshape will continue (COW)\n",
+			pr_debug("md/raid:%s: raidkm COW reshape will continue\n",
 				 mdname(mddev));
 		} else if (mddev->reshape_backwards
 		    ? (here_new * chunk_sectors + min_offset_diff <=
@@ -14352,12 +14624,16 @@ static int raid5_run(struct mddev *mddev)
 	mddev->private = conf;
 
 	/*
-	 * Assembling an interrupted COW add-parity reshape: recover the in-flight
-	 * band from the journal (replay a torn COMMIT / redo an incomplete STAGE)
-	 * and reconcile reshape_progress before the reshape thread resumes.
+	 * Assembling an interrupted COW reshape: recover the in-flight band from
+	 * the journal (replay a torn COMMIT / redo an incomplete STAGE) and
+	 * reconcile reshape_progress before the reshape thread resumes.  A
+	 * disk-count change (classic add-parity/add-data, dcl pool expansion) has
+	 * previous_raid_disks < raid_disks; a dcl spare-count change keeps N
+	 * (delta_disks == 0) and is spotted by the layout word moving instead.
 	 */
 	if (is_raidkm(conf) && conf->reshape_progress != MaxSector &&
-	    conf->previous_raid_disks < conf->raid_disks) {
+	    (conf->previous_raid_disks < conf->raid_disks ||
+	     (conf->dcl && mddev->new_layout != mddev->layout))) {
 		ret = raidkm_reshape_recover(conf);
 		if (ret)
 			goto abort;
@@ -14917,10 +15193,6 @@ out:
 
 static int raid5_resize(struct mddev *mddev, sector_t sectors)
 {
-	struct r5conf *dclc = mddev->private;
-
-	if (dclc && dclc->dcl)
-		return -EOPNOTSUPP;	/* declustered v1: no resize */
 	/* no resync is happening, and there is enough space
 	 * on all devices, so we can resize.
 	 * We need to make sure resync covers any new space.
@@ -14934,6 +15206,71 @@ static int raid5_resize(struct mddev *mddev, sector_t sectors)
 
 	if (raid5_has_log(conf) || raid5_has_ppl(conf))
 		return -EINVAL;
+
+	/*
+	 * Declustered: the map is per-row (hashed), so a member-size GROW is
+	 * just more rows at the tail of every disk — same N/g/m/s/seed, no
+	 * permutation change.  What does move is the rkdcl metadata block,
+	 * which sits AT dev_sectors on every member: write it at the NEW
+	 * offset first (the old block stays valid at the old offset), persist
+	 * the superblock's new dev_sectors, and only then expose the new
+	 * capacity — every crash window reads a valid block at the offset its
+	 * superblock points to.  The new rows hold garbage, so a resync from
+	 * the old size parity-initializes them (recovery_cp below).
+	 */
+	if (conf->dcl) {
+		sector_t old_ds = mddev->dev_sectors;
+
+		sectors &= ~((sector_t)conf->chunk_sectors - 1);
+		if (sectors < old_ds)
+			return -EINVAL;		/* shrink: deferred */
+		if (conf->prev_dcl || mddev->reshape_position != MaxSector)
+			return -EBUSY;		/* reshape in flight */
+		if (conf->nreb)
+			return -EBUSY;		/* live spare assignment: the
+						 * rkdcl POPULATED mark sentinel
+						 * is dev_sectors itself */
+		if (mddev->degraded)
+			return -EINVAL;		/* v1: healthy pool only */
+		if (conf->csum)
+			return -EOPNOTSUPP;	/* CRC region sits past
+						 * dev_sectors; relocation is a
+						 * follow-up */
+		newsize = raid5_size(mddev, sectors, mddev->raid_disks);
+		if (mddev->external_size && mddev->array_sectors > newsize)
+			return -EINVAL;
+		if (mddev->bitmap) {
+			ret = mddev->bitmap_ops->resize(mddev, sectors, 0, false);
+			if (ret)
+				return ret;
+		}
+		mddev->dev_sectors = sectors;
+		if (sectors != old_ds) {
+			ret = raidkm_dcl_journal_write(conf, true);
+			if (ret) {
+				mddev->dev_sectors = old_ds;
+				pr_warn("md/raid:%s: declustered: resize aborted — could not write the rkdcl block at the new size\n",
+					mdname(mddev));
+				return ret;
+			}
+			set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
+			md_update_sb(mddev, 1);
+		}
+		md_set_array_sectors(mddev, newsize);
+		if (sectors > old_ds && mddev->recovery_cp > old_ds) {
+			mddev->recovery_cp = old_ds;
+			/* the new rows were never written, so their bitmap
+			 * bits are clean and the scoped-skip in sync_request
+			 * would pass over exactly the region that needs its
+			 * parity initialized — force the sweep (it starts at
+			 * recovery_cp, so only the new rows are visited;
+			 * cleared again when the sync completes) */
+			conf->fullsync = 1;
+			set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+		}
+		mddev->resync_max_sectors = sectors;
+		return 0;
+	}
 	sectors &= ~((sector_t)conf->chunk_sectors - 1);
 	newsize = raid5_size(mddev, sectors, mddev->raid_disks);
 	if (mddev->external_size &&
@@ -15040,6 +15377,9 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 	struct r5conf *conf = mddev->private;
 	struct dcl_geom *oge = conf->dcl, *nge;
 	int newN = conf->raid_disks + mddev->delta_disks;
+	int new_g, new_m, new_s, new_k;
+	bool ec_change;
+	unsigned char *new_a = NULL, *new_gg = NULL, *new_gb = NULL;
 	struct md_rdev *rdev;
 	unsigned long flags;
 
@@ -15051,20 +15391,61 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 		return -EINVAL;			/* v1: healthy pool only */
 	if (conf->nreb)
 		return -EBUSY;			/* v1: no live spare assignment */
-	if (conf->csum)
-		return -EOPNOTSUPP;		/* v1: CRC re-key is a follow-up */
+	/* native csum: the band verifies each migrated block against its stored
+	 * CRC (fail-closed on rot) and re-keys the row's CRCs after the home
+	 * write — see raidkm_dcl_reshape_verify_src / _csum_rekey. */
 	if (mddev->recovery_cp < MaxSector)
 		return -EBUSY;
-	if (mddev->delta_disks <= 0 || (newN - oge->s) % oge->g)
-		return -EINVAL;			/* C1 for N' */
+	if (mddev->delta_disks < 0)
+		return -EINVAL;
+	/* delta_disks == 0 is only a spare-count change (s, and hence ngroups,
+	 * move; the pool size stays) — it must carry a new layout word. */
+	if (mddev->delta_disks == 0 &&
+	    (mddev->new_layout < 0 || mddev->new_layout == mddev->layout))
+		return -EINVAL;
 
-	/* build the NEW map (g/m/s/nbase inherited; N and seed change).  Do it
-	 * while sleepable and before touching conf, so an alloc failure leaves
-	 * the array untouched at its old geometry. */
-	nge = raidkm_dcl_geom_new(newN, oge->g, oge->m, oge->s, oge->nbase,
-				  conf->reshape_new_seed);
-	if (!nge)
+	/*
+	 * The NEW declustered geometry comes from the staged new_layout word
+	 * (g/m/s) plus the new pool size.  Pool expansion leaves the layout word
+	 * unchanged (g/m/s fixed, only N and the seed move); the group-geometry
+	 * reshapes — add-parity (m+1), add-data (k+1), spare-count (s+/-1) —
+	 * change it.  Deriving from new_layout keeps a single path for all of
+	 * them and is identical to the old behaviour when new_layout == layout.
+	 */
+	{
+		int lay = (mddev->new_layout >= 0) ? mddev->new_layout
+						   : mddev->layout;
+		new_g = RAIDKM_LAYOUT_DCL_G(lay);
+		new_m = raidkm_layout_m(lay);
+		new_s = RAIDKM_LAYOUT_DCL_S(lay);
+	}
+	new_k = new_g - new_m;
+	ec_change = (new_m != oge->m || new_k != oge->k);
+	if (new_g < new_m + 1 || new_s < 1 || newN < new_g + new_s ||
+	    (newN - new_s) % new_g)			/* C1 for the NEW geometry */
+		return -EINVAL;
+	if (new_m < 2 || new_m > RAIDKM_MAX_M)
+		return -EINVAL;
+
+	/*
+	 * Build the NEW group EC tables when the group's (k,m) changes
+	 * (add-parity / add-data).  Sleepable + before touching conf, so a
+	 * failure leaves the array at its old geometry.  Installed (and the old
+	 * set demoted to prev_ec_*) under device_lock below.
+	 */
+	if (ec_change &&
+	    raidkm_build_ec(new_m, new_k, GFP_KERNEL, &new_a, &new_gg, &new_gb))
 		return -ENOMEM;
+
+	/* build the NEW map (nbase inherited; N, g/m/s and seed per new_layout) */
+	nge = raidkm_dcl_geom_new(newN, new_g, new_m, new_s, oge->nbase,
+				  conf->reshape_new_seed);
+	if (!nge) {
+		kfree(new_a);
+		kfree(new_gg);
+		kfree(new_gb);
+		return -ENOMEM;
+	}
 
 	atomic_set(&conf->reshape_stripes, 0);
 	spin_lock_irq(&conf->device_lock);
@@ -15076,6 +15457,25 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 	conf->reshape_frontier_row = 0;
 	conf->prev_chunk_sectors = conf->chunk_sectors;
 	conf->prev_algo = conf->algorithm;
+	/* the NEW layout word (g/m/s) — persisted to the SB at finish_reshape
+	 * (mddev->layout = conf->algorithm).  Unchanged for pool expansion. */
+	conf->algorithm = (mddev->new_layout >= 0) ? mddev->new_layout
+						   : mddev->layout;
+	if (ec_change) {
+		/* the un-migrated region keeps decoding with the old (k,m); the
+		 * migrated region uses the new — demote current tables to prev_*
+		 * and install the freshly built set.  max_degraded tracks the
+		 * larger m so stripe buffers fit either region. */
+		conf->prev_m = oge->m;
+		conf->m = new_m;
+		conf->max_degraded = max(new_m, (int)oge->m);
+		conf->prev_ec_a_matrix    = conf->ec_a_matrix;
+		conf->prev_ec_g_tbls_gfni = conf->ec_g_tbls_gfni;
+		conf->prev_ec_g_tbls_base = conf->ec_g_tbls_base;
+		conf->ec_a_matrix    = new_a;
+		conf->ec_g_tbls_gfni = new_gg;
+		conf->ec_g_tbls_base = new_gb;
+	}
 	conf->generation++;
 	smp_mb();
 	conf->reshape_progress = 0;		/* forward; frontier at row 0 */
@@ -15110,8 +15510,8 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 	{
 		struct raidkm_reshape_ctx ctx = {
 			.jseq		= 0,
-			.old_m		= conf->m,
-			.new_m		= conf->m,
+			.old_m		= conf->prev_dcl->m,
+			.new_m		= conf->dcl->m,
 			.old_raid_disks	= conf->previous_raid_disks,
 			.new_raid_disks	= conf->raid_disks,
 			.chunk_sectors	= conf->chunk_sectors,
@@ -15120,6 +15520,8 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 			.dcl_g		= conf->dcl->g,
 			.dcl_s		= conf->dcl->s,
 			.dcl_nbase	= conf->dcl->nbase,
+			.dcl_old_g	= conf->prev_dcl->g,
+			.dcl_old_s	= conf->prev_dcl->s,
 			.dcl_old_seed	= conf->prev_dcl->seed,
 			.dcl_new_seed	= conf->dcl->seed,
 			.frontier_row	= 0,
@@ -15136,8 +15538,9 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 	set_bit(MD_RECOVERY_RESHAPE, &mddev->recovery);
 	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	conf->reshape_checkpoint = jiffies;
-	pr_info("md/raid:%s: declustered pool expansion started: N %d -> %d (ngroups %u -> %u), new seed 0x%llx\n",
+	pr_info("md/raid:%s: declustered reshape started: N %d->%d g %u->%u m %u->%u s %u->%u (ngroups %u->%u), new seed 0x%llx\n",
 		mdname(mddev), conf->previous_raid_disks, newN,
+		oge->g, nge->g, oge->m, nge->m, oge->s, nge->s,
 		oge->ngroups, nge->ngroups,
 		(unsigned long long)conf->reshape_new_seed);
 	md_new_event();
@@ -15416,8 +15819,21 @@ static void raid5_finish_reshape(struct mddev *mddev)
 				pr_warn("md/raid:%s: declustered: persisting the new geometry to the rkdcl block failed\n",
 					mdname(mddev));
 			md_set_array_sectors(mddev, raid5_size(mddev, 0, 0));
+			/*
+			 * md-core only refreshes the gendisk capacity after a
+			 * reshape when delta_disks > 0 (md.c).  A spare-count
+			 * reshape keeps N fixed (delta_disks == 0) yet changes
+			 * ngroups, so the array size moves with no disk added or
+			 * removed — expose it here ourselves.  set_capacity() is
+			 * safe under the reconfig_mutex held across finish_reshape
+			 * (unlike set_capacity_and_notify(), which md-core calls
+			 * only after dropping the lock); a re-assemble would set it
+			 * anyway, this just makes the new size live immediately.
+			 */
+			if (!mddev_is_dm(mddev) && mddev->gendisk)
+				set_capacity(mddev->gendisk, mddev->array_sectors);
 			set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
-			pr_info("md/raid:%s: declustered pool expansion finished: %u groups/row, array grown to %llu sectors\n",
+			pr_info("md/raid:%s: declustered geometry reshape finished: %u groups/row, array now %llu sectors\n",
 				mdname(mddev), conf->dcl->ngroups,
 				(unsigned long long)mddev->array_sectors);
 		}
@@ -15631,30 +16047,38 @@ static int raidkm_check_reshape(struct mddev *mddev)
 	unsigned int new_chunk = mddev->new_chunk_sectors;
 
 	if (mddev->new_layout >= 0 && mddev->new_layout != mddev->layout) {
-		int old_m = raidkm_layout_m(mddev->layout);
-		int new_m = raidkm_layout_m(mddev->new_layout);
-		bool old_rot = raidkm_layout_is_rotating(mddev->layout);
-		bool new_rot = raidkm_layout_is_rotating(mddev->new_layout);
-
-		if (old_rot != new_rot || new_m != old_m + 1) {
-			pr_warn("md/raid:%s: raidkm reshape may only add a single parity disk (m -> m+1) at a fixed parity placement\n",
-				mdname(mddev));
-			return -EINVAL;
-		}
 		/*
-		 * The m -> m+1 change adds exactly one disk.  mdadm stages the new
-		 * layout (via the "layout" sysfs attr) BEFORE bumping raid_disks, so
-		 * accept the layout-only step (delta_disks == 0) without setting up —
-		 * the subsequent raid_disks write re-enters here with delta_disks == 1
-		 * and does the real validation.  layout_store keeps new_layout because
-		 * we return success.
+		 * Declustered geometry reshapes (add-parity m+1, add-data k+1,
+		 * spare-count s+/-1) change g/m/s in the layout word; the number of
+		 * disks added is ngroups (one new column per group), not 1, and the
+		 * DCL start path (raidkm_dcl_start_reshape) validates C1 and rebuilds
+		 * the group EC.  Accept the layout-only stage (delta_disks == 0) like
+		 * the classic path; the real setup runs when raid_disks bumps.
 		 */
-		if (mddev->delta_disks == 0)
-			return 0;
-		if (mddev->delta_disks != 1) {
-			pr_warn("md/raid:%s: raidkm add-parity must add exactly one disk (delta_disks=%d)\n",
-				mdname(mddev), mddev->delta_disks);
-			return -EINVAL;
+		if (raidkm_layout_is_dcl(mddev->new_layout)) {
+			if (mddev->delta_disks == 0)
+				return 0;
+		} else {
+			int old_m = raidkm_layout_m(mddev->layout);
+			int new_m = raidkm_layout_m(mddev->new_layout);
+			bool old_rot = raidkm_layout_is_rotating(mddev->layout);
+			bool new_rot = raidkm_layout_is_rotating(mddev->new_layout);
+
+			if (old_rot != new_rot || new_m != old_m + 1) {
+				pr_warn("md/raid:%s: raidkm reshape may only add a single parity disk (m -> m+1) at a fixed parity placement\n",
+					mdname(mddev));
+				return -EINVAL;
+			}
+			/* mdadm stages the new layout before bumping raid_disks;
+			 * accept the layout-only step, the raid_disks write re-enters
+			 * with delta_disks == 1 and does the real validation. */
+			if (mddev->delta_disks == 0)
+				return 0;
+			if (mddev->delta_disks != 1) {
+				pr_warn("md/raid:%s: raidkm add-parity must add exactly one disk (delta_disks=%d)\n",
+					mdname(mddev), mddev->delta_disks);
+				return -EINVAL;
+			}
 		}
 	}
 	/*

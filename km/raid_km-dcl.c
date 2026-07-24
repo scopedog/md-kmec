@@ -451,19 +451,37 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 	blk->hdr_crc = cpu_to_le32(want);
 	if (crc != want)
 		return -EINVAL;
-	/* geometry must agree with the layout word and the rdev count.  During
-	 * a pool-expansion reshape the rkdcl block still holds the OLD pool size
-	 * (it is rewritten only at finalize) while raid_disks is already the new
-	 * size — accept pool_disks < raid_disks in that (reshape-in-progress)
-	 * window; the reshape journal carries the authoritative geometry. */
-	if ((le32_to_cpu(blk->pool_disks) != (u32)mddev->raid_disks &&
-	     !(mddev->reshape_position != MaxSector &&
-	       le32_to_cpu(blk->pool_disks) < (u32)mddev->raid_disks)) ||
-	    le32_to_cpu(blk->group_width) != (u32)RAIDKM_LAYOUT_DCL_G(layout) ||
-	    le32_to_cpu(blk->parity) != (u32)raidkm_layout_m(layout) ||
-	    le32_to_cpu(blk->spare_cols) != (u32)RAIDKM_LAYOUT_DCL_S(layout) ||
-	    !le32_to_cpu(blk->nbase) || le32_to_cpu(blk->nbase) > 64)
-		return -EINVAL;
+	/*
+	 * Geometry must agree with the layout word and the rdev count.  During a
+	 * reshape the rkdcl block still holds the OLD geometry (it is rewritten to
+	 * the new one only at finalize) while raid_disks / new_layout already
+	 * describe the NEW one.  So accept, in the reshape-in-progress window, a
+	 * pool size below raid_disks and a group geometry matching EITHER the new
+	 * layout or the pre-reshape layout (mddev->layout).  Outside a reshape
+	 * only the new layout (== the steady layout) is valid.  The reshape
+	 * journal carries the authoritative old→new geometry.
+	 */
+	{
+		bool reshaping = mddev->reshape_position != MaxSector;
+		u32 pool = le32_to_cpu(blk->pool_disks);
+		u32 bg = le32_to_cpu(blk->group_width);
+		u32 bp = le32_to_cpu(blk->parity);
+		u32 bs = le32_to_cpu(blk->spare_cols);
+
+		if (pool != (u32)mddev->raid_disks &&
+		    !(reshaping && pool < (u32)mddev->raid_disks))
+			return -EINVAL;
+		if (!(bg == (u32)RAIDKM_LAYOUT_DCL_G(layout) &&
+		      bp == (u32)raidkm_layout_m(layout) &&
+		      bs == (u32)RAIDKM_LAYOUT_DCL_S(layout)) &&
+		    !(reshaping &&
+		      bg == (u32)RAIDKM_LAYOUT_DCL_G(mddev->layout) &&
+		      bp == (u32)raidkm_layout_m(mddev->layout) &&
+		      bs == (u32)RAIDKM_LAYOUT_DCL_S(mddev->layout)))
+			return -EINVAL;
+		if (!le32_to_cpu(blk->nbase) || le32_to_cpu(blk->nbase) > 64)
+			return -EINVAL;
+	}
 	if (vers == RKDCL_SB_VERSION2) {
 		u32 x = le32_to_cpu(blk->assign_disk);
 		u32 j = le32_to_cpu(blk->assign_spare);

@@ -26,7 +26,10 @@
  */
 
 #define RAIDKM_RJ_MAGIC		0x4a524b52u	/* 'RKRJ' */
-#define RAIDKM_RJ_VERSION	1u
+/* v2: dcl_old_g/dcl_old_s appended for the group-geometry reshapes, moving
+ * hdr_csum.  v1 records (written by older modules) fail the csum anyway; the
+ * explicit version bump makes the mismatch diagnosable instead of silent. */
+#define RAIDKM_RJ_VERSION	2u
 
 enum raidkm_reshape_phase {
 	RAIDKM_PH_IDLE		= 0,
@@ -62,12 +65,17 @@ struct raidkm_reshape_journal {
 	 * old/new pool sizes ride old_raid_disks/new_raid_disks, m is unchanged
 	 * (old_m == new_m).  Classic reshapes leave all of these zero. */
 	__le32	kind;			/* enum raidkm_reshape_kind */
-	__le32	dcl_g;			/* group width (unchanged across the grow) */
-	__le32	dcl_s;			/* spare columns (unchanged) */
+	__le32	dcl_g;			/* NEW group width (== old for pool grow) */
+	__le32	dcl_s;			/* NEW spare columns (== old for pool grow) */
 	__le32	dcl_nbase;		/* base shuffles (unchanged) */
 	__le64	dcl_old_seed;		/* OLD permutation seed */
 	__le64	dcl_new_seed;		/* NEW permutation seed */
 	__le64	frontier_row;		/* device chunk row of this band */
+	/* OLD group geometry — differs from the NEW dcl_g/dcl_s for the
+	 * group-geometry reshapes (add-parity / add-data / spare-count); equal
+	 * for pool expansion.  old_m/new_m ride old_m/new_m above. */
+	__le32	dcl_old_g;
+	__le32	dcl_old_s;
 	__le32	hdr_csum;		/* crc32c of this header with hdr_csum == 0 */
 } __packed;
 
@@ -97,9 +105,12 @@ struct raidkm_reshape_ctx {
 	u32		old_raid_disks, new_raid_disks;
 	u32		chunk_sectors;
 	u32		scratch_rows;
-	/* v2 declustered pool expansion (zero for classic reshapes) */
+	/* v2 declustered reshape (zero for classic reshapes).  dcl_g/dcl_s are
+	 * the NEW geometry; dcl_old_g/dcl_old_s the OLD (differ only for the
+	 * group-geometry reshapes — add-parity/add-data/spare-count). */
 	u32		kind;		/* enum raidkm_reshape_kind */
 	u32		dcl_g, dcl_s, dcl_nbase;
+	u32		dcl_old_g, dcl_old_s;
 	u64		dcl_old_seed, dcl_new_seed;
 	u64		frontier_row;	/* device row of the band being journaled */
 };

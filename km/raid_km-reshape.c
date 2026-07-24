@@ -103,6 +103,8 @@ int raidkm_reshape_jwrite(struct r5conf *conf, struct raidkm_reshape_ctx *ctx,
 	rj->dcl_old_seed	= cpu_to_le64(ctx->dcl_old_seed);
 	rj->dcl_new_seed	= cpu_to_le64(ctx->dcl_new_seed);
 	rj->frontier_row	= cpu_to_le64(ctx->frontier_row);
+	rj->dcl_old_g		= cpu_to_le32(ctx->dcl_old_g);
+	rj->dcl_old_s		= cpu_to_le32(ctx->dcl_old_s);
 	rj->hdr_csum		= cpu_to_le32(raidkm_rj_csum(rj));
 
 	slot_local = (ctx->jseq & (RAIDKM_RJ_SLOTS - 1)) * RAIDKM_PAGE_SECTORS;
@@ -175,9 +177,16 @@ int raidkm_reshape_jread(struct r5conf *conf, struct raidkm_reshape_journal *out
 			if (!raidkm_scratch_io(rdev, slot * RAIDKM_PAGE_SECTORS,
 					       page, REQ_OP_READ))
 				continue;
-			if (le32_to_cpu(rj->magic) != RAIDKM_RJ_MAGIC ||
-			    le32_to_cpu(rj->version) != RAIDKM_RJ_VERSION ||
-			    le32_to_cpu(rj->hdr_csum) != raidkm_rj_csum(rj))
+			if (le32_to_cpu(rj->magic) != RAIDKM_RJ_MAGIC)
+				continue;
+			if (le32_to_cpu(rj->version) != RAIDKM_RJ_VERSION) {
+				pr_warn_once("md/raid:%s: reshape journal version %u on %pg (this module writes v%u) — treating as absent; resume the reshape with the module that wrote it\n",
+					     mdname(conf->mddev),
+					     le32_to_cpu(rj->version),
+					     rdev->bdev, RAIDKM_RJ_VERSION);
+				continue;
+			}
+			if (le32_to_cpu(rj->hdr_csum) != raidkm_rj_csum(rj))
 				continue;
 			seq = le64_to_cpu(rj->seq);
 			if (!found || seq >= best_seq) {
