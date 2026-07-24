@@ -36,6 +36,14 @@ enum raidkm_reshape_phase {
 	RAIDKM_PH_FINALIZE	= 4,	/* all bands done; SB geometry flip pending */
 };
 
+/* Which reshape the journal describes.  Classic (add-parity / add-data) records
+ * leave kind == 0; declustered pool expansion sets DCL_POOL and fills the
+ * dcl_* geometry fields so recovery can rebuild both permutation maps. */
+enum raidkm_reshape_kind {
+	RAIDKM_RESHAPE_KIND_CLASSIC	= 0,
+	RAIDKM_RESHAPE_KIND_DCL_POOL	= 1,
+};
+
 /* On-disk journal record (one per slot).  __le fields, fixed layout. */
 struct raidkm_reshape_journal {
 	__le32	magic;			/* RAIDKM_RJ_MAGIC */
@@ -50,6 +58,16 @@ struct raidkm_reshape_journal {
 	__le32	scratch_rows;		/* stripe rows the scratch zone holds */
 	__le64	reshape_position;	/* committed frontier (array sectors) */
 	__le32	data_csum;		/* crc32c of the staged band in scratch */
+	/* v2 (declustered pool expansion): kind == RAIDKM_RESHAPE_KIND_DCL_POOL;
+	 * old/new pool sizes ride old_raid_disks/new_raid_disks, m is unchanged
+	 * (old_m == new_m).  Classic reshapes leave all of these zero. */
+	__le32	kind;			/* enum raidkm_reshape_kind */
+	__le32	dcl_g;			/* group width (unchanged across the grow) */
+	__le32	dcl_s;			/* spare columns (unchanged) */
+	__le32	dcl_nbase;		/* base shuffles (unchanged) */
+	__le64	dcl_old_seed;		/* OLD permutation seed */
+	__le64	dcl_new_seed;		/* NEW permutation seed */
+	__le64	frontier_row;		/* device chunk row of this band */
 	__le32	hdr_csum;		/* crc32c of this header with hdr_csum == 0 */
 } __packed;
 
@@ -79,6 +97,11 @@ struct raidkm_reshape_ctx {
 	u32		old_raid_disks, new_raid_disks;
 	u32		chunk_sectors;
 	u32		scratch_rows;
+	/* v2 declustered pool expansion (zero for classic reshapes) */
+	u32		kind;		/* enum raidkm_reshape_kind */
+	u32		dcl_g, dcl_s, dcl_nbase;
+	u64		dcl_old_seed, dcl_new_seed;
+	u64		frontier_row;	/* device row of the band being journaled */
 };
 
 /* I/O to a member's scratch zone at @local (0..SCRATCH), below data_offset. */

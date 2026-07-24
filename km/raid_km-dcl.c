@@ -358,6 +358,79 @@ module_param_cb(dcl_selftest, &dcl_selftest_ops, NULL, 0600);
 MODULE_PARM_DESC(dcl_selftest,
 	"declustered map self-test: write N:g:m:s:nbase:seed[:crc32] (see tools/raidkm-test-declustered-map.sh)");
 
+/* P0 reshape geometry-select consistency selftest (declustered pool
+ * expansion, notes/declustered-reshape-design.md §8 P0).  Builds the OLD and
+ * NEW permutation maps (g/m/s/nbase shared, the pool widens oldN -> newN),
+ * freezes a NEW-row frontier, and sweeps the OLD logical address space so
+ * raidkm_dcl_test_reshape can assert the two runtime geometry selectors
+ * (raidkm_dcl_geom_for_chunk / _for_row) agree with each other and with the
+ * frontier rule.  Shares dcl_selftest_result / _lock (both report through the
+ * same read-back).  Input:
+ *   g:m:s:nbase:oldN:oldseed:newN:newseed:oldrows:frontier
+ */
+static int dcl_reshape_selftest_set(const char *val,
+				    const struct kernel_param *kp)
+{
+	u32 g, m, s, nbase, oldN, newN;
+	u64 oldseed, newseed, oldrows, frontier, bad = 0;
+	struct dcl_geom *oldge = NULL, *newge = NULL;
+	struct r5conf *conf = NULL;
+	int n, ret;
+
+	n = sscanf(val, "%u:%u:%u:%u:%u:%llx:%u:%llx:%llu:%llu",
+		   &g, &m, &s, &nbase, &oldN, &oldseed, &newN, &newseed,
+		   &oldrows, &frontier);
+	if (n < 10) {
+		pr_err("raidkm: dcl_reshape_selftest wants g:m:s:nbase:oldN:oldseed:newN:newseed:oldrows:frontier\n");
+		return -EINVAL;
+	}
+	if (m < 2 || g <= m || !s || !nbase || nbase > DCL_ST_MAX_NBASE ||
+	    oldN < g + s || newN <= oldN || newN > 255 ||
+	    (oldN - s) % g || (newN - s) % g || !oldrows) {
+		pr_err("raidkm: dcl_reshape_selftest bad geometry (C1 on both N; oldN<newN<=255; m>=2, s>=1, nbase<=%u)\n",
+		       DCL_ST_MAX_NBASE);
+		return -EINVAL;
+	}
+
+	oldge = raidkm_dcl_geom_new(oldN, g, m, s, nbase, oldseed);
+	newge = raidkm_dcl_geom_new(newN, g, m, s, nbase, newseed);
+	conf = kzalloc(sizeof(*conf), GFP_KERNEL);
+	if (!oldge || !newge || !conf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	conf->prev_dcl = oldge;
+	conf->dcl = newge;
+	conf->reshape_frontier_row = frontier;
+
+	mutex_lock(&dcl_selftest_lock);
+	ret = raidkm_dcl_test_reshape(conf, oldrows, &bad);
+	if (ret == 0)
+		scnprintf(dcl_selftest_result, sizeof(dcl_selftest_result),
+			  "RESHAPE PASS oldN=%u newN=%u F=%llu rows=%llu",
+			  oldN, newN, frontier, oldrows);
+	else
+		scnprintf(dcl_selftest_result, sizeof(dcl_selftest_result),
+			  "RESHAPE FAIL(%d) oldN=%u newN=%u F=%llu chunk=%llu",
+			  ret, oldN, newN, frontier, bad);
+	pr_info("raidkm: DCLTEST %s\n", dcl_selftest_result);
+	mutex_unlock(&dcl_selftest_lock);
+	ret = ret ? -EINVAL : 0;
+out:
+	raidkm_dcl_geom_destroy(oldge);
+	raidkm_dcl_geom_destroy(newge);
+	kfree(conf);
+	return ret;
+}
+
+static const struct kernel_param_ops dcl_reshape_selftest_ops = {
+	.set = dcl_reshape_selftest_set,
+	.get = dcl_selftest_get,	/* shares dcl_selftest_result */
+};
+module_param_cb(dcl_reshape_selftest, &dcl_reshape_selftest_ops, NULL, 0600);
+MODULE_PARM_DESC(dcl_reshape_selftest,
+	"declustered reshape geom-select self-test: g:m:s:nbase:oldN:oldseed:newN:newseed:oldrows:frontier");
+
 /* ---- Phase 1c: load the on-disk rkdcl metadata block at setup_conf -------- */
 
 /* Verify a candidate rkdcl block (magic, version 1..3, crc, geometry vs
@@ -378,8 +451,14 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 	blk->hdr_crc = cpu_to_le32(want);
 	if (crc != want)
 		return -EINVAL;
-	/* geometry must agree with the layout word and the rdev count */
-	if (le32_to_cpu(blk->pool_disks) != (u32)mddev->raid_disks ||
+	/* geometry must agree with the layout word and the rdev count.  During
+	 * a pool-expansion reshape the rkdcl block still holds the OLD pool size
+	 * (it is rewritten only at finalize) while raid_disks is already the new
+	 * size — accept pool_disks < raid_disks in that (reshape-in-progress)
+	 * window; the reshape journal carries the authoritative geometry. */
+	if ((le32_to_cpu(blk->pool_disks) != (u32)mddev->raid_disks &&
+	     !(mddev->reshape_position != MaxSector &&
+	       le32_to_cpu(blk->pool_disks) < (u32)mddev->raid_disks)) ||
 	    le32_to_cpu(blk->group_width) != (u32)RAIDKM_LAYOUT_DCL_G(layout) ||
 	    le32_to_cpu(blk->parity) != (u32)raidkm_layout_m(layout) ||
 	    le32_to_cpu(blk->spare_cols) != (u32)RAIDKM_LAYOUT_DCL_S(layout) ||
@@ -431,6 +510,48 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 		}
 	}
 	return 0;
+}
+
+/* Build a standalone declustered geometry (permutation tables included) from
+ * the scalar parameters.  The on-disk load path (raidkm_dcl_load) inlines the
+ * equivalent for conf->dcl; this factory serves conf->prev_dcl during a
+ * pool-expansion reshape, where the OLD geometry is reconstructed from the
+ * reshape journal's recorded {N,g,m,s,nbase,seed}.  Caller owns the result and
+ * frees it with raidkm_dcl_geom_destroy. */
+struct dcl_geom *raidkm_dcl_geom_new(u32 N, u32 g, u32 m, u32 s,
+				     u32 nbase, u64 seed)
+{
+	struct dcl_geom *ge = kzalloc(sizeof(*ge), GFP_KERNEL);
+
+	if (!ge)
+		return NULL;
+	ge->N = N;
+	ge->g = g;
+	ge->m = m;
+	ge->k = g - m;
+	ge->s = s;
+	ge->ngroups = (N - s) / g;
+	ge->nbase = nbase;
+	ge->seed = seed;
+	ge->base  = kvmalloc_array((size_t)nbase * N, sizeof(u32), GFP_KERNEL);
+	ge->ibase = kvmalloc_array((size_t)nbase * N, sizeof(u32), GFP_KERNEL);
+	if (!ge->base || !ge->ibase) {
+		kvfree(ge->base);
+		kvfree(ge->ibase);
+		kfree(ge);
+		return NULL;
+	}
+	dcl_geom_tables(ge);
+	return ge;
+}
+
+void raidkm_dcl_geom_destroy(struct dcl_geom *ge)
+{
+	if (!ge)
+		return;
+	kvfree(ge->base);
+	kvfree(ge->ibase);
+	kfree(ge);
 }
 
 /* Read + verify the rkdcl metadata block from EVERY readable member and keep
@@ -641,6 +762,10 @@ void raidkm_dcl_free(struct r5conf *conf)
 	kvfree(conf->dcl->ibase);
 	kfree(conf->dcl);
 	conf->dcl = NULL;
+	/* a reshape torn down without finishing (stop mid-reshape) leaves the
+	 * OLD geometry hanging off prev_dcl; free it too */
+	raidkm_dcl_geom_destroy(conf->prev_dcl);
+	conf->prev_dcl = NULL;
 	bitmap_free(conf->reb_win_bits);
 	conf->reb_win_bits = NULL;
 	kfree(conf->reb);

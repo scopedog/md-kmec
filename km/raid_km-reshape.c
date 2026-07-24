@@ -96,6 +96,13 @@ int raidkm_reshape_jwrite(struct r5conf *conf, struct raidkm_reshape_ctx *ctx,
 	rj->scratch_rows	= cpu_to_le32(ctx->scratch_rows);
 	rj->reshape_position	= cpu_to_le64(reshape_position);
 	rj->data_csum		= cpu_to_le32(data_csum);
+	rj->kind		= cpu_to_le32(ctx->kind);
+	rj->dcl_g		= cpu_to_le32(ctx->dcl_g);
+	rj->dcl_s		= cpu_to_le32(ctx->dcl_s);
+	rj->dcl_nbase		= cpu_to_le32(ctx->dcl_nbase);
+	rj->dcl_old_seed	= cpu_to_le64(ctx->dcl_old_seed);
+	rj->dcl_new_seed	= cpu_to_le64(ctx->dcl_new_seed);
+	rj->frontier_row	= cpu_to_le64(ctx->frontier_row);
 	rj->hdr_csum		= cpu_to_le32(raidkm_rj_csum(rj));
 
 	slot_local = (ctx->jseq & (RAIDKM_RJ_SLOTS - 1)) * RAIDKM_PAGE_SECTORS;

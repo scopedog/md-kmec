@@ -951,6 +951,24 @@ struct r5conf {
 					 * RAIDKM_LAYOUT_DCL.  Freed with the
 					 * conf. */
 	/*
+	 * Declustered online pool-expansion reshape (N -> N', g/m/s fixed;
+	 * notes/declustered-reshape-design.md).  While a reshape is in flight
+	 * TWO geometries are live: prev_dcl == the OLD (pre-widen) map, dcl ==
+	 * the NEW (wider) map.  reshape_frontier_row is the per-disk device
+	 * chunk row below which content has been migrated to the new geometry
+	 * (row < frontier => new; row >= frontier => old).  prev_dcl is NULL
+	 * and frontier is 0 whenever no reshape is running, which makes every
+	 * geometry-select (raidkm_dcl_geom_for_{chunk,row}) collapse to dcl and
+	 * the whole steady-state path bit-identical to the pre-reshape code.
+	 * prev_dcl is freed at end_reshape and in raidkm_dcl_free.
+	 */
+	struct dcl_geom		*prev_dcl;
+	sector_t		reshape_frontier_row;
+	u64			reshape_new_seed;	/* NEW-geometry permutation
+							 * seed, staged by the
+							 * reshape trigger, consumed
+							 * by raidkm_dcl_start_reshape */
+	/*
 	 * Declustered spare-assignment / population state (Phase 3 + 3b,
 	 * notes/declustered-population-design.md).  Loaded from the highest-
 	 * generation rkdcl v2/v3 block; journaled back on state transitions
@@ -1334,6 +1352,14 @@ void raidkm_ppl_encode_modified(struct r5conf *conf, void **src,
  * permutation tables into conf->dcl (raid_km-dcl.c) */
 int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev);
 void raidkm_dcl_free(struct r5conf *conf);
+/* Declustered reshape: build/destroy a standalone dcl_geom (with its own
+ * permutation tables) from the scalar geometry — used for conf->prev_dcl
+ * during a pool-expansion reshape (raid_km-dcl.c;
+ * notes/declustered-reshape-design.md).  Returns NULL on allocation
+ * failure. */
+struct dcl_geom *raidkm_dcl_geom_new(u32 N, u32 g, u32 m, u32 s,
+				     u32 nbase, u64 seed);
+void raidkm_dcl_geom_destroy(struct dcl_geom *ge);
 /* Declustered Phase 3: spare-assignment journal + population prefix mark
  * (raid_km-dcl.c; notes/declustered-population-design.md) */
 #define RKDCL_REB_WINDOW	16384	/* stripe-address granules; must
@@ -1346,4 +1372,7 @@ void raidkm_dcl_pop_done(struct r5conf *conf, sector_t sector);
 int raidkm_dcl_test_redirect(struct r5conf *conf, int disk, sector_t row,
 			     bool for_write);
 int raidkm_dcl_test_chain_root(struct r5conf *conf, sector_t row, int X);
+/* P0 reshape geometry-select consistency sweep over the OLD address space
+ * (raid_km.c; notes/declustered-reshape-design.md §8 Phase P0) */
+int raidkm_dcl_test_reshape(struct r5conf *conf, u64 old_rows, u64 *bad);
 #endif
