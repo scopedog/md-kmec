@@ -26,6 +26,15 @@ BTF="${BTF_VMLINUX:-/sys/kernel/btf/vmlinux}"
 
 skip() { echo "$tag SKIP: $1 — struct mddev ABI not verified (build continues)"; exit 0; }
 
+# Instrumented (lockdep) kernels grow every embedded lock, so the production
+# offset tables below can never match — and need not: the module compiles from
+# the same headers/config as the kernel, so its layout moves identically.
+# (Pairs with the CONFIG_PROVE_LOCKING guard in km/raid_km.c.)
+for cfg in "/boot/config-$KVER" "/lib/modules/$KVER/build/.config"; do
+	[ -r "$cfg" ] && grep -q '^CONFIG_PROVE_LOCKING=y' "$cfg" &&
+		skip "lockdep kernel ($KVER): embedded locks grow, production offsets do not apply"
+done
+
 command -v pahole >/dev/null 2>&1 || skip "pahole not found (install 'dwarves')"
 [ -r "$BTF" ] || skip "$BTF not readable"
 # /sys/kernel/btf/vmlinux describes the RUNNING kernel; if we are building for a

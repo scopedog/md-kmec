@@ -83,7 +83,14 @@
  */
 static void __maybe_unused raidkm_mddev_abi_checks(void)
 {
-#ifdef RAIDKM_TARGET_RHEL10
+#ifdef CONFIG_PROVE_LOCKING
+	/* lockdep grows every embedded lock (mutex/spinlock/rwsem carry a
+	 * lockdep_map), so the PRODUCTION offsets pinned below cannot match an
+	 * instrumented debug kernel — and do not need to: the module compiles
+	 * from the same headers and config as that kernel, so its layout moves
+	 * identically and the binding stays correct by construction.  Skip the
+	 * pins; check-mddev-abi.sh skips for the same reason. */
+#elif defined(RAIDKM_TARGET_RHEL10)
 	/* RHEL 10.2 builtin md core (6.12.0-211.x.el10_2). */
 	BUILD_BUG_ON(sizeof(struct mddev)			!= 2080);
 	BUILD_BUG_ON(offsetof(struct mddev, gendisk)		!= 120);
