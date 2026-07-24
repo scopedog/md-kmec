@@ -10203,9 +10203,11 @@ static int raidkm_reshape_migrate_band_dcl(struct r5conf *conf,
 	sector_t home = row * chunk, old_rows;
 	u64 old_data_chunks;
 	u32 dcsum = 0;
-	int grp, slot, p, po, j, err = 0;
+	int grp, slot, p, po, j, err = 0, lim;
+#ifdef RAIDKM_FAULT_INJECT
+	enum raidkm_inject_action act;
+#endif
 
-	(void)last_band;
 	if (Nnew > RAIDKM_MAX_STRIPE_DISKS)
 		return -EINVAL;
 
@@ -10301,14 +10303,32 @@ static int raidkm_reshape_migrate_band_dcl(struct r5conf *conf,
 				    (u64)row * ng * k, ng * k, dcsum,
 				    conf->reshape_progress);
 	if (err) goto out;
-	raidkm_reshape_write_units(conf, band, Nnew, npages, 0, true, total);
+	lim = total;
+#ifdef RAIDKM_FAULT_INJECT
+	act = raidkm_reshape_inject_decide(conf, row, last_band, RAIDKM_PH_STAGE);
+	if (act == RAIDKM_INJ_HANG) { err = raidkm_reshape_park(mddev); goto out; }
+	if (act == RAIDKM_INJ_TORN) lim = total / 2;
+#endif
+	raidkm_reshape_write_units(conf, band, Nnew, npages, 0, true, lim);
+#ifdef RAIDKM_FAULT_INJECT
+	if (act == RAIDKM_INJ_TORN) { err = raidkm_reshape_park(mddev); goto out; }
+#endif
 
 	/* ---- COMMIT: journal (scratch durable), then write the row home ---- */
 	err = raidkm_reshape_jwrite(conf, ctx, RAIDKM_PH_COMMIT,
 				    (u64)row * ng * k, ng * k, dcsum,
 				    conf->reshape_progress);
 	if (err) goto out;
-	raidkm_reshape_write_units(conf, band, Nnew, npages, home, false, total);
+	lim = total;
+#ifdef RAIDKM_FAULT_INJECT
+	act = raidkm_reshape_inject_decide(conf, row, last_band, RAIDKM_PH_COMMIT);
+	if (act == RAIDKM_INJ_HANG) { err = raidkm_reshape_park(mddev); goto out; }
+	if (act == RAIDKM_INJ_TORN) lim = total / 2;
+#endif
+	raidkm_reshape_write_units(conf, band, Nnew, npages, home, false, lim);
+#ifdef RAIDKM_FAULT_INJECT
+	if (act == RAIDKM_INJ_TORN) { err = raidkm_reshape_park(mddev); goto out; }
+#endif
 
 	/* ---- DONE ---- */
 	err = raidkm_reshape_jwrite(conf, ctx, RAIDKM_PH_DONE,
@@ -14222,6 +14242,20 @@ static int raid5_run(struct mddev *mddev)
 		here_new = mddev->reshape_position;
 		chunk_sectors = max(mddev->chunk_sectors, mddev->new_chunk_sectors);
 		new_data_disks = mddev->raid_disks - new_md;
+		/*
+		 * Declustered: a device row carries ngroups*k data columns, not
+		 * raid_disks - m, and reshape_position is frontier_row *
+		 * (ngroups*k) * chunk (raidkm_reshape_dcl_cow).  Use that data
+		 * count so the stripe-boundary check passes and reshape_offset
+		 * resolves to the per-disk frontier (here_new == frontier_row).
+		 */
+		if (raidkm_layout_is_dcl(mddev->new_layout)) {
+			int dg = RAIDKM_LAYOUT_DCL_G(mddev->new_layout);
+			int ds = RAIDKM_LAYOUT_DCL_S(mddev->new_layout);
+			int dng = (mddev->raid_disks - ds) / dg;
+
+			new_data_disks = dng * (dg - new_md);
+		}
 		if (sector_div(here_new, chunk_sectors * new_data_disks)) {
 			pr_warn("md/raid:%s: reshape_position not on a stripe boundary\n",
 				mdname(mddev));
