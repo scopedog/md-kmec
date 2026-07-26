@@ -45,8 +45,10 @@ if [ "$BTF" = "/sys/kernel/btf/vmlinux" ] && [ "$KVER" != "$(uname -r)" ]; then
 fi
 
 # --- expected layout (keep in sync with km/raid_km.c BUILD_BUG_ON) -----------
-# Target selected from the kernel release: ".el" => RHEL 10.2, else mainline/Debian.
+# Target selected from the kernel release: ".el9" => RHEL 9.7, other ".el" =>
+# RHEL 10.2, else mainline/Debian.
 case "$KVER" in
+*.el9*)	abi_target=rhel9 ;;
 *.el*)	abi_target=rhel10 ;;
 *)	abi_target=vanilla ;;
 esac
@@ -55,6 +57,12 @@ if [ "$abi_target" = vanilla ]; then
 	mddev_fields="gendisk=120 level=256 reshape_position=344 recovery_active=584"
 	exp_rdev_meta_bdev=				# (not pinned for vanilla)
 	exp_bitmap_start_sync=120			# bitmap_operations vtable slot (Debian 6.12.90)
+elif [ "$abi_target" = rhel9 ]; then
+	exp_size=2744					# RHEL 9.7 builtin md (5.14-el9, 6.12-era backport)
+	mddev_fields="gendisk=120 level=256 reshape_position=344 recovery_active=584 \
+	              cluster_ops=2704"
+	exp_rdev_meta_bdev=
+	exp_bitmap_start_sync=
 else
 	exp_size=2080					# RHEL 10.2 builtin md
 	mddev_fields="gendisk=120 dm_gendisk=128 level=264 reshape_position=352 \

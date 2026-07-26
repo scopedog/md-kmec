@@ -14,14 +14,21 @@ endif
 # Build target selects the md ABI/compat the sources are built against:
 #   rhel10  - RHEL 10.2 builtin md core (struct mddev 2080); md headers from
 #             the mdraid fork; compat/compat-rhel10.h.
+#   rhel9   - RHEL 9.7 builtin md core (5.14-el9, carries the 6.12-era md
+#             backport: md_submodule + bitmap_ops + queue_limits); vendored
+#             md-rhel9/ headers; compat/compat-rhel9.h.
 #   vanilla - mainline / Debian 6.12 md core (struct mddev 2336); vendored
 #             md-vanilla/ headers; compat/compat-vanilla.h.
-# Auto-detected from the kernel release (".el" => RHEL); override with TARGET=.
-TARGET ?= $(if $(findstring .el,$(KVER)),rhel10,vanilla)
+# Auto-detected from the kernel release (".el9" / other ".el" => RHEL);
+# override with TARGET=.
+TARGET ?= $(if $(findstring .el9,$(KVER)),rhel9,$(if $(findstring .el,$(KVER)),rhel10,vanilla))
 
 ifeq ($(TARGET),vanilla)
 COMPAT_HDR := $(CURDIR)/compat/compat-vanilla.h
 MD_HDRS    := $(CURDIR)/md-vanilla
+else ifeq ($(TARGET),rhel9)
+COMPAT_HDR := $(CURDIR)/compat/compat-rhel9.h
+MD_HDRS    := $(CURDIR)/md-rhel9
 else
 COMPAT_HDR := $(CURDIR)/compat/compat-rhel10.h
 MD_HDRS    := $(MDRAID_BUILD)/md

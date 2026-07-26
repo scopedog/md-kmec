@@ -90,6 +90,17 @@ static void __maybe_unused raidkm_mddev_abi_checks(void)
 	 * from the same headers and config as that kernel, so its layout moves
 	 * identically and the binding stays correct by construction.  Skip the
 	 * pins; check-mddev-abi.sh skips for the same reason. */
+#elif defined(RAIDKM_TARGET_RHEL9)
+	/* RHEL 9.7 builtin md core (5.14.0-611.x.el9_7 — 6.12-era md
+	 * backport).  Offsets match the mainline 6.12 layout for everything
+	 * raidkm touches; RHEL tail reserves + cluster_ops grow the size.
+	 * Verified via pahole on the running el9_7 BTF (2026-07-26). */
+	BUILD_BUG_ON(sizeof(struct mddev)			!= 2744);
+	BUILD_BUG_ON(offsetof(struct mddev, gendisk)		!= 120);
+	BUILD_BUG_ON(offsetof(struct mddev, level)		!= 256);
+	BUILD_BUG_ON(offsetof(struct mddev, reshape_position)	!= 344);
+	BUILD_BUG_ON(offsetof(struct mddev, recovery_active)	!= 584);
+	BUILD_BUG_ON(offsetof(struct mddev, cluster_ops)	!= 2704);
 #elif defined(RAIDKM_TARGET_RHEL10)
 	/* RHEL 10.2 builtin md core (6.12.0-211.x.el10_2). */
 	BUILD_BUG_ON(sizeof(struct mddev)			!= 2080);
@@ -16356,9 +16367,21 @@ static void raid5_prepare_suspend(struct mddev *mddev)
  */
 static struct md_personality raid_km_personality =
 {
+#ifdef RAIDKM_PERS_HAS_HEAD
+	/* el9-style md_personality: identity lives in the embedded
+	 * md_submodule_head (type/id/name/owner); the register shim in
+	 * compat-rhel9.h passes &p->head. */
+	.head = {
+		.type	= MD_PERSONALITY,
+		.id	= RAID_KM_LEVEL,
+		.name	= "raidkm",
+		.owner	= THIS_MODULE,
+	},
+#else
 	.name		= "raidkm",
 	.level		= RAID_KM_LEVEL,
 	.owner		= THIS_MODULE,
+#endif
 	.make_request	= raid5_make_request,
 	.run		= raid5_run,
 	.start		= raid5_start,

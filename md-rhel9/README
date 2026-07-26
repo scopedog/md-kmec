@@ -1,0 +1,18 @@
+# RHEL 9.7 private md headers (drivers/md/)
+#
+# EXACT copy of the RHEL 9.7 kernel's drivers/md/ headers, extracted from the
+# kernel-5.14.0-611.42.1.el9_7 source RPM.  Same vendoring rule as md-vanilla/
+# (see its README for the bitmap_ops-vtable lesson): always the *target
+# kernel's* exact drivers/md/, never a mainline approximation.
+#
+# Despite the 5.14 base, el9_7 carries the 6.12-era md core backport:
+# md_submodule registration, bitmap_ops vtable, md_init_stacking_limits /
+# queue_limits_*.  Deltas vs md-vanilla (6.12.90) are small: struct mddev
+# adds cluster_ops (no raidkm-visible offset pins change without re-checking
+# BTF — see the BUILD_BUG_ON block in km/raid_km.c and tools/check-mddev-abi.sh),
+# mddev_lock/trylock return -ENODEV on MD_DELETED, rdev_blocked() helper.
+#
+# raidkm on RHEL 9 builds against these via TARGET=rhel9
+# (compat/compat-rhel9.h).
+#
+# Files: md.h md-bitmap.h md-cluster.h raid1.h raid5.h raid10.h
