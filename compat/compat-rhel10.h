@@ -30,6 +30,15 @@
 	(mddev)->bitmap_ops->endwrite((mddev), (off), (sects))
 
 /*
+ * mddev->recovery_active is atomic64_t in the RHEL-ported md.h (see the
+ * port-fix #6 comment there) but atomic_t on mainline; the declustered
+ * sync-credit accounting goes through this shim so raid_km.c stays
+ * single-source.
+ */
+#define raidkm_recovery_active_add(mddev, sectors)			\
+	atomic64_add((sectors), &(mddev)->recovery_active)
+
+/*
  * RHEL 10 struct md_personality layout (192 bytes, verified by binary diff):
  *
  *   +0x00  u32 type          (submodule type; 0 = standard personality)

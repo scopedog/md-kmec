@@ -38,6 +38,14 @@
 	(mddev)->bitmap_ops->endwrite((mddev), (off), (sects))
 
 /*
+ * mddev->recovery_active is a 32-bit atomic_t on mainline (the RHEL port
+ * carries it as atomic64_t); the declustered sync-credit accounting goes
+ * through this shim so raid_km.c stays single-source.
+ */
+#define raidkm_recovery_active_add(mddev, sectors)			\
+	atomic_add((sectors), &(mddev)->recovery_active)
+
+/*
  * RHEL 10.2 exports raid6_get_zero_page(); mainline does not.  The
  * global zero page is an always-zero, read-only data source, which is
  * exactly what the syndrome path needs for a missing/zero block.

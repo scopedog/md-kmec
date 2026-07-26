@@ -11788,8 +11788,8 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		int grp;
 
 		for (grp = 1; grp < (int)conf->dcl->ngroups; grp++) {
-			atomic64_add(RAID5_STRIPE_SECTORS(conf),
-				     &mddev->recovery_active);
+			raidkm_recovery_active_add(mddev,
+						   RAID5_STRIPE_SECTORS(conf));
 			sh = raid5_get_active_stripe(conf, NULL, sector_nr,
 						     grp, 0);
 			set_bit(STRIPE_SYNC_REQUESTED, &sh->state);
@@ -14345,6 +14345,20 @@ static int only_parity(int raid_disk, int algo, int raid_disks, int max_degraded
 	return 0;
 }
 
+/* Data cells in one full stripe row — the io_opt / full-stripe-write unit.
+ * On a declustered array a row is the k data cells of one g-wide group;
+ * raid_disks is the pool width N (every group plus the distributed
+ * spares), so raid_disks - max_degraded is not the width of anything a
+ * single write can span.  Reported to the block layer as optimal_io_size,
+ * which mke2fs & co. turn into fs stride/stripe_width.
+ */
+static int raid5_stripe_data_disks(struct r5conf *conf)
+{
+	if (conf->dcl)
+		return conf->dcl->k;
+	return conf->raid_disks - conf->max_degraded;
+}
+
 static int raid5_set_limits(struct mddev *mddev)
 {
 	struct r5conf *conf = mddev->private;
@@ -14355,8 +14369,14 @@ static int raid5_set_limits(struct mddev *mddev)
 	/*
 	 * The read-ahead size must cover two whole stripes, which is
 	 * 2 * (datadisks) * chunksize where 'n' is the number of raid devices.
+	 * Declustered: the whole-stripe unit is the k-cell group row (a
+	 * g-change reshape is offline-only and pool expansion keeps k, so
+	 * there is no previous-geometry variant to consider).
 	 */
-	data_disks = conf->previous_raid_disks - conf->prev_m;
+	if (conf->dcl)
+		data_disks = conf->dcl->k;
+	else
+		data_disks = conf->previous_raid_disks - conf->prev_m;
 
 	/*
 	 * We can only discard a whole stripe. It doesn't make sense to
@@ -14366,7 +14386,7 @@ static int raid5_set_limits(struct mddev *mddev)
 
 	md_init_stacking_limits(&lim);
 	lim.io_min = mddev->chunk_sectors << 9;
-	lim.io_opt = lim.io_min * (conf->raid_disks - conf->max_degraded);
+	lim.io_opt = lim.io_min * raid5_stripe_data_disks(conf);
 	lim.features |= BLK_FEAT_RAID_PARTIAL_STRIPES_EXPENSIVE;
 
 	/*
@@ -15775,7 +15795,7 @@ static void end_reshape(struct r5conf *conf)
 		wake_up(&conf->wait_for_reshape);
 
 		mddev_update_io_opt(conf->mddev,
-			conf->raid_disks - conf->max_degraded);
+				    raid5_stripe_data_disks(conf));
 	}
 }
 
