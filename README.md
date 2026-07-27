@@ -465,6 +465,54 @@ so 1.08 is run-to-run noise; the rest are within ±4%).  So the only cost of
 
 ### Tuning
 
+#### Deployment checklist
+
+Ordered by impact.  Most of the md side is already the default — the wins are
+geometry and layout decisions made **before** the array carries data.  Each
+item is expanded in the sections that follow.
+
+**Decide once, at array-create time** (a reshape is the only later fix):
+
+1. **Choose `k` so `k × chunk` is a power of two** — 256K, 512K, 1M.  Large
+   writes are almost always a power of two, so a row is only ever written whole
+   if the row is one too.  A width like `k=5` @ 64K (320K) or `k=14` @ 64K
+   (896K) leaves a partial row at the tail of every write, at every chunk size,
+   with no tuning available.
+2. **Prefer declustered parity on wide pools** — it decouples pool width from
+   row width, so an 80-disk pool keeps a small, easily-filled row instead of a
+   ~5 MiB one, and rebuilds far faster.
+3. **Keep the 64K chunk default** unless deliberately trading for a specific
+   row width.
+
+**Storage layout:**
+
+4. **Put the filesystem journal on a separate device** — the single largest win
+   here (see *Keep the filesystem journal off the array*).
+5. **Start the partition or LV on a row boundary** — nothing detects a
+   violation at runtime; it silently phase-shifts every allocation.
+6. **Keep other small, barriered write streams off the array** — same mechanism
+   as the journal.
+
+**Filesystem geometry:**
+
+7. **Set `stride`/`stripe_width`** to match the array, or let `mkfs.ext4` derive
+   them from `optimal_io_size`.  Verify with `dumpe2fs -h <dev> | grep RAID`.
+8. **After a grow that changes `k`, refresh them with `tune2fs`** — `mdadm
+   --grow` prints the exact command.
+
+**md tunables — verify, don't tune:**
+
+9. `skip_copy` and worker groups are **already on by default**.  On many-core
+   hosts, raising `worker_thread_cnt` toward `nproc` may help concurrent writes
+   — measure rather than assume.
+10. `stripe_cache_size` (default fine) and `preread_bypass_threshold`
+    (irrelevant to full-row writes) are not worth sweeping.
+
+**One-line version:** get `k`, the journal, and the partition offset right at
+build time; everything else is already the default or automatic.
+
+#### Worker threads
+
 raidkm already auto-enables raid5 **worker groups**: total worker threads default
 to `max(num_online_cpus()/2, 2)`, distributed across `num_possible_nodes()` groups
 (the kernel creates one worker group per NUMA node).  The single `raid5d` kthread
@@ -541,11 +589,52 @@ mkfs.ext4 -b 4096 -E stride=$((chunk/4096)),stripe_width=$((k*chunk/4096)) /dev/
 > Grows that leave k unchanged (adding parity, expanding a declustered pool)
 > don't affect it and print nothing.
 
-If the array carries a filesystem **journal**, keep it off the array — an
-internal journal issues a small sub-row write per transaction, and each one is a
-read-modify-write against the parity.  Moving the journal to a separate device
-(`mke2fs -O journal_dev` + `tune2fs -J device=`) removed essentially all of the
-residual read traffic in our measurements.
+#### Keep the filesystem journal off the array
+
+Alignment fixes the *large* writes.  What is left is usually a small, frequent
+write stream sharing the array with them — and on a parity array that is
+expensive out of all proportion to its size.
+
+A journalled filesystem is the common case.  By default the ext4/jbd2 journal
+is a hidden inode **inside** the filesystem, so its commits land on the array,
+interleaved with the data.  Those commits are small and sub-row, and every
+sub-row write is a read-modify-write: read the old data and parity, recompute,
+write back.  The journal is only a few percent of the bytes written and can
+still dominate the array's read traffic.
+
+Measured on a `k=8 m=2` array at 64 KiB chunk under streaming 1 MiB aligned
+O_DIRECT writes — same filesystem, same workload, only the journal moved:
+
+| journal location | array member reads | journal device |
+|---|---|---|
+| internal (on the array) | 43–50 MB per GiB written | — |
+| **external (own device)** | **0.2 MB per GiB written** | 39 MB/GiB written, 0 read |
+
+The work does not disappear, it just stops being charged parity RMW.  Note the
+symptom this produces if you do not know to look for it: the cost is nearly
+constant *per transaction*, so it scales with commit rate rather than with I/O
+size, and it is easy to mistake for a fixed per-write overhead somewhere in the
+block layer.
+
+To move it:
+
+```sh
+mke2fs -O journal_dev /dev/sdX          # format a device as an external journal
+tune2fs -O ^has_journal /dev/md70       # drop the internal journal
+tune2fs -J device=/dev/sdX /dev/md70    # point the filesystem at the new one
+```
+
+(or `mke2fs -J device=/dev/sdX` at filesystem-creation time.)
+
+> **The journal device becomes a correctness dependency.**  The filesystem will
+> not mount without it, and losing it loses the journal.  Give it durability at
+> least equal to the array it serves — a mirror, or an SSD with power-loss
+> protection.  An internal journal is parity-protected; an external one is only
+> as safe as the device you put it on.
+
+The general rule generalizes past journals: **any small, frequent write stream
+co-located with large aligned writes will tax them.**  Metadata-heavy sidecars
+and write-intent logs behave the same way.
 
 ### Testing
 
