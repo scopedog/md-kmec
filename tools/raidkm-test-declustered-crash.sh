@@ -312,7 +312,19 @@ for it in $(seq 1 "$ITERS"); do
 	rk_dmesg_window_close; rk_dmesg_clear
 	# --force: the dropped stop leaves DIRTY superblocks and the pool is
 	# degraded — md (correctly) refuses dirty+degraded without it.
-	sudo "$MDADM" --assemble --force --run "$MD" "${SURV[@]}" > /dev/null 2>&1 || {
+	# Retry briefly: the dead instance's member release can still be
+	# draining (notably on KASAN/lockdep kernels, where an immediate
+	# assemble sees "busy - skipping" and fails); a persistently busy
+	# member is still a real failure.
+	asm_ok=0
+	for _try in 1 2 3 4 5 6; do
+		if sudo "$MDADM" --assemble --force --run "$MD" "${SURV[@]}" > /dev/null 2>&1; then
+			asm_ok=1; break
+		fi
+		sudo "$MDADM" --stop "$MD" > /dev/null 2>&1
+		sleep 5
+	done
+	[ "$asm_ok" = 1 ] || {
 		rk_fail "$tag: post-crash assemble failed (crash at ${delay}s, premark=$premark)"
 		break; }
 	# multi: F's assignment completed (and was journaled) BEFORE F2 failed,

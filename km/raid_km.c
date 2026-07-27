@@ -3259,6 +3259,33 @@ ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
 			clear_bit(STRIPE_OP_BIODRAIN, ops_request);
 			clear_bit(STRIPE_OP_PARTIAL_PARITY, ops_request);
 		}
+		/*
+		 * Unwind the write-path latches too.  schedule_reconstruction
+		 * (paired with this compute in the same handle pass) marked
+		 * the draining data slots R5_LOCKED|R5_Wantdrain and the
+		 * parity slots R5_LOCKED; their ops were just dropped above
+		 * and no member I/O has been issued for them (writes only go
+		 * out after ops_complete_reconstruct).  Left set, those
+		 * R5_LOCKED bits make the stripe permanently unschedulable:
+		 * need_this_block() skips locked slots and the dirtying path
+		 * cannot relatch, so no re-derivation ever happens and the
+		 * stripe spins on the handle list forever (observed as a
+		 * degraded-write livelock in the el9 KASAN+lockdep gate:
+		 * workers pinned in analyse_stripe, preread_active stuck,
+		 * quiesce unkillable).
+		 */
+		if (sh->reconstruct_state == reconstruct_state_drain_run ||
+		    sh->reconstruct_state == reconstruct_state_prexor_drain_run ||
+		    sh->reconstruct_state == reconstruct_state_run) {
+			for (i = 0; i < disks; i++) {
+				struct r5dev *dev = &sh->dev[i];
+
+				if (test_and_clear_bit(R5_Wantdrain, &dev->flags))
+					clear_bit(R5_LOCKED, &dev->flags);
+				else if (is_parity_disk(sh, i))
+					clear_bit(R5_LOCKED, &dev->flags);
+			}
+		}
 		sh->reconstruct_state = reconstruct_state_idle;
 		set_bit(STRIPE_HANDLE, &sh->state);
 		atomic_inc(&sh->count);
