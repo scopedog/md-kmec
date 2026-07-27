@@ -507,6 +507,46 @@ win sitting unused.  The one knob worth revisiting per host:
 group win should be larger — threads overlap device latency — and the stripe-cache
 result may invert.)
 
+#### Filesystem geometry (stride / stripe width)
+
+A write that covers whole rows is a reconstruct-write with **no pre-read**; one
+that straddles a row boundary forces a read-modify-write.  So a filesystem on a
+raidkm array should align and size its allocations to the **data row**,
+`k × chunk`.
+
+The array advertises exactly that as `optimal_io_size`, so `mkfs.ext4` picks it
+up with no options:
+
+```sh
+cat /sys/block/md70/queue/optimal_io_size    # = k * chunk
+```
+
+This is the **data** row width, not the pool width — on a declustered array the
+row is `k = g − m` cells wide regardless of how many disks are in the pool, so a
+14-disk pool with `g=6, m=2` advertises `4 × chunk`, not `12 × chunk`.  To set
+the geometry by hand (4 KiB filesystem blocks, 64 KiB chunk → stride 16):
+
+```sh
+mkfs.ext4 -b 4096 -E stride=$((chunk/4096)),stripe_width=$((k*chunk/4096)) /dev/md70
+```
+
+> **After a grow that changes k**, the filesystem's stored geometry is stale and
+> every subsequent write lands off-row.  `mdadm --grow` prints the exact refresh
+> command; it is a metadata-only update, no re-write of data:
+>
+> ```sh
+> tune2fs -E stride=16,stripe_width=80 /dev/md70   # then remount
+> ```
+>
+> Grows that leave k unchanged (adding parity, expanding a declustered pool)
+> don't affect it and print nothing.
+
+If the array carries a filesystem **journal**, keep it off the array — an
+internal journal issues a small sub-row write per transaction, and each one is a
+read-modify-write against the parity.  Moving the journal to a separate device
+(`mke2fs -O journal_dev` + `tune2fs -J device=`) removed essentially all of the
+residual read traffic in our measurements.
+
 ### Testing
 
 `tools/raidkm-test.sh` runs the regression suite — functional
@@ -575,7 +615,11 @@ md-kmec/
 ├── Kbuild               # top-level kbuild glue (obj-m += km/)
 ├── Makefile             # build infra; symlinks ../mdraid/md and ../mdraid/isa-l
 ├── compat/
-│   └── compat-rhel10.h  # RHEL 10.1 personality-API shim (force-included by the build)
+│   ├── compat-rhel10.h  # RHEL 10.x personality-API shim (force-included by the build)
+│   ├── compat-rhel9.h   # RHEL 9.x shim (md_submodule head-style personality)
+│   └── compat-vanilla.h # mainline-kernel shim
+├── md-rhel9/            # vendored RHEL 9.x md headers (ABI matches in-kernel md-mod)
+├── md-vanilla/          # vendored mainline md headers
 ├── tools/
 │   ├── raidkm-test.sh               # run the full test suite (functional/degraded/grow)
 │   ├── raidkm-test-lib.sh           # shared helpers sourced by the test scripts
@@ -612,9 +656,29 @@ cd ../mdraid && make     # produces isal_lib.ko + raid456.ko etc.
 cd ../md-kmec && make    # produces km/raidkm.ko
 ```
 
-The build force-includes `compat/compat-rhel10.h` so the verbatim
-raid5.c source compiles against the RHEL 10.1 personality API
-(`register_md_submodule` etc.).
+### Kernel targets
+
+One source tree builds against three kernel flavours.  The build picks a
+`TARGET` from the running kernel release and force-includes the matching
+`compat/compat-*.h` shim, so the verbatim raid5.c fork compiles against each
+kernel's personality API (`register_md_submodule` etc.) unchanged:
+
+| `TARGET`  | Selected when     | md headers   | Notes |
+|-----------|-------------------|--------------|-------|
+| `rhel10`  | `.el10` release   | built mdraid tree | flat `md_personality` with `.level` |
+| `rhel9`   | `.el9` release    | `md-rhel9/`  | `md_submodule_head`-style personality (level comes from `head.id`) |
+| `vanilla` | anything else     | `md-vanilla/` | mainline |
+
+Override the auto-detection with `make TARGET=rhel9` (useful when building
+against a KDIR whose release string doesn't carry the distro suffix, e.g. a
+locally-built debug kernel).
+
+RHEL 9 support is **production-grade**: the full 12-suite matrix (functional,
+declustered create/io/degraded/csum/populate/rebalance/autoarm/multi/crash,
+checksum thrash, self-heal) passes 211 distinct checks under a
+KASAN + lockdep kernel with zero splats.  The vendored `md-rhel9/` headers come
+from the distro kernel source, so the ABI matches the in-kernel `md-mod` by
+construction rather than by inspection.
 
 ## Managing raidkm arrays with mdadm
 
@@ -1066,8 +1130,9 @@ raidkm's layout, **growing/shrinking a raidkm LV is not supported via LVM** — 
 
 An LVM raidkm LV is an ordinary cache origin, so it can be fronted by **lvmcache**
 (`lvconvert --type cache`) — e.g. a fast tier over the EC capacity tier under a
-filesystem. See `notes/rhel9-lvmcache-ost.md` (on the `rhel9-port` branch) for an
-end-to-end `dm-cache → dm-raid(raidkm)` validation.
+filesystem. See `notes/rhel9-lvmcache-ost.md` (still only on the legacy
+`rhel9-port` branch) for an end-to-end
+`dm-cache → dm-raid(raidkm)` validation on RHEL 9.
 
 ## License
 
