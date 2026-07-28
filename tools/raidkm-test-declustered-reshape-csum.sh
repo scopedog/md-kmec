@@ -212,7 +212,12 @@ cmp -s "$RK_TMP/rb$LC" "$RK_TMP/exp$LC" &&
 	rk_pass "T3: rotted block healed through the ahead (old-geometry) region" ||
 	rk_fail "T3: ahead-region read returned corrupt bytes"
 healed=0
-for i in $(seq 1 30); do	# the heal rewrite is asynchronous
+# The heal rewrite is asynchronous.  The window has to cover an INSTRUMENTED
+# kernel too: on KASAN+lockdep everything runs several times slower and 15s
+# expired here while the heal was still in flight (the data-correctness
+# assertions above had already passed).  Poll up to 60s; a genuine failure to
+# heal still fails, it just is not raced by a slow kernel.
+for i in $(seq 1 ${HEAL_POLL_TRIES:-120}); do
 	raw_matches "${MEMBERS[$DSK]}" "$ROW" "$RK_TMP/exp$LC" && { healed=1; break; }
 	sleep 0.5
 done

@@ -254,8 +254,13 @@ static inline int raidkm_dcl_redirect(struct r5conf *conf, int disk,
 static inline struct dcl_geom *raidkm_dcl_geom_for_row(struct r5conf *conf,
 						       sector_t row)
 {
-	if (conf->prev_dcl && row >= READ_ONCE(conf->reshape_frontier_row))
-		return conf->prev_dcl;
+	/* Single load: prev_dcl is unpublished lock-free at finalize, and a
+	 * check-then-reload could return NULL (or worse) to a caller that
+	 * passed the check.  Same in every prev_dcl selector below. */
+	struct dcl_geom *prev = READ_ONCE(conf->prev_dcl);
+
+	if (prev && row >= READ_ONCE(conf->reshape_frontier_row))
+		return prev;
 	return conf->dcl;
 }
 
@@ -267,15 +272,37 @@ static inline struct dcl_geom *raidkm_dcl_geom_for_chunk(struct r5conf *conf,
 							 sector_t logical_chunk)
 {
 	struct dcl_geom *ge = conf->dcl;
+	struct dcl_geom *prev = READ_ONCE(conf->prev_dcl);
 
-	if (conf->prev_dcl) {
+	if (prev) {
 		sector_t nrow = logical_chunk;
 
 		sector_div(nrow, ge->ngroups * ge->k);	/* NEW-geometry row */
 		if (nrow >= READ_ONCE(conf->reshape_frontier_row))
-			return conf->prev_dcl;
+			return prev;
 	}
 	return ge;
+}
+
+/* Geometry of an ACTIVE STRIPE.  During a g-CHANGING reshape (add-parity /
+ * add-data) the stripe carries its geometry in sh->disks (built at
+ * prev_dcl->g by init_stripe for the un-migrated region, dcl->g below the
+ * frontier) — key on THAT, never on the moving frontier, so every accessor
+ * of one stripe resolves the same geometry no matter when it runs
+ * (raidkm_sh_dcl_prev, raid_km.h).  g-PRESERVING reshapes (pool expansion,
+ * spare-count) can't discriminate by width but don't need to for the EC
+ * dimensions; their placement stays row-keyed exactly as shipped (the band
+ * claim + quiesce pulse brackets frontier movement).  Steady state
+ * (prev_dcl NULL) collapses to conf->dcl. */
+static inline struct dcl_geom *raidkm_sh_dcl_geom(struct r5conf *conf,
+						  struct stripe_head *sh,
+						  sector_t row)
+{
+	struct dcl_geom *prev = READ_ONCE(conf->prev_dcl);
+
+	if (prev && prev->g != conf->dcl->g)
+		return sh->disks == (int)prev->g ? prev : conf->dcl;
+	return raidkm_dcl_geom_for_row(conf, row);
 }
 
 /* Declustered D1: slot -> physical disk.  A pure function of
@@ -295,7 +322,7 @@ static inline int raidkm_sh_pdisk_rw(struct r5conf *conf,
 		return i;
 	row = sh->sector;
 	sector_div(row, conf->chunk_sectors);
-	ge = raidkm_dcl_geom_for_row(conf, row);
+	ge = raidkm_sh_dcl_geom(conf, sh, row);
 	disk = dcl_disk(ge, row, sh->dcl_group * ge->g + i);
 	return raidkm_dcl_redirect(conf, disk, row, for_write);
 }
@@ -435,8 +462,13 @@ int raidkm_dcl_test_reshape(struct r5conf *conf, u64 old_rows, u64 *bad)
 }
 
 /* Declustered: which group of its row a LOGICAL sector belongs to (the
- * (sector, group) stripe-identity discriminator).  0 when not declustered. */
-static inline int raidkm_dcl_group_of(struct r5conf *conf, sector_t logical)
+ * (sector, group) stripe-identity discriminator).  0 when not declustered.
+ * `previous` selects the OLD map of a live reshape explicitly (the stripe
+ * path's choice, from get_reshape_loc) so the group is derived under the
+ * SAME geometry as the stripe's sector/pd_idx/width — never re-keyed off
+ * the moving frontier; previous==0 callers stay frontier-keyed. */
+static inline int raidkm_dcl_group_of(struct r5conf *conf, sector_t logical,
+				      int previous)
 {
 	struct dcl_geom *ge;
 	sector_t chunk;
@@ -446,7 +478,12 @@ static inline int raidkm_dcl_group_of(struct r5conf *conf, sector_t logical)
 		return 0;
 	chunk = logical;
 	sector_div(chunk, conf->chunk_sectors);
-	ge = raidkm_dcl_geom_for_chunk(conf, chunk);
+	if (previous)
+		ge = READ_ONCE(conf->prev_dcl);
+	else
+		ge = NULL;
+	if (!ge)
+		ge = raidkm_dcl_geom_for_chunk(conf, chunk);
 	dcol = sector_div(chunk, ge->ngroups * ge->k);
 	return dcol / ge->k;
 }
@@ -471,7 +508,7 @@ static inline int raidkm_dcl_read_pdisk(struct r5conf *conf, sector_t logical,
 	sector_div(row, conf->chunk_sectors);
 	ge = raidkm_dcl_geom_for_row(conf, row);
 	disk = dcl_disk(ge, row,
-			raidkm_dcl_group_of(conf, logical) * ge->g + slot);
+			raidkm_dcl_group_of(conf, logical, 0) * ge->g + slot);
 	return raidkm_dcl_redirect(conf, disk, row, false);
 }
 
@@ -1055,8 +1092,21 @@ static void init_stripe(struct stripe_head *sh, sector_t sector, int previous,
 retry:
 	seq = read_seqcount_begin(&conf->gen_lock);
 	sh->generation = conf->generation - previous;
-	sh->disks = conf->dcl ? (int)conf->dcl->g :
-		    (previous ? conf->previous_raid_disks : conf->raid_disks);
+	/* Declustered: the stripe spans one GROUP; during a g-changing reshape
+	 * an un-migrated-region stripe (previous) is built at the OLD group
+	 * width — sh->disks then discriminates the two geometries for every
+	 * later accessor (raidkm_sh_dcl_prev).  prev_dcl->g == dcl->g for
+	 * pool expansion / spare-count, so `previous` is dimension-neutral
+	 * there, exactly as before. */
+	if (conf->dcl) {
+		struct dcl_geom *ge = previous ? READ_ONCE(conf->prev_dcl)
+					       : NULL;
+
+		sh->disks = (int)((ge ?: conf->dcl)->g);
+	} else {
+		sh->disks = previous ? conf->previous_raid_disks
+				     : conf->raid_disks;
+	}
 	sh->sector = sector;
 	stripe_set_idx(sector, conf, previous, sh);
 	sh->state = 0;
@@ -5298,16 +5348,25 @@ sector_t raid5_compute_sector(struct r5conf *conf, sector_t r_sector,
 			 * data_disks-based dd_idx/stripe computed above are
 			 * simply overwritten here. */
 			struct dcl_addr a;
-			/* During a pool-expansion reshape the OLD (prev_dcl)
-			 * map serves chunks above the frontier and the NEW
-			 * (dcl) map serves those below — the declustered
-			 * analogue of the `previous` flag (which cannot be
-			 * used here: g, hence sh->disks, is unchanged, so the
-			 * disk count no longer distinguishes the geometries).
-			 * Identity == conf->dcl when no reshape is running. */
-			struct dcl_geom *ge =
-				raidkm_dcl_geom_for_chunk(conf, chunk_number);
+			/* During a reshape the OLD (prev_dcl) map serves
+			 * chunks above the frontier and the NEW (dcl) map
+			 * those below.  The stripe path passes `previous`
+			 * explicitly (from get_reshape_loc): honoring it here
+			 * makes the geometry choice race-free against frontier
+			 * movement AND correct for a g-changing reshape, where
+			 * old and new packings genuinely differ.  previous==0
+			 * callers (steady state, behind-region I/O, straggler
+			 * aligned-read retries submitted before the reshape
+			 * armed) stay frontier-keyed via geom_for_chunk, which
+			 * resolves the same geometry deterministically (the
+			 * frontier only advances, and behind chunks stay
+			 * behind).  Identity == conf->dcl with no reshape. */
+			struct dcl_geom *ge = previous ?
+				READ_ONCE(conf->prev_dcl) : NULL;
 
+			if (!ge)
+				ge = raidkm_dcl_geom_for_chunk(conf,
+							       chunk_number);
 			dcl_forward(ge, chunk_number, &a);
 			*dd_idx = a.slot;
 			pd_idx = ge->k;
@@ -5543,14 +5602,18 @@ sector_t raid5_compute_blocknr(struct stripe_head *sh, int i, int previous)
 		if (conf->dcl) {
 			/* Declustered inverse: slots [0,k) are data, [k,g)
 			 * parity; `stripe` already holds the row.  The group
-			 * comes from the stripe identity itself.  A reshape's
-			 * migrated rows (< frontier) invert through the NEW
-			 * map, un-migrated rows through the OLD one — keyed by
-			 * the device row, matching raidkm_dcl_geom_for_row's
-			 * use on the forward/pdisk side. */
-			struct dcl_geom *ge = raidkm_dcl_geom_for_row(conf,
-								      stripe);
+			 * comes from the stripe identity itself.  `previous`
+			 * (a previous-geometry stripe of a live reshape)
+			 * selects the OLD map explicitly — race-free against
+			 * frontier movement and correct for a g-changing
+			 * reshape; previous==0 stays keyed by the device row,
+			 * matching raidkm_dcl_geom_for_row's use on the
+			 * forward/pdisk side. */
+			struct dcl_geom *ge = previous ?
+				READ_ONCE(conf->prev_dcl) : NULL;
 
+			if (!ge)
+				ge = raidkm_dcl_geom_for_row(conf, stripe);
 			if (i >= (int)ge->k)
 				return 0;	/* a parity slot */
 			chunk_number = stripe * ((sector_t)ge->ngroups * ge->k) +
@@ -6015,9 +6078,17 @@ static void stripe_set_idx(sector_t stripe, struct r5conf *conf, int previous,
 
 	if (conf->dcl) {
 		/* Declustered: parity is at the group tail — pd/qd are the
-		 * same for every stripe and don't depend on the sector. */
-		sh->pd_idx = conf->dcl->k;
-		sh->qd_idx = conf->dcl->g - 1;
+		 * same for every stripe and don't depend on the sector.  An
+		 * un-migrated-region stripe of a g-changing reshape carries
+		 * the OLD group's k and width (matching init_stripe's
+		 * sh->disks choice). */
+		struct dcl_geom *ge = previous ? READ_ONCE(conf->prev_dcl)
+					       : NULL;
+
+		if (!ge)
+			ge = conf->dcl;
+		sh->pd_idx = ge->k;
+		sh->qd_idx = ge->g - 1;
 		sh->ddf_layout = 0;
 		return;
 	}
@@ -9118,19 +9189,21 @@ static enum stripe_result make_stripe_request(struct mddev *mddev,
 		}
 		if (loc == LOC_AHEAD_OF_RESHAPE) {
 			/*
-			 * add-parity / add-data change the group width and
-			 * parity count; the dcl stripe path is single-geometry,
-			 * so a stripe built for the un-migrated (old-geometry)
-			 * region would encode it with the wrong width/parity =
-			 * silent corruption.  These reshapes are offline-only
-			 * (rejected at start when the array is in use), but if
-			 * I/O still races one — e.g. a mount slipped in after the
-			 * reshape began — fail it rather than corrupt.  Fail-safe
-			 * and hang-free (no wait).  Pool expansion and spare-count
-			 * keep g and m, so they fall through to the online
-			 * previous-geometry path.
+			 * The un-migrated region of a dcl g-changing reshape
+			 * (add-parity / add-data) is served ONLINE by
+			 * previous-geometry stripes: init_stripe /
+			 * stripe_set_idx build the stripe at the OLD group
+			 * width and every accessor keys the geometry off
+			 * sh->disks (raidkm_sh_dcl_prev) — the dcl analogue
+			 * of the classic previous==1 path.  v1 exception:
+			 * NATIVE-CSUM arrays stay offline-only (a user write
+			 * racing the band's CRC re-key is unvalidated); if
+			 * I/O still races one — a mount slipped in after the
+			 * start-time openers gate — fail it rather than risk
+			 * a stale-key mismatch storm.  Fail-safe and
+			 * hang-free (no wait).
 			 */
-			if (conf->prev_dcl &&
+			if (conf->csum && conf->prev_dcl &&
 			    (conf->prev_dcl->g != conf->dcl->g ||
 			     conf->prev_dcl->m != conf->dcl->m)) {
 				bi->bi_status = BLK_STS_IOERR;
@@ -9150,7 +9223,8 @@ static enum stripe_result make_stripe_request(struct mddev *mddev,
 	if (bi->bi_opf & REQ_RAHEAD)
 		flags |= R5_GAS_NOBLOCK;
 	sh = raid5_get_active_stripe(conf, ctx, new_sector,
-				     raidkm_dcl_group_of(conf, logical_sector),
+				     raidkm_dcl_group_of(conf, logical_sector,
+							 previous),
 				     flags);
 	if (unlikely(!sh)) {
 		/* cannot get stripe, just give-up */
@@ -11901,11 +11975,45 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio,
 	sector_t sector, logical_sector, last_sector;
 	int scnt = 0;
 	int handled = 0;
+	int previous = 0;
 
 	logical_sector = raid_bio->bi_iter.bi_sector &
 		~((sector_t)RAID5_STRIPE_SECTORS(conf)-1);
+	/*
+	 * The bypass gate only admits aligned reads while no reshape runs,
+	 * but a failed one can be QUEUED for this stripe-cache retry just as
+	 * a reshape arms and replayed after it — start_reshape's quiesce
+	 * pulse even waits for exactly these (active_aligned_reads).  Build
+	 * the retry stripe under the geometry of the bio's reshape region,
+	 * like make_stripe_request: an un-migrated chunk needs the PREVIOUS
+	 * geometry — during a dcl g-change the stripe dimensions differ, so
+	 * previous==0 would pair an old-map sector with new-geometry
+	 * dimensions and read the wrong cells.  (The bio spans one chunk and
+	 * the dcl frontier advances in whole rows, so one location decision
+	 * covers the whole bio.)
+	 *
+	 * A chunk INSIDE the claimed band cannot be served at all until the
+	 * band commits — and we cannot park either: this bio HOLDS
+	 * active_aligned_reads, which the band's own quiesce pulse waits on,
+	 * so requeueing here would deadlock the reshape against ourselves.
+	 * Fail the bio instead (it already failed once to get here; never
+	 * wrong data, never a wait on a window this path cannot outlive).
+	 */
+	if (unlikely(conf->reshape_progress != MaxSector)) {
+		enum reshape_loc loc = get_reshape_loc(conf->mddev, conf,
+						       logical_sector);
+
+		if (loc == LOC_INSIDE_RESHAPE) {
+			raid_bio->bi_status = BLK_STS_IOERR;
+			bio_endio(raid_bio);
+			if (atomic_dec_and_test(&conf->active_aligned_reads))
+				wake_up(&conf->wait_for_quiescent);
+			return handled;
+		}
+		previous = (loc == LOC_AHEAD_OF_RESHAPE);
+	}
 	sector = raid5_compute_sector(conf, logical_sector,
-				      0, &dd_idx, NULL);
+				      previous, &dd_idx, NULL);
 	last_sector = bio_end_sector(raid_bio);
 
 	for (; logical_sector < last_sector;
@@ -11918,8 +12026,10 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio,
 			continue;
 
 		sh = raid5_get_active_stripe(conf, NULL, sector,
-				raidkm_dcl_group_of(conf, logical_sector),
-				R5_GAS_NOBLOCK | R5_GAS_NOQUIESCE);
+				raidkm_dcl_group_of(conf, logical_sector,
+						    previous),
+				R5_GAS_NOBLOCK | R5_GAS_NOQUIESCE |
+				(previous ? R5_GAS_PREVIOUS : 0));
 		if (!sh) {
 			/* failed to get a stripe - must wait */
 			conf->retry_read_aligned = raid_bio;
@@ -11927,7 +12037,23 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio,
 			return handled;
 		}
 
-		if (!add_stripe_bio(sh, raid_bio, dd_idx, 0, 0)) {
+		if (unlikely(previous) &&
+		    stripe_ahead_of_reshape(conf->mddev, conf, sh)) {
+			/* The frontier is crossing this bio's stripe right
+			 * now (some cells already migrated).  Same rule as
+			 * the INSIDE case above: we cannot park while holding
+			 * active_aligned_reads, and a straddling previous
+			 * stripe must not serve reconstruct paths — fail the
+			 * once-failed bio rather than wait or read wrong. */
+			raid5_release_stripe(sh);
+			raid_bio->bi_status = BLK_STS_IOERR;
+			bio_endio(raid_bio);
+			if (atomic_dec_and_test(&conf->active_aligned_reads))
+				wake_up(&conf->wait_for_quiescent);
+			return handled;
+		}
+
+		if (!add_stripe_bio(sh, raid_bio, dd_idx, 0, previous)) {
 			int hash;
 
 			/* Upstream 7f9f7c697474 ("md/raid5: fix soft lockup in
@@ -12834,18 +12960,19 @@ raidkm_store_dcl_reshape(struct mddev *mddev, const char *page, size_t len)
 		goto out;
 	}
 	/*
-	 * add-parity / add-data / spare-count — every reshape that changes the
-	 * layout word (group width, parity count or spare-column count) — are
-	 * OFFLINE-ONLY.  The dcl stripe path is single-geometry, so concurrent
-	 * I/O to the not-yet-migrated region is unsafe (add-parity/add-data
-	 * silently corrupt it); the whole layout-changing class is gated offline
-	 * for a uniform, conservative policy.  Refuse to start unless the array
-	 * is idle (no mounts / open writers).  A pure pool expansion keeps the
-	 * layout word (only N and the seed move) and stays fully online.
+	 * Every layout-word-changing reshape (add-parity / add-data /
+	 * spare-count) now runs ONLINE: the stripe path serves the
+	 * un-migrated region with previous-geometry stripes (built at the OLD
+	 * group width; see make_stripe_request / raidkm_sh_dcl_prev), exactly
+	 * as pool expansion always has.  v1 exception: NATIVE-CSUM arrays stay
+	 * offline-only — the band's post-commit CRC re-key has not been
+	 * validated against concurrent user writes; refuse to start unless
+	 * the array is idle (no mounts / open writers).
 	 */
 	if (newlay != (unsigned int)mddev->layout &&
+	    raidkm_layout_has_csum(mddev->layout) &&
 	    atomic_read(&mddev->openers) > 0) {
-		pr_warn("md/raid:%s: declustered: add-parity/add-data/spare-count reshape is offline-only; the array has %d open handle(s) — unmount / close it and retry\n",
+		pr_warn("md/raid:%s: declustered: a group-geometry reshape of a native-checksum array is offline-only; the array has %d open handle(s) — unmount / close it and retry\n",
 			mdname(mddev), atomic_read(&mddev->openers));
 		err = -EBUSY;
 		goto out;
@@ -15552,6 +15679,19 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 	raid5_quiesce(mddev, true);
 	raid5_quiesce(mddev, false);
 
+	/*
+	 * The pulse above also retires the previous reshape's map for good: it
+	 * drains every stripe-path and aligned-read holder, so nobody can still
+	 * be inside a selector that loaded that pointer.  (This runs in user
+	 * context — a sysfs trigger / mdadm --grow — where quiescing is safe,
+	 * unlike raid5_finish_reshape's raid5d context, which is why the free
+	 * is deferred to here.)
+	 */
+	if (conf->dcl_retired) {
+		raidkm_dcl_geom_destroy(conf->dcl_retired);
+		conf->dcl_retired = NULL;
+	}
+
 	/* admit the g new pool disks (added as spares by mdadm --add) as
 	 * In_sync members — their columns are filled by the migration, not a
 	 * rebuild.  nreb==0, so raid5_add_disk takes the stock slot-assign path. */
@@ -15876,9 +16016,34 @@ static void raid5_finish_reshape(struct mddev *mddev)
 		 * reshape (MD_RECOVERY_INTR) so prev_dcl survives for the resume.
 		 */
 		if (is_raidkm(conf) && conf->prev_dcl) {
-			raidkm_dcl_geom_destroy(conf->prev_dcl);
-			conf->prev_dcl = NULL;
-			conf->reshape_frontier_row = 0;
+			/*
+			 * The geometry selectors (geom_for_row/for_chunk,
+			 * raidkm_sh_dcl_prev) read prev_dcl lock-free, so the
+			 * old map must be UNPUBLISHED before it is freed —
+			 * and it must NOT be freed here at all.  We run in
+			 * raid5d (md_check_recovery -> md_reap_sync_thread),
+			 * so we cannot drain the readers first: quiescing
+			 * from raid5d deadlocks against the very stripes only
+			 * raid5d can complete.  Instead RETIRE the map —
+			 * unpublish it and keep the allocation alive — so a
+			 * reader that loaded the pointer just before the NULL
+			 * dereferences valid (merely stale) memory and, in
+			 * every selector, resolves to conf->dcl anyway: the
+			 * row-keyed ones because the frontier is still at its
+			 * end-of-migration value (so `row >= frontier` fails
+			 * for every valid row), the stripe-keyed ones because
+			 * a post-finalize stripe is built at the new width
+			 * (so `sh->disks == prev->g` fails).  The retired map
+			 * is freed by the next reshape's start, which quiesces
+			 * from a safe (user) context, or at array stop.
+			 * Only after the unpublish is the frontier reset to 0
+			 * — the next reshape's start window relies on finding
+			 * it there the moment it publishes the next prev_dcl.
+			 */
+			WARN_ON_ONCE(conf->dcl_retired);
+			conf->dcl_retired = conf->prev_dcl;
+			WRITE_ONCE(conf->prev_dcl, NULL);
+			WRITE_ONCE(conf->reshape_frontier_row, 0);
 			conf->previous_raid_disks = conf->raid_disks;
 			if (raidkm_dcl_journal_write(conf, true))
 				pr_warn("md/raid:%s: declustered: persisting the new geometry to the rkdcl block failed\n",

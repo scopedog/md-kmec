@@ -784,6 +784,11 @@ void raidkm_dcl_free(struct r5conf *conf)
 	 * OLD geometry hanging off prev_dcl; free it too */
 	raidkm_dcl_geom_destroy(conf->prev_dcl);
 	conf->prev_dcl = NULL;
+	/* and a FINISHED reshape leaves its retired map alive for the lock-free
+	 * readers (see conf->dcl_retired); raid5d is stopped by now, so this is
+	 * the terminal owner when no further reshape claimed it */
+	raidkm_dcl_geom_destroy(conf->dcl_retired);
+	conf->dcl_retired = NULL;
 	bitmap_free(conf->reb_win_bits);
 	conf->reb_win_bits = NULL;
 	kfree(conf->reb);

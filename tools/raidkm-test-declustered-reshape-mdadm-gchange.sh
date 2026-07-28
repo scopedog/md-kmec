@@ -10,8 +10,11 @@
 #       g -> g+1 at fixed m; capacity grows.
 #   T3  mdadm --grow --spare-columns=s' (decrease): no disks added, capacity
 #       grows; s' increase and s' == s both REJECTED with a clear message.
-#   T4  offline-only enforcement through mdadm: with the array held open,
-#       --add-parity is refused (mdadm's O_EXCL probe) and no reshape starts.
+#   T4  ONLINE g-change through mdadm: with the array held open (models a
+#       mounted array), --add-parity is ACCEPTED, runs to completion and is
+#       correct — the §7b dual-geometry stripe path through the mdadm driver.
+#       (Csum arrays stay offline-only; that leg is covered by the
+#       offline-guard gate at the trigger level.)
 #   T5  option hygiene: --add-parity + --spare-columns rejected;
 #       --add-parity with a conflicting --raid-devices rejected.
 #
@@ -143,21 +146,22 @@ CAP1=$(blockdev --getsz "$MD")
 			|| rk_fail "T3: capacity did not grow ($CAP0 -> $CAP1)"
 verify_common "T3" "$M" "$SC spare column"
 
-# ---- T4: offline-only enforced through mdadm -----------------------------------
-echo "=== T4: --add-parity refused while the array is held open ==="
+# ---- T4: ONLINE g-change through mdadm ------------------------------------------
+echo "=== T4: --add-parity ACCEPTED and correct while the array is held open ==="
 mk_array "$N" || { rk_fail "T4: create"; rk_summary; exit 1; }
-( exec 9<>"$MD"; sleep 30 ) &
+( exec 9<>"$MD"; sleep 240 ) &
 HOLDER=$!
 sleep 1
 out=$(sudo "$MDADM" --grow "$MD" --add-parity "${MEMBERS[@]:$N:$NG}" 2>&1)
-echo "$out" | grep -qi "offline-only.*in use\|in use" &&
-	rk_pass "T4: mdadm refused add-parity on an in-use array" ||
-	rk_fail "T4: no in-use refusal: $out"
-sleep 2
-grep -q reshape /proc/mdstat &&
-	rk_fail "T4: a reshape STARTED despite the open handle" ||
-	rk_pass "T4: no reshape started while held open"
+if echo "$out" | grep -qi "started"; then
+	rk_pass "T4: mdadm started add-parity on an in-use array (online g-change)"
+else
+	rk_fail "T4: mdadm did not start add-parity while held open: $out"
+fi
+wait_reshape_done && rk_pass "T4: online add-parity completed with an open handle" \
+		  || rk_fail "T4: reshape did not finish"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+verify_common "T4" "$((M + 1))" "g=$((G+1)) (k=.*m=$((M+1)))"
 
 # ---- T5: option hygiene --------------------------------------------------------
 echo "=== T5: conflicting option combinations rejected ==="

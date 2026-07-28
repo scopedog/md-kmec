@@ -7,6 +7,8 @@
 #include <linux/local_lock.h>
 
 #include "raid_km_reshape.h"
+#include "raid_km_dcl.h"	/* struct dcl_geom: the declustered dual-geometry
+				 * stripe keys below deref conf->prev_dcl */
 
 /*
  * md personality level for raid_km.  Chosen to not collide with
@@ -963,6 +965,17 @@ struct r5conf {
 	 * prev_dcl is freed at end_reshape and in raidkm_dcl_free.
 	 */
 	struct dcl_geom		*prev_dcl;
+	/*
+	 * The OLD map after a reshape finalizes.  raid5_finish_reshape runs in
+	 * raid5d and therefore cannot quiesce (that deadlocks against the
+	 * stripes only raid5d completes), so it unpublishes prev_dcl but keeps
+	 * the allocation alive here: a lock-free reader that loaded the pointer
+	 * just before the unpublish then touches valid, merely stale memory and
+	 * still resolves to conf->dcl (see the retire comment in
+	 * raid5_finish_reshape).  Freed by the next reshape's start, which
+	 * quiesces from user context, and at array stop.
+	 */
+	struct dcl_geom		*dcl_retired;
 	sector_t		reshape_frontier_row;
 	u64			reshape_new_seed;	/* NEW-geometry permutation
 							 * seed, staged by the
@@ -1102,10 +1115,35 @@ static inline bool is_raidkm(struct r5conf *conf)
  * conf->m.  sh->disks already carries the stripe's geometry, so it is the
  * region discriminator.  k for the stripe is always sh->disks - raidkm_sh_m().
  */
+/*
+ * Declustered dual-geometry stripe discriminator.  During a g-CHANGING dcl
+ * reshape (add-parity / add-data — every supported group-geometry change
+ * widens the group, g' == g+1) the un-migrated region is served by stripes
+ * built at the OLD group width, so sh->disks identifies an old-geometry
+ * stripe exactly — the dcl analogue of the classic sh->disks ==
+ * previous_raid_disks key (which can never fire for dcl, where sh->disks
+ * is the group width g, strictly < any raid_disks).  g-PRESERVING reshapes
+ * (pool expansion, spare-count) keep m and k too, so no discrimination is
+ * needed and this returns false; likewise outside any reshape (prev_dcl
+ * NULL) and in the end_reshape..finish_reshape window (a fresh stripe is
+ * built at the NEW width, which differs from prev_dcl->g).
+ */
+static inline bool raidkm_sh_dcl_prev(struct r5conf *conf,
+				      struct stripe_head *sh)
+{
+	/* Single load — prev_dcl is unpublished lock-free at finalize. */
+	struct dcl_geom *prev = READ_ONCE(conf->prev_dcl);
+
+	return prev && prev->g != conf->dcl->g &&
+	       sh->disks == (int)prev->g;
+}
+
 static inline int raidkm_sh_m(struct stripe_head *sh)
 {
 	struct r5conf *conf = sh->raid_conf;
 
+	if (conf->dcl)
+		return raidkm_sh_dcl_prev(conf, sh) ? conf->prev_m : conf->m;
 	/*
 	 * previous_raid_disks != raid_disks is the "two geometries live" guard:
 	 * end_reshape() bumps previous_raid_disks up to raid_disks when the
@@ -1187,6 +1225,12 @@ static inline bool raidkm_sh_prev(struct stripe_head *sh)
 {
 	struct r5conf *conf = sh->raid_conf;
 
+	/* Declustered: the group width, not the disk count, is the region
+	 * discriminator (see raidkm_sh_dcl_prev).  An old-region stripe of a
+	 * g-changing reshape decodes/encodes with the prev_ec_* tables the
+	 * dcl start_reshape demoted. */
+	if (conf->dcl)
+		return raidkm_sh_dcl_prev(conf, sh);
 	return raidkm_reshape_live(conf) &&
 	       sh->disks == conf->previous_raid_disks;
 }
