@@ -6294,24 +6294,42 @@ static int need_this_block(struct stripe_head *sh, struct stripe_head_state *s,
 		return 0;
 
 	/*
-	 * Defer an overlapping read while a skip_copy write is draining.
+	 * Defer ANY fill of this slot while a skip_copy write is draining.
 	 * skip_copy (conf->skip_copy, default-on in md-kmec) borrows the write
 	 * bio's page as dev->page and deliberately leaves the block !UPTODATE --
-	 * the aliased page is not a readable stripe-cache copy and is handed back
+	 * the aliased page is not a writable stripe-cache slot and is handed back
 	 * to dev->orig_page in handle_stripe_clean_event().  Scheduling a disk
-	 * read into that aliased page to satisfy a toread would (a) clobber the
+	 * read (or a compute) into that aliased page would (a) clobber the
 	 * write's source page and (b) set R5_UPTODATE on a R5_SkipCopy block,
 	 * tripping the SkipCopy/UPTODATE invariant WARN_ON in
-	 * handle_stripe_clean_event() and ops_run_io().  Returning 0 keeps the
-	 * toread pending; the write's clean_event restores dev->page and clears
-	 * R5_SkipCopy, after which the read fetches the just-committed data from
-	 * disk (correct read-after-write).  No deadlock: R5_SkipCopy always
-	 * clears once the in-flight write completes.  This path is reachable with
-	 * native checksums, which re-drive chunk-aligned reads through the stripe
-	 * cache (retry_aligned_read) for verification, creating read/skip_copy
-	 * overlaps that a plain aligned read (served in raid5_align_endio) avoids.
+	 * handle_stripe_clean_event() and ops_run_io().
+	 *
+	 * This must NOT be conditioned on dev->toread (as it originally was):
+	 * on a degraded array this slot is also read as a reconstruction
+	 * SOURCE for some other slot's toread ("if we want to read from a
+	 * failed device ... read every other device" below), and as a
+	 * pre-read source for degraded RMW/RCW.  In that window -- member
+	 * write completed (R5_LOCKED cleared) but clean_event still deferred
+	 * behind a parity gate under fault churn -- the toread-only guard let
+	 * the survivor read clobber the aliased page and mark it UPTODATE;
+	 * the next write on the stripe then computed parity from the
+	 * clobbered "current data" without re-reading disk.  Observed as fio
+	 * verify EILSEQ + residual scrub mismatch_cnt under the m-parity
+	 * degraded concurrency stress (m=6/8, 2026-07-29); vanishes with
+	 * skip_copy=0.  Sibling of upstream 52e4324935be, which defers the
+	 * raid6 2-failure compute when the other target is R5_LOCKED.
+	 *
+	 * Returning 0 keeps the dependent request pending; the write's
+	 * clean_event restores dev->page and clears R5_SkipCopy, after which
+	 * the read fetches the just-committed data from disk (correct
+	 * read-after-write).  No deadlock: R5_SkipCopy always clears once the
+	 * in-flight write resolves -- handle_stripe_clean_event() on success,
+	 * handle_failed_stripe() on member failure -- and both re-handle the
+	 * stripe.  Reachable with native checksums (retry_aligned_read
+	 * re-drives aligned reads through the stripe cache) and on any
+	 * degraded array carrying concurrent reads and writes.
 	 */
-	if (dev->toread && test_bit(R5_SkipCopy, &dev->flags))
+	if (test_bit(R5_SkipCopy, &dev->flags))
 		return 0;
 
 	if (dev->toread ||
@@ -6553,6 +6571,22 @@ static int fetch_block(struct stripe_head *sh, struct stripe_head_state *s,
 						if (test_bit(R5_UPTODATE, &sh->dev[j].flags) ||
 						    test_bit(R5_Wantcompute, &sh->dev[j].flags))
 							continue;
+						/* A busy slot is not a
+						 * reconstruction target:
+						 * R5_SkipCopy means dev->page
+						 * aliases an in-flight write's
+						 * bio page (decoding into it
+						 * clobbers the user's write
+						 * payload — seen as fio verify
+						 * EILSEQ under degraded churn),
+						 * and R5_LOCKED means a
+						 * read/write already owns the
+						 * page.  Both are being
+						 * refreshed by their own I/O;
+						 * decode the rest without them. */
+						if (test_bit(R5_SkipCopy, &sh->dev[j].flags) ||
+						    test_bit(R5_LOCKED, &sh->dev[j].flags))
+							continue;
 						set_bit(R5_Wantcompute, &sh->dev[j].flags);
 						if (t < 0)
 							t = j;
@@ -6635,8 +6669,12 @@ static int fetch_block(struct stripe_head *sh, struct stripe_head_state *s,
 			 * doubly-degraded array the other target may be R5_LOCKED
 			 * (write in flight, page aliased to the bio) — reconstructing
 			 * into it is unsafe and trips the R5_SkipCopy/R5_UPTODATE
-			 * WARN in ops_run_io(). Defer the compute. */
-			if (test_bit(R5_LOCKED, &sh->dev[other].flags))
+			 * WARN in ops_run_io(). Defer the compute.  R5_SkipCopy
+			 * alone (member write completed, clean_event still
+			 * pending, so !LOCKED) aliases the page just the same —
+			 * defer for it too. */
+			if (test_bit(R5_LOCKED, &sh->dev[other].flags) ||
+			    test_bit(R5_SkipCopy, &sh->dev[other].flags))
 				return 0;
 			pr_debug("Computing stripe %llu blocks %d,%d\n",
 			       (unsigned long long)sh->sector,
@@ -6929,8 +6967,15 @@ static int handle_stripe_dirtying(struct r5conf *conf,
 			    !(uptodate_for_rmw(dev) ||
 			      test_bit(R5_Wantcompute, &dev->flags)) &&
 			    test_bit(R5_Insync, &dev->flags)) {
+				/* R5_SkipCopy: dev->page aliases an in-flight
+				 * write's bio page -- reading disk into it
+				 * would clobber the write source (see the
+				 * guard in need_this_block()).  Stay DELAYED;
+				 * the write's completion re-handles the stripe
+				 * and clean_event un-aliases the page. */
 				if (test_bit(STRIPE_PREREAD_ACTIVE,
-					     &sh->state)) {
+					     &sh->state) &&
+				    !test_bit(R5_SkipCopy, &dev->flags)) {
 					pr_debug("Read_old block %d for r-m-w\n",
 						 i);
 					set_bit(R5_LOCKED, &dev->flags);
@@ -6953,9 +6998,13 @@ static int handle_stripe_dirtying(struct r5conf *conf,
 			    !(test_bit(R5_UPTODATE, &dev->flags) ||
 			      test_bit(R5_Wantcompute, &dev->flags))) {
 				rcw++;
+				/* R5_SkipCopy: never read into the aliased
+				 * write page (see the r-m-w site above); rcw
+				 * stays nonzero so reconstruction holds off. */
 				if (test_bit(R5_Insync, &dev->flags) &&
 				    test_bit(STRIPE_PREREAD_ACTIVE,
-					     &sh->state)) {
+					     &sh->state) &&
+				    !test_bit(R5_SkipCopy, &dev->flags)) {
 					pr_debug("Read_old block "
 						"%d for Reconstruct\n", i);
 					set_bit(R5_LOCKED, &dev->flags);
@@ -7018,6 +7067,38 @@ static int handle_stripe_dirtying(struct r5conf *conf,
 				return 0;
 		}
 	}
+
+	/*
+	 * raidkm: never latch a write in the same pass as a pending compute.
+	 *
+	 * The stock gate below deliberately lets a write start alongside a
+	 * requested compute ("raid_run_ops only handles the case where compute
+	 * block and reconstruct are requested simultaneously"), which is safe
+	 * for raid5/6 because ops_run_compute5/6 bind their source PAGES when
+	 * raid_run_ops builds the async chain, before biodrain can touch them.
+	 * ops_run_compute_km() does not: it re-derives its k decode sources
+	 * from the R5_UPTODATE FLAGS at run time.  schedule_reconstruction()
+	 * clears R5_UPTODATE on every draining data slot and every parity slot,
+	 * so a write latched in the same pass destroys the source set of the
+	 * compute it was paired with.  compute_km then sees nsrc < k, takes its
+	 * "a decode source vanished" abandon path (correctly refusing to fake
+	 * the result), unwinds the write latches and re-handles -- and the next
+	 * pass rebuilds exactly the same trap.  The stripe spins forever with
+	 * no member write ever issued: a permanent degraded-I/O livelock,
+	 * reproducible at ANY m (m=2 included) whenever a read of a failed slot
+	 * overlaps a write to the same stripe, which is just "mixed read/write
+	 * on a degraded array at queue depth > 1".
+	 *
+	 * Holding the write for one pass costs a re-handle; the compute lands,
+	 * clears STRIPE_COMPUTE_RUN and marks its target UPTODATE, and the
+	 * write latches normally on the next pass.  It cannot stall: the
+	 * compute's sources are survivor reads, independent of this write.
+	 * (The s->failed >= 2 defer above guards a different hazard -- a failed
+	 * DATA slot whose old value the parity re-encode still needs.)
+	 */
+	if (is_raidkm(conf) &&
+	    (s->req_compute || test_bit(STRIPE_COMPUTE_RUN, &sh->state)))
+		return 0;
 
 	if ((s->req_compute || !test_bit(STRIPE_COMPUTE_RUN, &sh->state)) &&
 	    (s->locked == 0 && (rcw == 0 || rmw == 0) &&
