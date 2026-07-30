@@ -14604,9 +14604,10 @@ static int raid5_set_limits(struct mddev *mddev)
 	/*
 	 * The read-ahead size must cover two whole stripes, which is
 	 * 2 * (datadisks) * chunksize where 'n' is the number of raid devices.
-	 * Declustered: the whole-stripe unit is the k-cell group row (a
-	 * g-change reshape is offline-only and pool expansion keeps k, so
-	 * there is no previous-geometry variant to consider).
+	 * Declustered: the whole-stripe unit is the k-cell group row.  During
+	 * an online g-change the NEW geometry's k is used — read-ahead sizing
+	 * is a performance hint, so tracking the finalize target rather than
+	 * the (transient) previous geometry is fine.
 	 */
 	if (conf->dcl)
 		data_disks = conf->dcl->k;
@@ -14802,9 +14803,9 @@ static int raid5_run(struct mddev *mddev)
 			 * readonly mode so it can take control before
 			 * allowing any writes.  So just check for that.
 			 * (A declustered spare-count change is also delta_disks
-			 * == 0, but it is CoW-staged + journal-recoverable and
-			 * offline-only, so it takes the COW branch below instead
-			 * of this backup-monitored classic path.)
+			 * == 0, but it is CoW-staged + journal-recoverable,
+			 * so it takes the COW branch below instead of this
+			 * backup-monitored classic path.)
 			 */
 			if (abs(min_offset_diff) >= mddev->chunk_sectors &&
 			    abs(min_offset_diff) >= mddev->new_chunk_sectors)
