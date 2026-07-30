@@ -1,26 +1,23 @@
 #!/bin/bash
 #
-# raidkm-test-declustered-reshape-offline-guard.sh — the group-geometry reshape
-# gating policy (notes/declustered-reshape-design.md §7a/§7b).
+# raidkm-test-declustered-reshape-offline-guard.sh — online acceptance guard
+# for group-geometry reshapes (notes/declustered-reshape-design.md §7b/§7c).
 #
 # Since the ONLINE dual-geometry stripe path landed (§7b), layout-word-changing
-# reshapes (add-parity / add-data / spare-count) run ONLINE on plain arrays:
-# the un-migrated region is served by previous-geometry stripes.  The one v1
-# exception is NATIVE-CSUM arrays — the band's post-commit CRC re-key is not
-# validated against concurrent user writes — which stay offline-only, enforced
-# by the same two mechanisms the whole class used to have:
-#   - reject at start while the array has any open handle (openers > 0);
-#   - fail-safe: ahead-region I/O that still races one gets BLK_STS_IOERR,
-#     never a wrong-geometry encode or a stale-key storm.
+# reshapes (add-parity / add-data / spare-count) run ONLINE: the un-migrated
+# region is served by previous-geometry stripes.  §7c lifted the last v1
+# exception — NATIVE-CSUM arrays run online too (stripe-path CRC keying is
+# sh-geometry-keyed; the band's CRC re-key runs inside the row's claim/quiesce
+# bracket, so an open writer can never observe a stale key).
 #
-# This gate proves: (1) an add-parity reshape on a PLAIN array is ACCEPTED and
-# completes correctly while the array is held open (the online path); (2) the
-# same reshape on a --checksum array is REFUSED while the array is in use and
-# no reshape starts; (3) the csum reshape succeeds once the array is idle.
+# This gate proves BOTH array flavours are ACCEPTED and complete correctly
+# while the array is held open: (1) add-parity on a PLAIN array; (2) the same
+# reshape on a --checksum array, plus a zero-mismatch (no stale-key storm)
+# assertion after a full re-read.
 set -u
 # The busy-holder below opens $MD directly (a shell fd, not via sudo), so this
-# gate needs root — an unprivileged open fails silently and the csum leg
-# false-fails ("reshape STARTED with the array in use").  Re-exec under sudo.
+# gate needs root — an unprivileged open fails silently and the held-open legs
+# prove nothing.  Re-exec under sudo.
 [ "$(id -u)" = 0 ] || exec sudo bash "$0" "$@"
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
 
@@ -89,36 +86,37 @@ mm=$(rk_scrub); [ "$mm" = 0 ] && rk_pass "scrub clean (online leg)" || rk_fail "
 sudo "$MDADM" --examine "${MEMBERS[0]}" | grep -q "g=$NEWG (k=.*m=$NEWM)" &&
 	rk_pass "new geometry persisted (--examine g=$NEWG m=$NEWM)" || rk_fail "geometry not persisted (online leg)"
 
-# ---- Leg 2: CSUM array — add-parity stays OFFLINE-ONLY ----------------------
-echo "=== leg 2: --checksum array, add-parity must be REFUSED while in use ==="
+# ---- Leg 2: CSUM array — add-parity must run ONLINE while held open (§7c) ---
+echo "=== leg 2: --checksum array, add-parity WHILE the array is held open (online path) ==="
 mk_array --checksum || { rk_fail "create (--checksum)"; rk_summary; exit 1; }
-( exec 9<>"$MD"; sleep 120 ) &
+STORM0=$(sudo dmesg | grep -c "native csum mismatch")
+( exec 9<>"$MD"; sleep 180 ) &
 HOLDER=$!
 sleep 1
 if echo "$NEWN:$NEWSEED:$AP_LAYOUT_CSUM" | sudo tee "$TRIG" >/dev/null 2>&1; then
-	rk_fail "csum add-parity STARTED with the array in use (offline-only not enforced)"
-	for i in $(seq 1 120); do case "$(cat "$TRIG")" in idle*) break;; esac; sleep 2; done
+	rk_pass "csum add-parity ACCEPTED with the array in use (online g-change, §7c)"
 else
-	rk_pass "csum add-parity rejected while array in use (offline-only enforced)"
+	rk_fail "csum add-parity rejected while open (§7c online lift not engaged)"
+	kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+	rk_summary; exit 1
 fi
-grep -q reshape /proc/mdstat && rk_fail "a reshape is running despite the busy csum array" \
-	|| rk_pass "no reshape started while the csum array was busy"
-
-echo "=== leg 2b: release the csum array, then the same reshape must succeed offline ==="
-kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; sync; sudo udevadm settle 2>/dev/null; sleep 1
-echo "$NEWN:$NEWSEED:$AP_LAYOUT_CSUM" | sudo tee "$TRIG" >/dev/null 2>&1 &&
-	rk_pass "csum add-parity accepted once the array is idle (offline)" || { rk_fail "csum add-parity rejected even when idle"; rk_summary; exit 1; }
 for i in $(seq 1 120); do case "$(cat "$TRIG")" in idle*) break;; esac; sleep 2; done
-case "$(cat "$TRIG")" in idle*) rk_pass "offline csum add-parity reshape completed";;
+case "$(cat "$TRIG")" in idle*) rk_pass "online csum add-parity completed with an open handle";;
 	*) rk_fail "reshape did not finish"; sudo dmesg|tail -6; rk_summary; exit 1;; esac
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 [ "$PRE" = "$(sudo dd if="$MD" bs=1M count="$PATMB" iflag=direct status=none 2>/dev/null|md5sum|cut -d' ' -f1)" ] &&
-	rk_pass "data intact across offline csum add-parity" || rk_fail "DATA MISMATCH (csum leg)"
-storm=$(sudo dmesg | grep -c "native csum mismatch")
-[ "$storm" = 0 ] && rk_pass "zero csum mismatches after csum add-parity (re-key correct)" \
+	rk_pass "data intact across online csum add-parity" || rk_fail "DATA MISMATCH (csum leg)"
+mm=$(rk_scrub); [ "$mm" = 0 ] && rk_pass "scrub clean (csum leg)" || rk_fail "scrub mismatch_cnt=$mm (csum leg)"
+# full re-read through the verify path: every block must match its (re-keyed) CRC
+sudo dd if="$MD" of=/dev/null bs=1M iflag=direct status=none 2>/dev/null
+storm=$(( $(sudo dmesg | grep -c "native csum mismatch") - STORM0 ))
+[ "$storm" = 0 ] && rk_pass "zero csum mismatches after online csum add-parity (re-key correct)" \
 		 || rk_fail "$storm csum mismatches (stale-key storm)"
+sudo "$MDADM" --examine "${MEMBERS[0]}" | grep -q "g=$NEWG (k=.*m=$NEWM)" &&
+	rk_pass "csum-leg geometry persisted (--examine g=$NEWG m=$NEWM)" || rk_fail "geometry not persisted (csum leg)"
 
-sudo dmesg | grep -iE "offline-only|WARN|BUG|call trace|gf_invert" | tail -6
+sudo dmesg | grep -iE "WARN|BUG|call trace|gf_invert" | tail -6
 sudo "$MDADM" --stop "$MD" 2>/dev/null
 sudo udevadm settle 2>/dev/null
 for d in "${MEMBERS[@]}"; do sudo "$MDADM" --zero-superblock "$d" 2>/dev/null; done

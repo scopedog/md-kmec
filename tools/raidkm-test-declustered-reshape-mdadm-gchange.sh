@@ -13,8 +13,8 @@
 #   T4  ONLINE g-change through mdadm: with the array held open (models a
 #       mounted array), --add-parity is ACCEPTED, runs to completion and is
 #       correct — the §7b dual-geometry stripe path through the mdadm driver.
-#       (Csum arrays stay offline-only; that leg is covered by the
-#       offline-guard gate at the trigger level.)
+#       (Csum arrays run online too since §7c; that leg is covered by the
+#       offline-guard gate at the trigger level and CSUM=1 gchange-concurrent.)
 #   T5  option hygiene: --add-parity + --spare-columns rejected;
 #       --add-parity with a conflicting --raid-devices rejected.
 #

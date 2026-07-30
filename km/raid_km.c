@@ -9276,20 +9276,16 @@ static enum stripe_result make_stripe_request(struct mddev *mddev,
 			 * stripe_set_idx build the stripe at the OLD group
 			 * width and every accessor keys the geometry off
 			 * sh->disks (raidkm_sh_dcl_prev) — the dcl analogue
-			 * of the classic previous==1 path.  v1 exception:
-			 * NATIVE-CSUM arrays stay offline-only (a user write
-			 * racing the band's CRC re-key is unvalidated); if
-			 * I/O still races one — a mount slipped in after the
-			 * start-time openers gate — fail it rather than risk
-			 * a stale-key mismatch storm.  Fail-safe and
-			 * hang-free (no wait).
+			 * of the classic previous==1 path.  NATIVE-CSUM
+			 * arrays take it too (design §7c): every stripe-path
+			 * CRC store/verify keys the physical disk via the
+			 * sh-keyed raidkm_sh_pdisk map, so an old-geometry
+			 * stripe reads and writes its CRCs at exactly the
+			 * old physical cells; the band's post-COMMIT re-key
+			 * only touches the claimed (quiesce-drained) row's
+			 * keys, which ahead I/O can never share (ahead ⇒
+			 * old_row strictly beyond the frontier).
 			 */
-			if (conf->csum && conf->prev_dcl &&
-			    (conf->prev_dcl->g != conf->dcl->g ||
-			     conf->prev_dcl->m != conf->dcl->m)) {
-				bi->bi_status = BLK_STS_IOERR;
-				return STRIPE_FAIL;
-			}
 			previous = 1;
 		}
 	}
@@ -13042,22 +13038,15 @@ raidkm_store_dcl_reshape(struct mddev *mddev, const char *page, size_t len)
 	}
 	/*
 	 * Every layout-word-changing reshape (add-parity / add-data /
-	 * spare-count) now runs ONLINE: the stripe path serves the
-	 * un-migrated region with previous-geometry stripes (built at the OLD
-	 * group width; see make_stripe_request / raidkm_sh_dcl_prev), exactly
-	 * as pool expansion always has.  v1 exception: NATIVE-CSUM arrays stay
-	 * offline-only — the band's post-commit CRC re-key has not been
-	 * validated against concurrent user writes; refuse to start unless
-	 * the array is idle (no mounts / open writers).
+	 * spare-count) runs ONLINE: the stripe path serves the un-migrated
+	 * region with previous-geometry stripes (built at the OLD group
+	 * width; see make_stripe_request / raidkm_sh_dcl_prev), exactly as
+	 * pool expansion always has.  NATIVE-CSUM arrays included (design
+	 * §7c): CRC keying on the stripe path is sh-keyed, the band's
+	 * post-COMMIT re-key runs inside the row's claim/quiesce bracket,
+	 * and ahead-region keys are disjoint from the band's by the §3
+	 * overlap argument — no offline exception remains.
 	 */
-	if (newlay != (unsigned int)mddev->layout &&
-	    raidkm_layout_has_csum(mddev->layout) &&
-	    atomic_read(&mddev->openers) > 0) {
-		pr_warn("md/raid:%s: declustered: a group-geometry reshape of a native-checksum array is offline-only; the array has %d open handle(s) — unmount / close it and retry\n",
-			mdname(mddev), atomic_read(&mddev->openers));
-		err = -EBUSY;
-		goto out;
-	}
 	conf->reshape_new_seed = newseed;
 	mddev->delta_disks = (int)newN - conf->raid_disks;
 	mddev->new_layout = (int)newlay;

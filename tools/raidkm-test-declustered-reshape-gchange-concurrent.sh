@@ -12,8 +12,17 @@
 # KIND=addparity : m->m+1, g->g+1, +ngroups disks; capacity fixed.
 # KIND=adddata   : k->k+1, g->g+1, +ngroups disks; capacity grows at finalize.
 # KIND=sparecount: s->s' (decrease), N/g/m fixed; capacity grows at finalize.
+#
+# CSUM=1: run the same race on a NATIVE-CHECKSUM array (§7c) — the array is
+# created --checksum, the layout word carries the csum bit through the
+# g-change, and after the run a full re-read must report ZERO csum mismatches
+# (the stale-key-storm detector: proves the band re-key + sh-keyed CRC store
+# stay coherent under racing writes).  CSUM_CACHE_PAGES can pin the csum
+# cache tiny (set BEFORE create) so the pending-xarray path is engaged
+# throughout — the thrash variant of this gate.
 set -u
 KIND=${KIND:-addparity}
+CSUM=${CSUM:-0}
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
 
 case "$KIND" in
@@ -32,7 +41,9 @@ sparecount)
 *)	echo "ERROR: KIND must be addparity|adddata|sparecount"; exit 1;;
 esac
 NBASE=${DCL_NBASE:-16}; SEED=${DCL_SEED:-0x10}; NEWSEED=${DCL_NEWSEED:-0xabc}
-NEWLAYOUT=$(printf '%x' $(( NEWM | 0x400 | (NEWG << 16) | (NEWSC << 24) )))
+CSUM_BIT=0; CREATE_CSUM=""
+if [ "$CSUM" = 1 ]; then CSUM_BIT=$(( 0x200 )); CREATE_CSUM="--checksum"; fi
+NEWLAYOUT=$(printf '%x' $(( NEWM | 0x400 | CSUM_BIT | (NEWG << 16) | (NEWSC << 24) )))
 SPEED=${SYNC_MAX_KB:-8000}	# slow the reshape so fio overlaps the whole run
 FIOSEC=${FIOSEC:-60}
 PATMB=${PATMB:-48}
@@ -40,6 +51,12 @@ TRIG=/sys/block/$MDNAME/md/rk_dcl_reshape
 
 command -v fio >/dev/null || { echo "ERROR: fio required"; exit 1; }
 rk_load_modules || exit 1
+# optional thrash variant: pin the csum cache tiny BEFORE create so every
+# store engages the pending-xarray path (supersede-in-place ordering under test)
+if [ "$CSUM" = 1 ] && [ -n "${CSUM_CACHE_PAGES:-}" ]; then
+	echo "$CSUM_CACHE_PAGES" | sudo tee \
+		/sys/module/raidkm/parameters/raidkm_csum_cache_pages >/dev/null
+fi
 rk_setup_brd "$NEWN" || exit 1
 MEMBERS=($(rk_pick_disks "$NEWN"))
 
@@ -49,13 +66,14 @@ for d in "${MEMBERS[@]}"; do
 	sudo "$MDADM" --zero-superblock "$d" 2>/dev/null
 done
 
-echo "=== create declustered N=$N g=$G m=$M s=$SC ==="
+echo "=== create declustered N=$N g=$G m=$M s=$SC${CREATE_CSUM:+ $CREATE_CSUM} ==="
 sudo "$MDADM" --create "$MD" --level=raidkm --parity-count=$M \
 	--layout=declustered --group-width=$G --spare-columns=$SC \
-	--dcl-nbase=$NBASE --dcl-seed=$SEED --chunk="$CHUNK_KB" \
+	--dcl-nbase=$NBASE --dcl-seed=$SEED --chunk="$CHUNK_KB" $CREATE_CSUM \
 	--raid-devices=$N --run "${MEMBERS[@]:0:$N}" >/dev/null 2>&1 &&
    grep -q "$MDNAME : active raidkm" /proc/mdstat || { rk_fail "create"; rk_summary; exit 1; }
 rk_wait_idle
+STORM0=$(sudo dmesg | grep -c "native csum mismatch")
 
 # a deterministic pattern OUTSIDE the fio region: fio churns [0, RGN), the
 # pattern lives above it — byte-exact across the reshape while fio races
@@ -125,6 +143,20 @@ adddata|sparecount) [ "$NEW_SIZE" -gt "$OLD_SIZE" ] && rk_pass "capacity grew ($
 						    || rk_fail "capacity did not grow ($OLD_SIZE -> $NEW_SIZE)";;
 esac
 mm=$(rk_scrub); [ "$mm" = 0 ] && rk_pass "scrub clean after concurrent $KIND" || rk_fail "scrub mismatch_cnt=$mm"
+
+if [ "$CSUM" = 1 ]; then
+	# §7c storm detector: a full re-read through the verify path must hit
+	# ZERO stale keys — every CRC either re-keyed by the band or stored by
+	# the racing writes at the stripe's own (sh-keyed) geometry.
+	echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+	sudo dd if="$MD" of=/dev/null bs=1M iflag=direct status=none 2>/dev/null
+	storm=$(( $(sudo dmesg | grep -c "native csum mismatch") - STORM0 ))
+	[ "$storm" = 0 ] && rk_pass "zero csum mismatches on full re-read (no stale-key storm)" \
+			 || rk_fail "$storm csum mismatches after concurrent csum $KIND (stale-key storm)"
+	sudo "$MDADM" --examine "${MEMBERS[0]}" 2>/dev/null | grep -q "crc32c" &&
+		rk_pass "csum layout bit survived the g-change (--examine crc32c)" ||
+		rk_fail "csum layout bit lost across the g-change"
+fi
 
 # THE decode oracle: fail the new m disks ONE AT A TIME -> the fio region and
 # the pattern must still read back correctly (parity written by BOTH the racing

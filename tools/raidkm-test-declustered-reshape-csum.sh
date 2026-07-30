@@ -19,7 +19,7 @@
 #       CRC and fails ("CRC mismatch on migrate read"); heal it through the
 #       array (ahead region still serves the OLD geometry), the reshape then
 #       resumes and completes; data byte-exact + scrub clean.
-#   T4  offline add-parity (g,m -> g+1,m+1) on a --checksum array: the layout
+#   T4  add-parity (g,m -> g+1,m+1) on an idle --checksum array: the layout
 #       word keeps the csum bit; data intact, scrub clean, degraded-decode at
 #       the NEW m, post-reshape corrupt/heal detection at the new geometry.
 #   T5  the trigger REJECTS a layout word that drops the csum bit (a reshape
@@ -213,11 +213,14 @@ cmp -s "$RK_TMP/rb$LC" "$RK_TMP/exp$LC" &&
 	rk_fail "T3: ahead-region read returned corrupt bytes"
 healed=0
 # The heal rewrite is asynchronous.  The window has to cover an INSTRUMENTED
-# kernel too: on KASAN+lockdep everything runs several times slower and 15s
-# expired here while the heal was still in flight (the data-correctness
-# assertions above had already passed).  Poll up to 60s; a genuine failure to
-# heal still fails, it just is not raced by a slow kernel.
-for i in $(seq 1 ${HEAL_POLL_TRIES:-120}); do
+# kernel too: on KASAN+lockdep everything runs several times slower and 15s,
+# then 60s, both expired here while the heal was still in flight (the
+# data-correctness assertions above had already passed, and the reshape's own
+# band-retry loop competes with the heal stripe for the array).  Poll up to
+# 240s; a genuine failure to heal still fails, it just is not raced by a slow
+# kernel.  (2026-07-30: 60s expired on 6.12.0-kasan while the migrate re-read
+# later PASSED its CRC check — proof the rewrite landed, just late.)
+for i in $(seq 1 ${HEAL_POLL_TRIES:-480}); do
 	raw_matches "${MEMBERS[$DSK]}" "$ROW" "$RK_TMP/exp$LC" && { healed=1; break; }
 	sleep 0.5
 done
@@ -233,8 +236,8 @@ GOT=$(sudo dd if="$MD" bs=1M count="$PATMB" iflag=direct status=none | md5sum | 
 mm=$(rk_scrub)
 [ "$mm" = 0 ] && rk_pass "T3: scrub clean" || rk_fail "T3: scrub mismatch_cnt=$mm"
 
-# ---- T4 + T5: offline add-parity with csum; csum-bit-drop rejected -------------
-echo "=== T4/T5: offline add-parity g=$G,m=$M -> g=$((G+1)),m=$((M+1)) with csum ==="
+# ---- T4 + T5: add-parity (idle array) with csum; csum-bit-drop rejected --------
+echo "=== T4/T5: add-parity g=$G,m=$M -> g=$((G+1)),m=$((M+1)) with csum (idle array) ==="
 mk_array "$N" || { rk_fail "T4: create"; rk_summary; exit 1; }
 NG=$(( (N - SC) / G )); APN=$((N + NG)); APG=$((G + 1)); APM=$((M + 1))
 APSEED=0xdef
@@ -248,7 +251,7 @@ echo "$APN:$APSEED:$BADLAY" | sudo tee "$TRIG" >/dev/null 2>&1 &&
 echo "$APN:$APSEED:$APLAY" | sudo tee "$TRIG" >/dev/null 2>&1 ||
 	{ rk_fail "T4: add-parity trigger rejected"; rk_summary; exit 1; }
 wait_trigger_idle 150 || { rk_fail "T4: add-parity did not finish"; rk_summary; exit 1; }
-rk_pass "T4: offline add-parity completed on a --checksum array"
+rk_pass "T4: add-parity completed on a --checksum array"
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 GOT=$(sudo dd if="$MD" bs=1M count="$PATMB" iflag=direct status=none | md5sum | cut -d' ' -f1)
 [ "$PRE" = "$GOT" ] && rk_pass "T4: data intact" || rk_fail "T4: DATA MISMATCH"
