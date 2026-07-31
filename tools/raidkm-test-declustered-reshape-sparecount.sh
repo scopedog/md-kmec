@@ -8,9 +8,10 @@
 #
 # A spare-count DECREASE frees spare columns into usable data columns, so
 # ngroups (and capacity) grow — a forward, non-destructive reshape, tested here
-# end to end.  A spare-count INCREASE shrinks capacity, which needs the
-# array-size-first + backup ordering of a pool shrink and is deferred; this gate
-# asserts the kernel rejects it cleanly rather than migrating over live data.
+# end to end.  A spare-count INCREASE shrinks capacity and runs the BACKWARD
+# COW walk gated array-size-first (dcl-shrink-design.md D2): this gate asserts
+# it is refused without the clamp, then runs it end to end with the clamp
+# (data intact, capacity shrunk, settled scrub clean, geometry persisted).
 # (notes/declustered-reshape-design.md §7.)
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
@@ -86,12 +87,51 @@ echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 [ "$PRE" = "$(sudo dd if="$MD" bs=1M count="$PATMB" iflag=direct status=none 2>/dev/null|md5sum|cut -d' ' -f1)" ] &&
 	rk_pass "data persists across re-assemble" || rk_fail "data lost on re-assemble"
 
-echo "=== spare-count increase (s=$END_S->$START_S) must be rejected (capacity shrink deferred with pool shrink) ==="
+# scrub that waits for a NEW "check done." — mismatch_cnt after an INTR'd
+# check is garbage (kmec scrub-after-reshape race)
+scrub_settled() {
+	local d0 i
+	d0=$(sudo dmesg | grep -c "check done")
+	echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
+	for i in $(seq 1 600); do
+		[ "$(sudo dmesg | grep -c 'check done')" -gt "$d0" ] && {
+			cat "/sys/block/$MDNAME/md/mismatch_cnt"
+			return 0
+		}
+		sleep 0.5
+	done
+	echo "check-never-completed"
+}
+
+echo "=== spare-count INCREASE s=$END_S->$START_S (ngroups $NEW_NG->$OLD_NG, capacity shrinks — BACKWARD walk) ==="
+CUR_SIZE=$(cat /sys/block/$MDNAME/size)
+SHRUNK_SIZE=$(( CUR_SIZE * OLD_NG / NEW_NG ))
 if echo "$N:$NEWSEED:$OLDLAYOUT" | sudo tee "$TRIG" >/dev/null 2>&1; then
-	rk_fail "capacity-shrinking spare-count increase was accepted (should be rejected)"
-	for i in $(seq 1 60); do case "$(cat "$TRIG" 2>/dev/null)" in idle*) break;; esac; sleep 2; done
+	rk_fail "s-increase accepted WITHOUT the array-size clamp"
+	for i in $(seq 1 120); do case "$(cat "$TRIG" 2>/dev/null)" in idle*) break;; esac; sleep 2; done
 else
-	rk_pass "spare-count increase cleanly rejected (deferred shrink path)"
+	rk_pass "s-increase refused without the array-size clamp"
+fi
+sudo "$MDADM" --grow "$MD" --array-size="$(( SHRUNK_SIZE / 2 ))" >/dev/null 2>&1 ||
+	rk_fail "s-increase --array-size clamp failed"
+if echo "$N:$NEWSEED:$OLDLAYOUT" | sudo tee "$TRIG" >/dev/null 2>&1; then
+	rk_pass "s-increase started (backward COW)"
+	ok=0
+	for i in $(seq 1 240); do case "$(cat "$TRIG" 2>/dev/null)" in idle*) ok=1; break;; esac; sleep 2; done
+	[ "$ok" = 1 ] && rk_pass "s-increase completed" || rk_fail "s-increase did not finish"
+	echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+	[ "$PRE" = "$(sudo dd if="$MD" bs=1M count="$PATMB" iflag=direct status=none 2>/dev/null|md5sum|cut -d' ' -f1)" ] &&
+		rk_pass "data intact across s-increase" || rk_fail "s-increase DATA MISMATCH"
+	[ "$(cat /sys/block/$MDNAME/size)" = "$SHRUNK_SIZE" ] &&
+		rk_pass "capacity shrank to the new geometry ($CUR_SIZE -> $SHRUNK_SIZE sectors)" ||
+		rk_fail "s-increase capacity $(cat /sys/block/$MDNAME/size) (want $SHRUNK_SIZE)"
+	mm=$(scrub_settled); [ "$mm" = 0 ] && rk_pass "s-increase scrub clean" ||
+		rk_fail "s-increase scrub mismatch_cnt=$mm"
+	sudo "$MDADM" --examine "${MEMBERS[0]}" | grep -q "$START_S spare column" &&
+		rk_pass "s-increase geometry persisted (--examine s=$START_S)" ||
+		rk_fail "s-increase geometry not persisted"
+else
+	rk_fail "s-increase rejected even with the array-size clamp"
 fi
 
 sudo "$MDADM" --stop "$MD" 2>/dev/null

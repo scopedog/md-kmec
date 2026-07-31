@@ -14,21 +14,33 @@
 # twin.  Each case asserts: parked at the armed point, recovery engaged with the
 # expected journal phase, the reshape completes, the pattern is byte-exact,
 # scrub is clean, and an m-disk degraded read decodes.
+#
+# SHRINK=1: run the same matrix over the BACKWARD pool shrink (N -> N-g,
+# dcl-shrink-design.md D3) — the walk descends, so band 0 is the LAST band
+# processed and band -1 the first; recovery must resume DESCENDING.  The
+# array is clamped array-size-first before the trigger.
 set -u
+SHRINK=${SHRINK:-0}
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
 
-N=${DCL_N:-14}; NEWN=${DCL_NEWN:-20}; G=${DCL_G:-6}; M=${DCL_M:-2}
+if [ "$SHRINK" = 1 ]; then
+	N=${DCL_N:-20}; NEWN=${DCL_NEWN:-14}
+else
+	N=${DCL_N:-14}; NEWN=${DCL_NEWN:-20}
+fi
+G=${DCL_G:-6}; M=${DCL_M:-2}
 SC=${DCL_SC:-2}; NBASE=${DCL_NBASE:-16}; SEED=${DCL_SEED:-0x10}
 NEWSEED=${DCL_NEWSEED:-0xabc}; PATMB=${PATMB:-96}
 INJ=/sys/block/$MDNAME/md/raidkm_reshape_inject
 TRIG=/sys/block/$MDNAME/md/rk_dcl_reshape
 
+MAXN=$(( N > NEWN ? N : NEWN ))
 rk_load_modules || exit 1
-rk_setup_brd "$NEWN" || exit 1
+rk_setup_brd "$MAXN" || exit 1
 
 run_case() {			# $1=band  $2=phase  $3=action
 	local band="$1" phase="$2" action="$3" tag="$1:$2:$3"
-	local MEMBERS=($(rk_pick_disks "$NEWN")) d i st PRE
+	local MEMBERS=($(rk_pick_disks "$MAXN")) d i st PRE
 
 	sudo "$MDADM" --stop "$MD" 2>/dev/null
 	for d in "${MEMBERS[@]}"; do
@@ -46,7 +58,17 @@ run_case() {			# $1=band  $2=phase  $3=action
 	sudo dd if="$RK_TMP/pat" of="$MD" bs=1M count="$PATMB" oflag=direct status=none
 	sync; PRE=$(md5sum "$RK_TMP/pat" | cut -d' ' -f1)
 
-	for d in "${MEMBERS[@]:$N:$((NEWN-N))}"; do sudo "$MDADM" --add "$MD" "$d" >/dev/null 2>&1; done
+	if [ "$NEWN" -gt "$N" ]; then
+		for d in "${MEMBERS[@]:$N:$((NEWN-N))}"; do
+			sudo "$MDADM" --add "$MD" "$d" >/dev/null 2>&1
+		done
+	else
+		# backward: array-size-first before the shrink trigger
+		local cur=$(cat /sys/block/$MDNAME/size)
+		local clamp=$(( cur * ((NEWN - SC) / G) / ((N - SC) / G) ))
+		sudo "$MDADM" --grow "$MD" --array-size="$(( clamp / 2 ))" >/dev/null 2>&1 ||
+			{ rk_fail "$tag: array-size clamp"; return; }
+	fi
 	echo "$band:$phase:$action" | sudo tee "$INJ" >/dev/null
 	rk_dmesg_clear
 	echo "$NEWN:$NEWSEED" | sudo tee "$TRIG" >/dev/null 2>&1 || { rk_fail "$tag: trigger"; return; }

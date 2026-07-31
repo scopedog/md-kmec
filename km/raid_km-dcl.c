@@ -359,8 +359,9 @@ MODULE_PARM_DESC(dcl_selftest,
 	"declustered map self-test: write N:g:m:s:nbase:seed[:crc32] (see tools/raidkm-test-declustered-map.sh)");
 
 /* P0 reshape geometry-select consistency selftest (declustered pool
- * expansion, notes/declustered-reshape-design.md §8 P0).  Builds the OLD and
- * NEW permutation maps (g/m/s/nbase shared, the pool widens oldN -> newN),
+ * expansion AND pool shrink; notes/declustered-reshape-design.md §8 P0,
+ * dcl-shrink-design.md D0).  Builds the OLD and NEW permutation maps
+ * (g/m/s/nbase shared, the pool resizes oldN -> newN in either direction),
  * freezes a NEW-row frontier, and sweeps the OLD logical address space so
  * raidkm_dcl_test_reshape can assert the two runtime geometry selectors
  * (raidkm_dcl_geom_for_chunk / _for_row) agree with each other and with the
@@ -384,10 +385,13 @@ static int dcl_reshape_selftest_set(const char *val,
 		pr_err("raidkm: dcl_reshape_selftest wants g:m:s:nbase:oldN:oldseed:newN:newseed:oldrows:frontier\n");
 		return -EINVAL;
 	}
+	/* newN > oldN sweeps the forward (pool-expansion) selectors; newN <
+	 * oldN sweeps the BACKWARD (pool-shrink) rule with the mirrored
+	 * frontier semantics (raidkm_dcl_backward). */
 	if (m < 2 || g <= m || !s || !nbase || nbase > DCL_ST_MAX_NBASE ||
-	    oldN < g + s || newN <= oldN || newN > 255 ||
+	    oldN < g + s || newN < g + s || newN == oldN || newN > 255 ||
 	    (oldN - s) % g || (newN - s) % g || !oldrows) {
-		pr_err("raidkm: dcl_reshape_selftest bad geometry (C1 on both N; oldN<newN<=255; m>=2, s>=1, nbase<=%u)\n",
+		pr_err("raidkm: dcl_reshape_selftest bad geometry (C1 on both N; newN!=oldN, both <=255; m>=2, s>=1, nbase<=%u)\n",
 		       DCL_ST_MAX_NBASE);
 		return -EINVAL;
 	}
@@ -468,8 +472,11 @@ static int rkdcl_verify_blk(struct mddev *mddev, struct rkdcl_sb *blk)
 		u32 bp = le32_to_cpu(blk->parity);
 		u32 bs = le32_to_cpu(blk->spare_cols);
 
-		if (pool != (u32)mddev->raid_disks &&
-		    !(reshaping && pool < (u32)mddev->raid_disks))
+		/* mid-reshape the block's pool size is the OLD N — below
+		 * raid_disks for an expansion, ABOVE it for a pool shrink
+		 * (dcl-shrink-design.md); the journal's old/new scalars are
+		 * validated against it by the recover path. */
+		if (pool != (u32)mddev->raid_disks && !reshaping)
 			return -EINVAL;
 		if (!(bg == (u32)RAIDKM_LAYOUT_DCL_G(layout) &&
 		      bp == (u32)raidkm_layout_m(layout) &&

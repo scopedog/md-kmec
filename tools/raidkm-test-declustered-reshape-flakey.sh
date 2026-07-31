@@ -31,7 +31,15 @@ set -u
 
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
 
-N=${DCL_N:-14}; NEWN=${DCL_NEWN:-20}; G=${DCL_G:-6}; M=${DCL_M:-2}
+# SHRINK=1: run the matrix over the BACKWARD pool shrink (N=20 -> 14,
+# array-size-first clamp before each trigger; dcl-shrink-design.md D3)
+SHRINK=${SHRINK:-0}
+if [ "$SHRINK" = 1 ]; then
+	N=${DCL_N:-20}; NEWN=${DCL_NEWN:-14}
+else
+	N=${DCL_N:-14}; NEWN=${DCL_NEWN:-20}
+fi
+G=${DCL_G:-6}; M=${DCL_M:-2}
 SC=${DCL_SC:-2}; NBASE=${DCL_NBASE:-16}; SEED=${DCL_SEED:-0x10}
 NEWSEED=${DCL_NEWSEED:-0xabc}
 ITERS=${DCL_CRASH_ITERS:-5}
@@ -60,14 +68,16 @@ global_cleanup() {
 	done
 }
 
+MAXN=$(( N > NEWN ? N : NEWN ))
+
 stack_setup() {
 	local i b flk sectors brds
 	FLK=(); BRDS=(); DEVS=()
 	global_cleanup
-	rk_setup_brd "$NEWN" || return 1
-	brds=($(rk_pick_disks "$NEWN"))
+	rk_setup_brd "$MAXN" || return 1
+	brds=($(rk_pick_disks "$MAXN"))
 	rk_udev_quiesce
-	for i in "${!brds[@]}"; do		# ALL NEWN members backed by brd
+	for i in "${!brds[@]}"; do		# ALL members backed by brd
 		b="${brds[$i]}"
 		sudo dd if=/dev/zero of="$b" bs=1M count=8 status=none 2>/dev/null
 		sudo "$MDADM" --zero-superblock "$b" 2>/dev/null
@@ -126,7 +136,17 @@ for it in $(seq 1 "$ITERS"); do
 	sync
 	PRE=$(md5sum "$RK_TMP/pat" | cut -d' ' -f1)
 
-	for d in "${DEVS[@]:$N:$((NEWN-N))}"; do sudo "$MDADM" --add "$MD" "$d" >/dev/null 2>&1; done
+	if [ "$NEWN" -gt "$N" ]; then
+		for d in "${DEVS[@]:$N:$((NEWN-N))}"; do
+			sudo "$MDADM" --add "$MD" "$d" >/dev/null 2>&1
+		done
+	else
+		# backward pool shrink (SHRINK=1): array-size-first clamp
+		cur=$(cat /sys/block/$MDNAME/size)
+		clamp=$(( cur * ((NEWN - SC) / G) / ((N - SC) / G) ))
+		sudo "$MDADM" --grow "$MD" --array-size="$(( clamp / 2 ))" >/dev/null 2>&1 ||
+			{ rk_fail "$tag: array-size clamp failed"; break; }
+	fi
 	rk_throttle "$SPEED"
 	echo "$NEWN:$NEWSEED" | sudo tee "$TRIG" >/dev/null 2>&1 || { rk_fail "$tag: trigger failed"; break; }
 

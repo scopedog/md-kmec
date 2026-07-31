@@ -245,12 +245,27 @@ static inline int raidkm_dcl_redirect(struct r5conf *conf, int disk,
 	return disk;	/* spare-only cycle; group slots never get here */
 }
 
-/* Declustered pool-expansion reshape: pick the geometry that applies to a
- * given physical device chunk row.  A row < reshape_frontier_row has been
- * migrated to the NEW (wider) geometry (conf->dcl); a row at/above it still
- * holds OLD-geometry content (conf->prev_dcl).  When no reshape is running
- * prev_dcl == NULL and this always returns conf->dcl — the steady-state path
- * is bit-identical.  See notes/declustered-reshape-design.md §3.2. */
+/* A capacity-shrinking dcl reshape (pool shrink N->N-g, spare-count
+ * increase) walks BACKWARD: its frontier DESCENDS from the top row and the
+ * un-migrated (old-geometry) region sits BELOW it — the mirror of the
+ * forward kinds.  Direction is a pure function of the two maps (the new
+ * geometry packing fewer data cells per row == backward), so the selectors
+ * need no extra published state. */
+static inline bool raidkm_dcl_backward(const struct dcl_geom *oge,
+				       const struct dcl_geom *nge)
+{
+	return (u32)nge->ngroups * nge->k < (u32)oge->ngroups * oge->k;
+}
+
+/* Declustered reshape: pick the geometry that applies to a given physical
+ * device chunk row.  Forward (pool expansion, add-parity/add-data,
+ * spare-count decrease): a row < reshape_frontier_row has been migrated to
+ * the NEW geometry (conf->dcl); a row at/above it still holds OLD-geometry
+ * content (conf->prev_dcl).  Backward (capacity-shrinking): the comparison
+ * mirrors — rows below the descending frontier are still OLD.  When no
+ * reshape is running prev_dcl == NULL and this always returns conf->dcl —
+ * the steady-state path is bit-identical.
+ * See notes/declustered-reshape-design.md §3.2 and dcl-shrink-design.md. */
 static inline struct dcl_geom *raidkm_dcl_geom_for_row(struct r5conf *conf,
 						       sector_t row)
 {
@@ -259,15 +274,31 @@ static inline struct dcl_geom *raidkm_dcl_geom_for_row(struct r5conf *conf,
 	 * passed the check.  Same in every prev_dcl selector below. */
 	struct dcl_geom *prev = READ_ONCE(conf->prev_dcl);
 
-	if (prev && row >= READ_ONCE(conf->reshape_frontier_row))
-		return prev;
+	if (prev) {
+		if (raidkm_dcl_backward(prev, conf->dcl)) {
+			/* The frontier RESTS at 0 between reshapes, which for
+			 * the flipped comparison means all-migrated — so a
+			 * backward start must publish the armed frontier
+			 * BEFORE prev_dcl (smp_wmb() there); pair it here so
+			 * seeing prev non-NULL implies seeing the armed
+			 * frontier, never the resting 0. */
+			smp_rmb();
+			if (row < READ_ONCE(conf->reshape_frontier_row))
+				return prev;
+		} else if (row >= READ_ONCE(conf->reshape_frontier_row)) {
+			return prev;
+		}
+	}
 	return conf->dcl;
 }
 
 /* Same selection keyed by a LOGICAL chunk instead of a device row: a chunk is
- * migrated iff its NEW-geometry row is below the frontier (the new map packs
- * data denser into lower rows, so new_row(c) <= old_row(c), which makes this
- * consistent with raidkm_dcl_geom_for_row on the row the chunk lands at). */
+ * migrated iff its NEW-geometry row is on the migrated side of the frontier.
+ * Forward: the new map packs data denser into lower rows (new_row(c) <=
+ * old_row(c)), so migrated == nrow < frontier.  Backward (shrink): the new
+ * map packs SPARSER (new_row(c) >= old_row(c)) and the frontier descends, so
+ * migrated == nrow >= frontier.  Either way this is consistent with
+ * raidkm_dcl_geom_for_row on the row the chunk lands at. */
 static inline struct dcl_geom *raidkm_dcl_geom_for_chunk(struct r5conf *conf,
 							 sector_t logical_chunk)
 {
@@ -278,8 +309,15 @@ static inline struct dcl_geom *raidkm_dcl_geom_for_chunk(struct r5conf *conf,
 		sector_t nrow = logical_chunk;
 
 		sector_div(nrow, ge->ngroups * ge->k);	/* NEW-geometry row */
-		if (nrow >= READ_ONCE(conf->reshape_frontier_row))
+		if (raidkm_dcl_backward(prev, ge)) {
+			smp_rmb();	/* pairs with the backward start's
+					 * frontier-before-prev publish; see
+					 * raidkm_dcl_geom_for_row */
+			if (nrow < READ_ONCE(conf->reshape_frontier_row))
+				return prev;
+		} else if (nrow >= READ_ONCE(conf->reshape_frontier_row)) {
 			return prev;
+		}
 	}
 	return ge;
 }
@@ -447,7 +485,12 @@ int raidkm_dcl_test_reshape(struct r5conf *conf, u64 old_rows, u64 *bad)
 		bool migrated;
 
 		sector_div(nrow, nspan);
-		migrated = nrow < conf->reshape_frontier_row;
+		/* the frontier rule mirrors for a backward (capacity-shrinking)
+		 * transition: the migrated region is AT/ABOVE the descending
+		 * frontier (see raidkm_dcl_geom_for_chunk) */
+		migrated = raidkm_dcl_backward(conf->prev_dcl, newge) ?
+			nrow >= conf->reshape_frontier_row :
+			nrow < conf->reshape_frontier_row;
 		if ((gc == newge) != migrated) {
 			*bad = c;
 			return -1;
@@ -10201,13 +10244,14 @@ static int raidkm_dcl_reshape_recover(struct r5conf *conf,
 	 * exactly, and conf must already carry the NEW parity count and pool
 	 * size (both set from new_layout at assembly).  Handles every forward
 	 * transition — pool expansion (g/m/s fixed), add-parity (m,g up),
-	 * add-data (k,g up) and spare-count (s changes, newN == oldN).  A
-	 * capacity shrink (newN < oldN) is not a supported reshape.
+	 * add-data (k,g up) and spare-count (s changes, newN == oldN) — and
+	 * the BACKWARD capacity-shrinking ones (pool shrink newN < oldN,
+	 * spare-count increase), whose resume math mirrors below.
 	 */
 	if (!oge || oge->N != oldN || oge->g != old_g || oge->s != old_s ||
 	    oge->m != old_m || oge->nbase != nbase || oge->seed != old_seed ||
 	    (u32)conf->m != new_m || (u32)conf->raid_disks != newN ||
-	    newN < oldN || new_g < new_m + 1 || new_s < 1 ||
+	    new_g < new_m + 1 || new_s < 1 ||
 	    (newN - new_s) % new_g) {
 		pr_warn("md/raid:%s: dcl reshape recover: foreign/mismatched journal (N %u->%u g %u->%u m %u->%u s %u->%u) — refusing\n",
 			mdname(mddev), oldN, newN, old_g, new_g, old_m, new_m,
@@ -10259,7 +10303,9 @@ static int raidkm_dcl_reshape_recover(struct r5conf *conf,
 		conf->max_degraded = max_t(int, new_m, old_m);
 	}
 
-	/* install the dual map; from here free_conf frees both on any abort */
+	/* install the dual map; from here free_conf frees both on any abort.
+	 * (Assembly context — the array is not live, so the backward
+	 * frontier-before-prev publication ordering is not needed here.) */
 	conf->prev_dcl = oge;
 	conf->dcl = nge;
 	conf->previous_raid_disks = oldN;
@@ -10272,20 +10318,28 @@ static int raidkm_dcl_reshape_recover(struct r5conf *conf,
 				mdname(mddev), (unsigned long long)row, err);
 			return err;		/* free_conf cleans up prev_dcl+dcl */
 		}
-		resume_row = row + 1;
+		resume_row = raidkm_dcl_backward(oge, nge) ? row : row + 1;
 		break;
 	case RAIDKM_PH_DONE:
-		resume_row = row + 1;		/* band committed; resume after */
+		/* band committed; resume after it.  Forward "after" is the next
+		 * row UP (frontier = migrated-below bound, row + 1); backward
+		 * "after" is the next row DOWN (frontier = migrated-at/above
+		 * bound, row). */
+		resume_row = raidkm_dcl_backward(oge, nge) ? row : row + 1;
 		break;
 	case RAIDKM_PH_STAGE:
 	case RAIDKM_PH_IDLE:
 	default:
-		resume_row = row;		/* home intact; redo from old */
+		/* home intact; redo this band from the old map */
+		resume_row = raidkm_dcl_backward(oge, nge) ? row + 1 : row;
 		break;
 	}
 
 	spin_lock_irq(&conf->device_lock);
 	conf->reshape_frontier_row = resume_row;
+	/* logical progress at a resting frontier is frontier * new-row span in
+	 * BOTH directions: forward it is the migrated-prefix end, backward the
+	 * un-migrated-prefix end (the descending claim's lower edge). */
 	conf->reshape_progress = resume_row *
 		(sector_t)nge->ngroups * nge->k * chunk;
 	conf->reshape_safe = conf->reshape_progress;
@@ -10928,28 +10982,47 @@ static sector_t raidkm_reshape_dcl_cow(struct mddev *mddev, sector_t sector_nr,
 	u64 new_span = (u64)nge->ngroups * nge->k;	/* logical chunks / new row */
 	sector_t per_disk = mddev->dev_sectors;
 	sector_t row = sector_nr, last_band = per_disk;
+	bool backward = raidkm_dcl_backward(conf->prev_dcl, nge);
+	sector_t nrows;
 	struct raidkm_reshape_ctx ctx;
 	unsigned int noio_flag;
 	int err;
 
-	/* resume jump: on assembly md_do_sync restarts at 0; skip the migrated
-	 * prefix (frontier restored from the journal by recovery — a later
-	 * phase; frontier is 0 for a fresh reshape so this never fires then). */
-	if (sector_nr == 0 && conf->reshape_frontier_row > 0) {
-		sector_t resume = conf->reshape_frontier_row * (sector_t)chunk;
+	nrows = per_disk;
+	sector_div(nrows, chunk);
 
-		mddev->curr_resync_completed = resume;
-		*skipped = 1;
-		return resume;
+	/* resume jump: on assembly md_do_sync restarts at 0; skip the already
+	 * completed work (frontier restored from the journal by recovery).
+	 * Forward migrates rows 0..F-1, so completed == F rows; backward
+	 * (shrink) migrates rows nrows-1..F, so completed == nrows - F rows.
+	 * A fresh reshape (forward F == 0, backward F == nrows) skips nothing. */
+	if (sector_nr == 0) {
+		sector_t done_rows = backward ?
+			nrows - conf->reshape_frontier_row :
+			conf->reshape_frontier_row;
+
+		if (done_rows > 0) {
+			sector_t resume = done_rows * (sector_t)chunk;
+
+			mddev->curr_resync_completed = resume;
+			*skipped = 1;
+			return resume;
+		}
 	}
 
 	sector_div(row, chunk);
 	sector_div(last_band, chunk);
 	if (last_band)
 		last_band -= 1;
+	if (backward)
+		row = last_band - row;			/* descending walk */
 
 	memset(&ctx, 0, sizeof(ctx));
-	ctx.jseq		= (u64)row * 4 + RAIDKM_RJ_SLOTS;
+	/* jread picks the HIGHEST valid seq, so seq must track migration
+	 * ORDER, not the row number — on the descending walk that is the
+	 * completed-band count (the forward walk's row IS its order). */
+	ctx.jseq		= (backward ? (u64)(last_band - row)
+					    : (u64)row) * 4 + RAIDKM_RJ_SLOTS;
 	ctx.old_m		= conf->prev_m;	/* differs from new_m on add-parity */
 	ctx.new_m		= conf->m;
 	ctx.old_raid_disks	= conf->previous_raid_disks;
@@ -10967,15 +11040,22 @@ static sector_t raidkm_reshape_dcl_cow(struct mddev *mddev, sector_t sector_nr,
 	ctx.frontier_row	= row;		/* recovery resumes from here */
 
 	/*
-	 * CLAIM: advance reshape_progress to the end of this new row's logical
-	 * range so make_request stalls I/O to [reshape_safe, reshape_progress)
-	 * (exactly this row) while below proceeds in the new geometry and above
-	 * in the old.  The frontier row is NOT advanced yet (stays `row`), so
-	 * the map selectors still treat this row as old until DONE.  Then drain
-	 * pre-claim I/O with a quiesce pulse before reading the old cells.
+	 * CLAIM this new row's logical range so make_request stalls I/O to it
+	 * while either side of the frontier proceeds in its own geometry.
+	 * Forward: advance reshape_progress to the range's END — the stall
+	 * window is [reshape_safe, reshape_progress).  Backward: LOWER
+	 * reshape_progress to the range's START — the window is
+	 * [reshape_progress, reshape_safe), matching the backwards
+	 * ahead_of_reshape() rule (un-migrated == below progress).  The
+	 * frontier row is NOT moved yet, so the map selectors still treat
+	 * this row as old until DONE.  Then drain pre-claim I/O with a
+	 * quiesce pulse before reading the old cells.
 	 */
 	spin_lock_irq(&conf->device_lock);
-	conf->reshape_progress = (sector_t)(row + 1) * new_span * chunk;
+	if (backward)
+		conf->reshape_progress = (sector_t)row * new_span * chunk;
+	else
+		conf->reshape_progress = (sector_t)(row + 1) * new_span * chunk;
 	spin_unlock_irq(&conf->device_lock);
 	raid5_quiesce(mddev, true);
 	raid5_quiesce(mddev, false);
@@ -10984,8 +11064,15 @@ static sector_t raidkm_reshape_dcl_cow(struct mddev *mddev, sector_t sector_nr,
 	err = raidkm_reshape_migrate_band_dcl(conf, &ctx, row, last_band);
 	memalloc_noio_restore(noio_flag);
 	if (err) {
+		/* no progress: unclaim (progress back to the band's resting
+		 * edge -> empty stall window, safe == progress) */
 		spin_lock_irq(&conf->device_lock);
-		conf->reshape_progress = (sector_t)row * new_span * chunk;
+		if (backward)
+			conf->reshape_progress =
+				(sector_t)(row + 1) * new_span * chunk;
+		else
+			conf->reshape_progress =
+				(sector_t)row * new_span * chunk;
 		spin_unlock_irq(&conf->device_lock);
 		wake_up(&conf->wait_for_reshape);
 		*skipped = 1;
@@ -10993,11 +11080,13 @@ static sector_t raidkm_reshape_dcl_cow(struct mddev *mddev, sector_t sector_nr,
 	}
 
 	/*
-	 * RELEASE: publish the frontier advance to the map selectors FIRST
+	 * RELEASE: publish the frontier move to the map selectors FIRST
 	 * (so a waking make_request that reclassifies this row as migrated maps
-	 * it through the new geometry), then advance reshape_safe to unstall it.
+	 * it through the new geometry), then move reshape_safe to unstall it.
+	 * Forward the frontier advances to row+1 (migrated == rows below it);
+	 * backward it descends to row (migrated == rows at/above it).
 	 */
-	WRITE_ONCE(conf->reshape_frontier_row, row + 1);
+	WRITE_ONCE(conf->reshape_frontier_row, backward ? row : row + 1);
 	spin_lock_irq(&conf->device_lock);
 	conf->reshape_safe = conf->reshape_progress;
 	spin_unlock_irq(&conf->device_lock);
@@ -13152,6 +13241,7 @@ raidkm_store_dcl_reshape(struct mddev *mddev, const char *page, size_t len)
 	struct r5conf *conf;
 	unsigned int newN, newlay = 0, g, s;
 	unsigned long long newseed;
+	bool backward = false;
 	int nf, err;
 
 	if (len >= PAGE_SIZE)
@@ -13188,33 +13278,68 @@ raidkm_store_dcl_reshape(struct mddev *mddev, const char *page, size_t len)
 	g = RAIDKM_LAYOUT_DCL_G(newlay);
 	s = RAIDKM_LAYOUT_DCL_S(newlay);
 	/* newN == raid_disks is allowed for a spare-count change (only the
-	 * layout word / s moves); otherwise the pool must grow. */
-	if (newN < (unsigned int)conf->raid_disks || !g || (newN - s) % g ||
+	 * layout word / s moves); newN > raid_disks grows the pool; newN <
+	 * raid_disks is a POOL SHRINK (validated below). */
+	if (!g || (newN - s) % g ||
 	    (newN == (unsigned int)conf->raid_disks &&
 	     newlay == (unsigned int)mddev->layout)) {
 		err = -EINVAL;
 		goto out;
 	}
 	/*
-	 * Capacity ~ ngroups * k.  A spare-count *increase* (or a pool shrink)
-	 * lowers ngroups and therefore shrinks the array.  A capacity-shrinking
-	 * reshape needs the array-size-first + backup-file ordering of a shrink
-	 * (userspace must evacuate the tail before the layout collapses into it);
-	 * that path is deferred, so reject it here rather than migrate over live
-	 * data.  Spare-count *decrease*, add-parity, add-data and pool expansion
-	 * all keep or grow the data-column count and fall through.
+	 * Capacity ~ ngroups * k.  A pool shrink (or a spare-count increase)
+	 * lowers ngroups and therefore shrinks the array — a BACKWARD reshape
+	 * (dcl-shrink-design.md).  v1 supports the pool shrink by exactly one
+	 * group (newN == N - g, layout word fixed), gated array-size-first:
+	 * the in-use array size must already fit the smaller geometry, so the
+	 * backward migration never walks over live tail data.  Spare-count
+	 * increase is still deferred.  Spare-count decrease, add-parity,
+	 * add-data and pool expansion keep or grow the data-column count and
+	 * run forward as before.
 	 */
 	{
 		unsigned int nm = raidkm_layout_m(newlay);
 		unsigned int new_ng = (newN - s) / g;
 
-		if (g <= nm || new_ng == 0 ||
-		    new_ng * (g - nm) <
-		    (unsigned int)conf->dcl->ngroups * (unsigned int)conf->dcl->k) {
-			pr_warn("md/raid:%s: declustered: reshape to N=%u g=%u m=%u s=%u would shrink capacity; capacity-shrinking reshapes (spare-count increase / pool shrink) are not yet supported\n",
-				mdname(mddev), newN, g, nm, s);
+		if (g <= nm || new_ng == 0) {
 			err = -EINVAL;
 			goto out;
+		}
+		backward = new_ng * (g - nm) <
+			(unsigned int)conf->dcl->ngroups *
+			(unsigned int)conf->dcl->k;
+		/* spare-count INCREASE: backward with a fixed device set
+		 * (newN == N).  Only s may move — a g/m change at fixed N is
+		 * not a supported transition in either direction. */
+		if (backward && newN == (unsigned int)conf->raid_disks &&
+		    (g != (unsigned int)conf->dcl->g ||
+		     nm != (unsigned int)conf->dcl->m)) {
+			err = -EINVAL;
+			goto out;
+		}
+		if (newN < (unsigned int)conf->raid_disks &&
+		    (newlay != (unsigned int)mddev->layout ||
+		     newN != (unsigned int)conf->raid_disks - g)) {
+			pr_warn("md/raid:%s: declustered: v1 pool shrink removes exactly one group (N %u -> %u, g=%u fixed layout); got N=%u layout %#x\n",
+				mdname(mddev), conf->raid_disks,
+				conf->raid_disks - g, g, newN, newlay);
+			err = -EINVAL;
+			goto out;
+		}
+		if (backward) {
+			sector_t rows = mddev->dev_sectors, newcap;
+
+			sector_div(rows, mddev->chunk_sectors);
+			newcap = rows * new_ng * (g - nm) *
+				(sector_t)mddev->chunk_sectors;
+			if (mddev->array_sectors > newcap) {
+				pr_warn("md/raid:%s: declustered shrink needs array-size-first: array is %llu sectors but the new geometry holds %llu; shrink the fs, then set --array-size before reshaping\n",
+					mdname(mddev),
+					(unsigned long long)mddev->array_sectors,
+					(unsigned long long)newcap);
+				err = -ENOSPC;
+				goto out;
+			}
 		}
 	}
 	if (mddev->reshape_position != MaxSector || conf->prev_dcl) {
@@ -13234,17 +13359,27 @@ raidkm_store_dcl_reshape(struct mddev *mddev, const char *page, size_t len)
 	 */
 	conf->reshape_new_seed = newseed;
 	mddev->delta_disks = (int)newN - conf->raid_disks;
+	/* a capacity-shrinking transition walks backward; md-core only arms
+	 * this on the raid_disks sysfs path (update_raid_disks), which this
+	 * trigger bypasses — and the spare-count case has delta_disks == 0,
+	 * which md-core would never flag.  ahead_of_reshape()'s LOC routing
+	 * and the descending progress semantics both key on it. */
+	if (backward)
+		mddev->reshape_backwards = 1;
 	mddev->new_layout = (int)newlay;
 	mddev->new_chunk_sectors = mddev->chunk_sectors;
 	mddev->new_level = mddev->level;
 	err = mddev->pers->check_reshape(mddev);	/* grows conf->disks */
 	if (err) {
 		mddev->delta_disks = 0;
+		mddev->reshape_backwards = 0;
 		goto out;
 	}
 	err = raid5_start_reshape(mddev);
-	if (err)
+	if (err) {
 		mddev->delta_disks = 0;
+		mddev->reshape_backwards = 0;
+	}
 out:
 	mddev_unlock(mddev);
 	if (!err)
@@ -15828,7 +15963,8 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 	struct dcl_geom *oge = conf->dcl, *nge;
 	int newN = conf->raid_disks + mddev->delta_disks;
 	int new_g, new_m, new_s, new_k;
-	bool ec_change;
+	bool ec_change, backward;
+	sector_t total_rows;
 	unsigned char *new_a = NULL, *new_gg = NULL, *new_gb = NULL;
 	struct md_rdev *rdev;
 	unsigned long flags;
@@ -15846,8 +15982,6 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 	 * write — see raidkm_reshape_verify_src / _csum_rekey. */
 	if (mddev->recovery_cp < MaxSector)
 		return -EBUSY;
-	if (mddev->delta_disks < 0)
-		return -EINVAL;
 	/* delta_disks == 0 is only a spare-count change (s, and hence ngroups,
 	 * move; the pool size stays) — it must carry a new layout word. */
 	if (mddev->delta_disks == 0 &&
@@ -15876,6 +16010,41 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 		return -EINVAL;
 	if (new_m < 2 || new_m > RAIDKM_MAX_M)
 		return -EINVAL;
+	backward = (unsigned int)((newN - new_s) / new_g) * new_k <
+		   (unsigned int)oge->ngroups * oge->k;
+	if (backward) {
+		sector_t rows = mddev->dev_sectors, newcap;
+
+		/* v1 backward kinds, re-validated here (not just in the
+		 * trigger) so the raw-sysfs raid_disks path can never start
+		 * an unguarded capacity-shrinking reshape:
+		 * - pool shrink: exactly one group's worth of disks removed,
+		 *   layout word (g/m/s) fixed;
+		 * - spare-count increase: fixed device set, only s moves
+		 *   (g/m fixed => ec_change false). */
+		if (mddev->delta_disks < 0) {
+			if (ec_change || new_g != oge->g || new_s != oge->s ||
+			    newN != conf->raid_disks - (int)new_g)
+				return -EINVAL;
+		} else {
+			if (mddev->delta_disks > 0 || ec_change ||
+			    new_g != oge->g)
+				return -EINVAL;
+		}
+		/* array-size-first: the in-use size must already fit the
+		 * smaller geometry, or the backward walk would migrate over
+		 * live tail data (dcl-shrink-design.md §4). */
+		sector_div(rows, conf->chunk_sectors);
+		newcap = rows * ((newN - new_s) / new_g) * new_k *
+			(sector_t)conf->chunk_sectors;
+		if (mddev->array_sectors > newcap) {
+			pr_warn("md/raid:%s: declustered shrink needs array-size-first: array is %llu sectors, new geometry holds %llu\n",
+				mdname(mddev),
+				(unsigned long long)mddev->array_sectors,
+				(unsigned long long)newcap);
+			return -ENOSPC;
+		}
+	}
 
 	/*
 	 * Build the NEW group EC tables when the group's (k,m) changes
@@ -15897,14 +16066,27 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 		return -ENOMEM;
 	}
 
+	total_rows = mddev->dev_sectors;
+	sector_div(total_rows, conf->chunk_sectors);
+
 	atomic_set(&conf->reshape_stripes, 0);
 	spin_lock_irq(&conf->device_lock);
 	write_seqcount_begin(&conf->gen_lock);
 	conf->previous_raid_disks = conf->raid_disks;
 	conf->raid_disks = newN;
+	/*
+	 * Backward (capacity-shrinking): the frontier rests at 0, which under
+	 * the flipped selector rule means all-migrated — so ARM it at the top
+	 * row BEFORE publishing prev_dcl, with a write barrier, so any
+	 * selector that observes prev non-NULL also observes the armed
+	 * frontier (pairs with the smp_rmb() in raidkm_dcl_geom_for_row/
+	 * _for_chunk).  Forward keeps the resting 0: under the forward rule
+	 * that is fail-safe-old for every row.
+	 */
+	conf->reshape_frontier_row = backward ? total_rows : 0;
+	smp_wmb();
 	conf->prev_dcl = oge;			/* OLD map: un-migrated rows */
 	conf->dcl = nge;			/* NEW map: migrated rows */
-	conf->reshape_frontier_row = 0;
 	conf->prev_chunk_sectors = conf->chunk_sectors;
 	conf->prev_algo = conf->algorithm;
 	/* the NEW layout word (g/m/s) — persisted to the SB at finish_reshape
@@ -15928,8 +16110,17 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 	}
 	conf->generation++;
 	smp_mb();
-	conf->reshape_progress = 0;		/* forward; frontier at row 0 */
-	conf->reshape_safe = 0;
+	if (backward) {
+		/* descending: progress rests at the frontier's logical span
+		 * end == the NEW geometry's full size; everything below it is
+		 * ahead-of-reshape (OLD map, previous=1) per the backwards
+		 * ahead_of_reshape() rule. */
+		conf->reshape_progress = total_rows *
+			(sector_t)nge->ngroups * nge->k * conf->chunk_sectors;
+	} else {
+		conf->reshape_progress = 0;	/* forward; frontier at row 0 */
+	}
+	conf->reshape_safe = conf->reshape_progress;
 	write_seqcount_end(&conf->gen_lock);
 	spin_unlock_irq(&conf->device_lock);
 
@@ -15952,14 +16143,17 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 
 	/* admit the g new pool disks (added as spares by mdadm --add) as
 	 * In_sync members — their columns are filled by the migration, not a
-	 * rebuild.  nreb==0, so raid5_add_disk takes the stock slot-assign path. */
-	rdev_for_each(rdev, mddev)
-		if (rdev->raid_disk < 0 && !test_bit(Faulty, &rdev->flags)) {
-			if (raid5_add_disk(mddev, rdev) == 0) {
-				set_bit(In_sync, &rdev->flags);
-				sysfs_link_rdev(mddev, rdev);
+	 * rebuild.  nreb==0, so raid5_add_disk takes the stock slot-assign path.
+	 * A shrink admits nothing: the departing slots (>= newN) stay In_sync
+	 * members serving OLD-map reads until finalize ejects them. */
+	if (mddev->delta_disks >= 0)
+		rdev_for_each(rdev, mddev)
+			if (rdev->raid_disk < 0 && !test_bit(Faulty, &rdev->flags)) {
+				if (raid5_add_disk(mddev, rdev) == 0) {
+					set_bit(In_sync, &rdev->flags);
+					sysfs_link_rdev(mddev, rdev);
+				}
 			}
-		}
 	spin_lock_irqsave(&conf->device_lock, flags);
 	mddev->degraded = raid5_calc_degraded(conf);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
@@ -15987,7 +16181,7 @@ static int raidkm_dcl_start_reshape(struct mddev *mddev)
 			.dcl_old_s	= conf->prev_dcl->s,
 			.dcl_old_seed	= conf->prev_dcl->seed,
 			.dcl_new_seed	= conf->dcl->seed,
-			.frontier_row	= 0,
+			.frontier_row	= backward ? total_rows : 0,
 		};
 
 		if (raidkm_reshape_journal_init(conf, &ctx))
@@ -16581,6 +16775,56 @@ static int raid5_check_reshape(struct mddev *mddev)
  * Everything else (delta_disks / stripe-cache resize) is handled by the shared
  * check_reshape(), and relocation rides the layout-aware compute_sector().
  */
+/* Every COW-staged reshape journals + stages bands in the scratch gap below
+ * each member's data_offset (raidkm_scratch_io).  Require the headroom on
+ * every member and require the staged band to fit the fixed-size zone, for
+ * every entry point (mdadm sysfs as well as dm-raid, where a normally
+ * created array has data_offset 0 and no gap at all), so the reshape fails
+ * cleanly instead of the scratch I/O wrapping into live data. */
+static int raidkm_reshape_check_scratch(struct mddev *mddev)
+{
+	struct md_rdev *rdev;
+
+	rdev_for_each(rdev, mddev) {
+		if (test_bit(Faulty, &rdev->flags))
+			continue;
+		if (rdev->data_offset < rdev->sb_start +
+		    RAIDKM_RESHAPE_SCRATCH_SECTORS +
+		    RAIDKM_RESHAPE_SB_MARGIN) {
+			pr_warn("md/raid:%s: raidkm reshape needs %u sectors of scratch headroom below data_offset (%pg has data_offset %llu, sb_start %llu)\n",
+				mdname(mddev),
+				RAIDKM_RESHAPE_SCRATCH_SECTORS +
+				RAIDKM_RESHAPE_SB_MARGIN,
+				rdev->bdev,
+				(unsigned long long)rdev->data_offset,
+				(unsigned long long)rdev->sb_start);
+			return -ENOSPC;
+		}
+	}
+
+	/*
+	 * The per-band staging area in the scratch zone holds the RJ_SLOTS
+	 * journal pages followed by one chunk's worth of pages per member
+	 * (raidkm_reshape_write_units writes at RJ_SLOTS + po pages).  The
+	 * scratch zone is a fixed RAIDKM_RESHAPE_SCRATCH_SECTORS, so a chunk
+	 * large enough to push the staged band past it would wrap up into the
+	 * data region (data_offset and above) and corrupt live data.  Reject
+	 * such a reshape rather than corrupt — the default 64 KiB through
+	 * 256 KiB chunks fit; >= 512 KiB does not (with SCRATCH = 1024).
+	 */
+	if ((RAIDKM_RJ_SLOTS + mddev->chunk_sectors / RAIDKM_PAGE_SECTORS) *
+	    RAIDKM_PAGE_SECTORS > RAIDKM_RESHAPE_SCRATCH_SECTORS) {
+		pr_warn("md/raid:%s: raidkm reshape unsupported at chunk %u KiB: staged band needs %u scratch sectors but only %u are reserved\n",
+			mdname(mddev), mddev->chunk_sectors / 2,
+			(unsigned int)((RAIDKM_RJ_SLOTS +
+				mddev->chunk_sectors / RAIDKM_PAGE_SECTORS) *
+				RAIDKM_PAGE_SECTORS),
+			RAIDKM_RESHAPE_SCRATCH_SECTORS);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int raidkm_check_reshape(struct mddev *mddev)
 {
 	unsigned int new_chunk = mddev->new_chunk_sectors;
@@ -16595,8 +16839,13 @@ static int raidkm_check_reshape(struct mddev *mddev)
 		 * the classic path; the real setup runs when raid_disks bumps.
 		 */
 		if (raidkm_layout_is_dcl(mddev->new_layout)) {
-			if (mddev->delta_disks == 0)
-				return 0;
+			if (mddev->delta_disks == 0) {
+				/* spare-count changes keep delta_disks == 0
+				 * but still run the COW band engine — they
+				 * need the scratch zone like any other kind
+				 * (this early return used to skip the check). */
+				return raidkm_reshape_check_scratch(mddev);
+			}
 		} else {
 			int old_m = raidkm_layout_m(mddev->layout);
 			int new_m = raidkm_layout_m(mddev->new_layout);
@@ -16632,9 +16881,19 @@ static int raidkm_check_reshape(struct mddev *mddev)
 		struct r5conf *conf = mddev->private;
 
 		if (conf && conf->dcl) {
-			pr_warn("md/raid:%s: declustered pool shrink is not supported\n",
-				mdname(mddev));
-			return -EOPNOTSUPP;
+			/* declustered pool shrink (backward COW): the one-group
+			 * quantum and the array-size-first precondition are
+			 * validated by the rk_dcl_reshape trigger and
+			 * re-checked in raidkm_dcl_start_reshape (covering the
+			 * raw-sysfs raid_disks path too).  v1 keeps the layout
+			 * word fixed. */
+			if (mddev->new_layout >= 0 &&
+			    mddev->new_layout != mddev->layout) {
+				pr_warn("md/raid:%s: declustered pool shrink cannot change the layout word\n",
+					mdname(mddev));
+				return -EINVAL;
+			}
+			goto scratch;
 		}
 		if (mddev->delta_disks != -1) {
 			pr_warn("md/raid:%s: raidkm shrink removes exactly one data disk (delta_disks=%d)\n",
@@ -16648,55 +16907,12 @@ static int raidkm_check_reshape(struct mddev *mddev)
 			return -EINVAL;
 		}
 	}
-	/*
-	 * Disk-count-changing reshapes run the COW-staged migration, whose
-	 * journal + scratch zone lives in the gap below each member's
-	 * data_offset (raidkm_scratch_io).  Require the headroom on every
-	 * member up front, for every entry point (mdadm sysfs as well as
-	 * dm-raid, where a normally-created array has data_offset 0 and no gap
-	 * at all), so the reshape fails cleanly instead of the scratch I/O
-	 * wrapping below the superblock.
-	 */
+scratch:
 	if (mddev->delta_disks != 0) {
-		struct md_rdev *rdev;
+		int err = raidkm_reshape_check_scratch(mddev);
 
-		rdev_for_each(rdev, mddev) {
-			if (test_bit(Faulty, &rdev->flags))
-				continue;
-			if (rdev->data_offset < rdev->sb_start +
-			    RAIDKM_RESHAPE_SCRATCH_SECTORS +
-			    RAIDKM_RESHAPE_SB_MARGIN) {
-				pr_warn("md/raid:%s: raidkm reshape needs %u sectors of scratch headroom below data_offset (%pg has data_offset %llu, sb_start %llu)\n",
-					mdname(mddev),
-					RAIDKM_RESHAPE_SCRATCH_SECTORS +
-					RAIDKM_RESHAPE_SB_MARGIN,
-					rdev->bdev,
-					(unsigned long long)rdev->data_offset,
-					(unsigned long long)rdev->sb_start);
-				return -ENOSPC;
-			}
-		}
-
-		/*
-		 * The per-band staging area in the scratch zone holds the RJ_SLOTS
-		 * journal pages followed by one chunk's worth of pages per member
-		 * (raidkm_reshape_write_units writes at RJ_SLOTS + po pages).  The
-		 * scratch zone is a fixed RAIDKM_RESHAPE_SCRATCH_SECTORS, so a chunk
-		 * large enough to push the staged band past it would wrap up into the
-		 * data region (data_offset and above) and corrupt live data.  Reject
-		 * such a reshape rather than corrupt — the default 64 KiB through
-		 * 256 KiB chunks fit; >= 512 KiB does not (with SCRATCH = 1024).
-		 */
-		if ((RAIDKM_RJ_SLOTS + mddev->chunk_sectors / RAIDKM_PAGE_SECTORS) *
-		    RAIDKM_PAGE_SECTORS > RAIDKM_RESHAPE_SCRATCH_SECTORS) {
-			pr_warn("md/raid:%s: raidkm reshape unsupported at chunk %u KiB: staged band needs %u scratch sectors but only %u are reserved\n",
-				mdname(mddev), mddev->chunk_sectors / 2,
-				(unsigned int)(RAIDKM_RJ_SLOTS +
-					mddev->chunk_sectors / RAIDKM_PAGE_SECTORS) *
-					RAIDKM_PAGE_SECTORS,
-				RAIDKM_RESHAPE_SCRATCH_SECTORS);
-			return -EINVAL;
-		}
+		if (err)
+			return err;
 	}
 	/*
 	 * A disk-count change (grow-data) is now supported: the ISA-L EC matrix

@@ -25,13 +25,18 @@ set -u
 
 PARAM=/sys/module/raidkm/parameters/dcl_reshape_selftest
 
-# g:m:s:nbase:oldN:oldseed:newN:newseed  — pool widens by exactly one group
-# (newN = oldN + g), so ngroups grows by 1.  Seeds are arbitrary pins: the
+# g:m:s:nbase:oldN:oldseed:newN:newseed  — pool resizes by exactly one group
+# (|newN - oldN| = g), so ngroups moves by 1.  newN > oldN sweeps the forward
+# (expansion) frontier rule; newN < oldN sweeps the BACKWARD (pool-shrink)
+# mirrored rule (dcl-shrink-design.md D0).  Seeds are arbitrary pins: the
 # consistency property under test does not depend on permutation balance.
 CASES=(
 	"6:2:2:4:14:0x11:20:0x22"	# m=2 k=4: ngroups 2 -> 3
 	"6:3:2:4:14:0x33:20:0x44"	# m=3 k=3: decode-side coverage
 	"13:2:2:16:80:0x159:93:0x15a"	# wide N=80 -> 93: ngroups 6 -> 7
+	"6:2:2:4:20:0x22:14:0x11"	# SHRINK m=2: ngroups 3 -> 2
+	"6:3:2:4:20:0x44:14:0x33"	# SHRINK m=3: decode-side coverage
+	"13:2:2:16:93:0x15a:80:0x159"	# SHRINK wide N=93 -> 80
 )
 OLDROWS=2048
 
