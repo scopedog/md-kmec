@@ -880,6 +880,7 @@ the named role, so you never compute the new device count yourself:
 | `--grow --add-data <disks>` | add **data** disk(s) — grow capacity, m fixed | PARITY_N **and** rotating | online kernel reshape |
 | `--grow --raid-devices=<N-1>` | REMOVE one data disk — shrink capacity, m fixed | PARITY_N **and** rotating | online backward COW reshape; `--array-size` clamp first (mdadm prints the value) |
 | `--grow --add-parity <disks>` | add **parity** disk(s) — raise m, k fixed | PARITY_N **and** rotating | PARITY_N: offline recreate. rotating: **online COW reshape** (no backup-file, crash-safe via the kernel journal); offline windowed relocation retained as a fallback (`MDADM_RAIDKM_OFFLINE_ADDPARITY`) — see below |
+| `--grow --remove-parity` | drop one **parity** disk — lower m (≥2 remain), k and capacity fixed | PARITY_N **and** rotating | **online COW reshape** (k fixed ⇒ every row re-encodes in place; no `--array-size` dance); the freed member becomes a spare (remove + `--zero-superblock` before reuse).  The m=4→3 Cauchy→Vandermonde boundary is handled by the re-encode.  Classic only (declustered refused) |
 
 **The traditional (stock) `--grow` syntax also works.**  Because parity in a
 stock RAID6 is fixed, growing `--raid-devices` there means *add capacity*, so

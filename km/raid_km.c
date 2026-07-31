@@ -1344,14 +1344,28 @@ int raid5_calc_degraded(struct r5conf *conf)
 static bool has_failed(struct r5conf *conf)
 {
 	int degraded = conf->mddev->degraded;
+	int limit = conf->max_degraded;
 
 	if (test_bit(MD_BROKEN, &conf->mddev->flags))
 		return true;
 
-	if (conf->mddev->reshape_position != MaxSector)
+	if (conf->mddev->reshape_position != MaxSector) {
 		degraded = raid5_calc_degraded(conf);
+		/*
+		 * Mid m-CHANGING reshape (add-parity, remove-parity) the
+		 * array's true tolerance is the WEAKER side's parity count:
+		 * un-migrated rows still hold old_m parities during an
+		 * add-parity, migrated rows already hold only new_m during a
+		 * remove-parity.  max_degraded is max(old,new) — right for
+		 * buffer sizing, over-accepting for failure tolerance.
+		 * prev_m == m for every non-m-changing reshape, so this is a
+		 * no-op there.
+		 */
+		if (is_raidkm(conf))
+			limit = min_t(int, conf->prev_m, conf->m);
+	}
 
-	return degraded > conf->max_degraded;
+	return degraded > limit;
 }
 
 enum stripe_result {
@@ -14145,6 +14159,21 @@ raid5_size(struct mddev *mddev, sector_t sectors, int raid_disks)
 		/* declustered: each row (one chunk per member) carries
 		 * ngroups * k data columns */
 		return sectors * conf->dcl->ngroups * conf->dcl->k;
+	if (is_raidkm(conf)) {
+		/*
+		 * Mid m-CHANGING reshape max_degraded is max(old_m, new_m)
+		 * (buffer sizing) and mis-sizes capacity: pair the disk
+		 * count with ITS OWN side's parity count instead — the
+		 * capacity is k either way (k is fixed across add-parity
+		 * and remove-parity; steady state prev_m == m ==
+		 * max_degraded, so this is bit-identical there).
+		 */
+		int m = (raid_disks == conf->previous_raid_disks &&
+			 conf->previous_raid_disks != conf->raid_disks) ?
+			conf->prev_m : conf->m;
+
+		return sectors * (raid_disks - m);
+	}
 	return sectors * (raid_disks - conf->max_degraded);
 }
 
@@ -14788,6 +14817,11 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 				ret = -ENOMEM;
 				goto abort;
 			}
+			/* max_degraded was set from conf->m above; mid
+			 * m-change the stripe buffers must fit the LARGER
+			 * side (remove-parity: the old, wider one).  Failure
+			 * acceptance keys on the smaller side in has_failed. */
+			conf->max_degraded = max_t(int, conf->prev_m, conf->m);
 		}
 	}
 	conf->algorithm = mddev->new_layout;
@@ -15139,10 +15173,12 @@ static int raid5_run(struct mddev *mddev)
 			   (raidkm_layout_is_dcl(mddev->new_layout) ||
 			    (mddev->delta_disks > 0 &&
 			     (new_md == old_md || new_md == old_md + 1)) ||
-			    (mddev->delta_disks < 0 && new_md == old_md))) {
+			    (mddev->delta_disks < 0 &&
+			     (new_md == old_md || new_md == old_md - 1)))) {
 			/* COW reshape.  Declustered (pool-expansion / add-parity /
 			 * add-data / spare-count, the last with delta_disks == 0)
-			 * and classic raidkm add-parity/add-data: the stock
+			 * and classic raidkm add-parity/add-data/shrink-data/
+			 * REMOVE-parity (delta < 0, m-1): the stock
 			 * frontier math does not apply.  For add-parity read and
 			 * write are the same sectors (here_new == here_old since
 			 * the data-disk count is unchanged); for add-data / a
@@ -16247,12 +16283,32 @@ static int raid5_start_reshape(struct mddev *mddev)
 	/* Refuse to reduce size of the array.  Any reductions in
 	 * array size must be through explicit setting of array_size
 	 * attribute.
+	 *
+	 * raidkm m-changes need the NEW geometry evaluated with the STAGED
+	 * parity count: pre-switch conf->m is still the old m, so
+	 * raid5_size(new N) would pair new N with old m and report k∓1.
+	 * A remove-parity keeps capacity at k (k fixed, one parity disk
+	 * dropped) and must pass this gate as an equality.
 	 */
-	if (raid5_size(mddev, 0, conf->raid_disks + mddev->delta_disks)
-	    < mddev->array_sectors) {
-		pr_warn("md/raid:%s: array size must be reduced before number of disks\n",
-			mdname(mddev));
-		return -EINVAL;
+	{
+		sector_t newcap;
+
+		if (is_raidkm(conf) && mddev->new_layout >= 0 &&
+		    raidkm_layout_m(mddev->new_layout) != conf->m) {
+			sector_t sec = mddev->dev_sectors &
+				~((sector_t)conf->chunk_sectors - 1);
+
+			newcap = sec * (conf->raid_disks + mddev->delta_disks -
+					raidkm_layout_m(mddev->new_layout));
+		} else {
+			newcap = raid5_size(mddev, 0,
+					    conf->raid_disks + mddev->delta_disks);
+		}
+		if (newcap < mddev->array_sectors) {
+			pr_warn("md/raid:%s: array size must be reduced before number of disks\n",
+				mdname(mddev));
+			return -EINVAL;
+		}
 	}
 
 	/*
@@ -16305,14 +16361,15 @@ static int raid5_start_reshape(struct mddev *mddev)
 		/*
 		 * Record the previous parity count and switch to the new one.  For
 		 * add-parity new_m = m + 1 (the before-region keeps prev_m, the
-		 * after-region uses m); for grow-data new_m == m so prev_m == m and
-		 * this is a no-op.  max_degraded tracks the larger (new) m so the
-		 * stripe-cache buffers built for the grown geometry are big enough
-		 * for either region's parity.
+		 * after-region uses m); for REMOVE-parity new_m = m - 1 (mirrored);
+		 * for grow/shrink-data new_m == m so prev_m == m and this is a
+		 * no-op.  max_degraded tracks the LARGER of the two m's so the
+		 * stripe-cache buffers are big enough for either region's parity
+		 * (failure ACCEPTANCE keys on the smaller side — see has_failed).
 		 */
 		conf->prev_m = conf->m;
 		conf->m = raidkm_layout_m(mddev->new_layout);
-		conf->max_degraded = conf->m;
+		conf->max_degraded = max_t(int, conf->prev_m, conf->m);
 		/* Demote the current EC tables to prev_* (the not-yet-reshaped
 		 * region keeps using them) and install the new tables built
 		 * above.  Pointer-only, safe under device_lock. */
@@ -16584,9 +16641,13 @@ static void raid5_finish_reshape(struct mddev *mddev)
 			conf->prev_ec_g_tbls_gfni = NULL;
 			conf->prev_ec_g_tbls_base = NULL;
 			/* Only the new geometry remains; collapse prev_m back onto m
-			 * (it differed only during an add-parity reshape) so a later
-			 * reshape starts from a clean prev_m == m invariant. */
+			 * (it differed only during an m-changing reshape) so a later
+			 * reshape starts from a clean prev_m == m invariant.
+			 * max_degraded was max(prev_m, m) for the duration — collapse
+			 * it too (a no-op for add-parity where max == new m; the
+			 * REMOVE-parity finalize is where it actually drops). */
 			conf->prev_m = conf->m;
+			conf->max_degraded = conf->m;
 		}
 	}
 }
@@ -16852,19 +16913,45 @@ static int raidkm_check_reshape(struct mddev *mddev)
 			bool old_rot = raidkm_layout_is_rotating(mddev->layout);
 			bool new_rot = raidkm_layout_is_rotating(mddev->new_layout);
 
-			if (old_rot != new_rot || new_m != old_m + 1) {
-				pr_warn("md/raid:%s: raidkm reshape may only add a single parity disk (m -> m+1) at a fixed parity placement\n",
+			/* classic m-changes: add-parity (m -> m+1, +1 disk)
+			 * and REMOVE-parity (m -> m-1, -1 disk; k fixed, so
+			 * every row maps to itself — the walk rides the
+			 * backward COW driver; see remove-parity-design.md).
+			 * ONLY the m field may move: the rotation kind is
+			 * fixed, and a word that flips any other bit (e.g.
+			 * dropping RAIDKM_LAYOUT_CSUM) would silently change
+			 * an unrelated feature when finish_reshape persists
+			 * it — reject it here (the dcl trigger has the same
+			 * rule). */
+			if ((mddev->new_layout ^ mddev->layout) &
+			    ~RAIDKM_LAYOUT_M_MASK) {
+				pr_warn("md/raid:%s: raidkm m-change may only move the parity count (layout %#x -> %#x flips non-m bits)\n",
+					mdname(mddev), mddev->layout,
+					mddev->new_layout);
+				return -EINVAL;
+			}
+			if (old_rot != new_rot ||
+			    (new_m != old_m + 1 && new_m != old_m - 1)) {
+				pr_warn("md/raid:%s: raidkm reshape may only add or remove a single parity disk (m -> m±1) at a fixed parity placement\n",
 					mdname(mddev));
 				return -EINVAL;
 			}
-			/* mdadm stages the new layout before bumping raid_disks;
+			if (new_m == old_m - 1 && new_m < 2) {
+				pr_warn("md/raid:%s: raidkm remove-parity needs at least 2 remaining parities (m=%d)\n",
+					mdname(mddev), old_m);
+				return -EINVAL;
+			}
+			/* mdadm stages the new layout before moving raid_disks;
 			 * accept the layout-only step, the raid_disks write re-enters
-			 * with delta_disks == 1 and does the real validation. */
+			 * with delta_disks == ±1 and does the real validation. */
 			if (mddev->delta_disks == 0)
 				return 0;
-			if (mddev->delta_disks != 1) {
-				pr_warn("md/raid:%s: raidkm add-parity must add exactly one disk (delta_disks=%d)\n",
-					mdname(mddev), mddev->delta_disks);
+			if (mddev->delta_disks != (new_m > old_m ? 1 : -1)) {
+				pr_warn("md/raid:%s: raidkm %s-parity must %s exactly one disk (delta_disks=%d)\n",
+					mdname(mddev),
+					new_m > old_m ? "add" : "remove",
+					new_m > old_m ? "add" : "remove",
+					mddev->delta_disks);
 				return -EINVAL;
 			}
 		}
@@ -16900,8 +16987,14 @@ static int raidkm_check_reshape(struct mddev *mddev)
 				mdname(mddev), mddev->delta_disks);
 			return -EINVAL;
 		}
+		/* delta == -1 with the (already validated) m-1 layout word is
+		 * REMOVE-PARITY, not shrink-data — k is fixed there, so the
+		 * layout may (must) change.  Shrink-data itself keeps the
+		 * layout word. */
 		if (mddev->new_layout >= 0 &&
-		    mddev->new_layout != mddev->layout) {
+		    mddev->new_layout != mddev->layout &&
+		    raidkm_layout_m(mddev->new_layout) !=
+		    raidkm_layout_m(mddev->layout) - 1) {
 			pr_warn("md/raid:%s: raidkm shrink cannot change the layout\n",
 				mdname(mddev));
 			return -EINVAL;
