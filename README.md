@@ -6,6 +6,12 @@
 > the entire package — it assembles this repo together with the other
 > components in the correct order.
 
+> **Operators:** [`docs/raidkm-field-manual.md`](docs/raidkm-field-manual.md) is
+> the task-ordered companion to this README — the feature catalogue, the layout
+> maps, and every command for create / scrub / rebuild / grow / shrink in one
+> place.  This README stays the canonical record of design decisions, milestones
+> and measurement provenance.
+
 A Linux md personality implementing arbitrary *k+m* Reed-Solomon
 erasure coding, built as a fork of [our optimized
 mdraid](https://github.com/scopedog/mdraid)'s `raid5.c`
@@ -791,8 +797,8 @@ co-dependent — features land across both repos together (level-71
 create / assemble / grow, and the PPL consistency policy).  Build and
 run them as a **matched pair**: the mdadm fork that goes with this
 tree is branch **`raidkm-level71`**, currently at commit
-**`d86ac2b1`** ("raidkm: split parity count from layout; default to
-rotating").  When you advance one repo, rebuild the other from
+**`24e99c1b`** ("raidkm: --grow --remove-parity + fix add-parity
+dropping the csum layout bit").  When you advance one repo, rebuild the other from
 its matching commit.  The fork will be wired in as a git submodule once it has a
 published remote (`scopedog/mdadm`); until then it lives in
 the sibling [`mdadm`](../mdadm) checkout and the pairing is tracked
