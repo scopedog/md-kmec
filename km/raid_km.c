@@ -14444,9 +14444,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 			}
 			/* geometry OK; the rkdcl metadata block is loaded and
 			 * verified later in setup_conf (raidkm_dcl_load, once
-			 * the rdevs are attached) — which is also where
-			 * activation is refused until the declustered I/O
-			 * path (Phase 1c) is complete. */
+			 * the rdevs are attached). */
 		}
 		if (rkm_m < 2 || rkm_m > RAIDKM_MAX_M) {
 			pr_warn("md/raid:%s: raidkm m=%d out of range [2..%d]\n",
@@ -14692,14 +14690,14 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 			}
 		}
 		/*
-		 * Declustered (Phase 1c, in progress): load + verify the rkdcl
-		 * metadata block (magic/crc/geometry vs the layout word) and
-		 * regenerate the permutation tables from the recorded seed —
-		 * the loaded seed/perm_crc line in dmesg is pinned against
-		 * mdadm and the reference simulator by the create gate.  The
-		 * declustered I/O path (slot->disk indirection, (sector, group)
-		 * stripe identity) is not complete yet, so activation is still
-		 * refused AFTER a successful load.
+		 * Declustered: load + verify the rkdcl metadata block
+		 * (magic/crc/geometry vs the layout word) and regenerate the
+		 * permutation tables from the recorded seed — the loaded
+		 * seed/perm_crc line in dmesg is pinned against mdadm and the
+		 * reference simulator by the create gate.  A failed load is
+		 * the only thing that refuses activation here; the declustered
+		 * I/O path (slot->disk indirection, (sector, group) stripe
+		 * identity) is complete.
 		 */
 		if (raidkm_layout_is_dcl(mddev->new_layout)) {
 			if (raidkm_dcl_load(conf, mddev))

@@ -70,9 +70,10 @@ static inline bool is_raid6_math(int level)
  *               (<= 127 keeps the int layout word positive); nbase and the
  *               64-bit permutation seed live in the on-disk rkdcl metadata
  *               block at data_offset + data_size.  See raid_km_dcl.h and
- *               notes/declustered-parity-design.md.  The I/O path is not
- *               implemented yet (Phase 1c) — setup_conf recognizes the
- *               geometry and refuses activation.
+ *               notes/declustered-parity-design.md.  Fully implemented: I/O,
+ *               rebuild-from-distributed-spare and pool reshape.  Note the row
+ *               carries k = g - m data columns regardless of N, which is what
+ *               raid5_stripe_data_disks() reports as io_opt.
  *
  * Stored verbatim in the superblock layout field, so the choice persists
  * across assemble.  A plain `--layout=m` (no high bits) is PARITY_N, keeping
