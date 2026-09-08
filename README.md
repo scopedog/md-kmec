@@ -752,6 +752,16 @@ cd ../mdraid && make     # produces isal_lib.ko + raid456.ko etc.
 cd ../md-kmec && make    # produces km/raidkm.ko
 ```
 
+`isal_lib.ko`'s exports are prefixed `isal_lib_` so they cannot collide with
+another out-of-tree module that vendors the same ISA-L code under the upstream
+API names — the kernel matches exported symbols by bare name and rejects the
+second module to load, which would leave `raidkm.ko` unloadable depending on
+boot order.  The rename is a macro in `../mdraid/isa-l/isal_lib_syms.h` applied
+to definitions and call sites alike, so `raid_km.c` still reads in the plain
+ISA-L names (`ec_encode_data_base`, `gf_invert_matrix`, …) and nothing about
+building or loading raidkm changes.  The prefix shows up only in
+`nm km/raidkm.ko` and in unresolved-symbol messages.
+
 ### Kernel targets
 
 One source tree builds against three kernel flavours.  The build picks a

@@ -326,6 +326,14 @@ insmod ../mdraid/isa-l/isal_lib.ko
 insmod km/raidkm.ko
 ```
 
+`isal_lib.ko`'s exported symbols are prefixed `isal_lib_`, so the module
+coexists with any other out-of-tree module that vendors the same ISA-L code
+under the upstream names.  Without the prefix the two collide on thirteen
+symbols and the kernel refuses whichever loads second
+(`exports duplicate symbol ... (owned by ec)`), leaving `raidkm.ko` unloadable
+on that node.  The rename is a build-time macro, so source and command lines
+are unchanged — the prefix shows up only in `nm` output.
+
 ---
 
 ## 2 Create an array
