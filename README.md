@@ -730,6 +730,9 @@ md-kmec/
 │   ├── raidkm-standard-benchmark.sh   # fio harness (6 workloads) + Test-7
 │   │                                    # rebuild/populate wall-clock item
 │   │                                    # (--rebuild-victim=DEV)
+│   ├── raidkm-ab-benchmark.sh         # A/B vs stock md on the same disks:
+│   │                                    # raw / raid6 / raid6-intree / raidkm<M>,
+│   │                                    # ABBA order, ratio tables
 │   └── raidkm-create.sh               # sysfs array creation; needs adapting
 │                                    # to "raidkm" name / level 71
 └── km/

@@ -26,7 +26,16 @@
 #                      (Test 7).  Declustered arrays populate the distributed
 #                      spare; classic arrays recover onto the re-added member.
 #   --mdadm=PATH       raidkm-aware mdadm for Test 7 (auto-resolved if omitted)
+#   --no-check         skip Test 6 (the post-workload parity check) — use it
+#                      on --assume-clean arrays over dirty disks, whose parity
+#                      was never made consistent
 #   -h, --help         show this help
+#
+# On an md target the suite first waits for any running resync to finish (a
+# sync competing with fio skews the numbers), and Test 6 runs once after all
+# runs, waits for the check to complete and fails the script (exit 3) on a
+# non-zero mismatch_cnt.  For raidkm vs stock md comparisons on the same disks
+# use tools/raidkm-ab-benchmark.sh, which drives this script per arm.
 #
 set -euo pipefail
 
@@ -35,9 +44,11 @@ RUNS=1
 RUNTIME=30
 OUTPUT=
 DROP_CACHES=1
+CHECK=1
 REBUILD_VICTIM=          # member device to fail+rebuild (enables Test 7)
 MDADM=                   # raidkm-aware mdadm (auto-resolved if empty)
 REBUILD_SECS=
+MISMATCH=
 
 usage() {
     sed -n '3,/^$/p' "$0" | sed 's/^# \?//'
@@ -54,6 +65,7 @@ for arg in "$@"; do
         --no-drop-caches)  DROP_CACHES=0 ;;
         --rebuild-victim=*) REBUILD_VICTIM="${arg#*=}" ;;
         --mdadm=*)         MDADM="${arg#*=}" ;;
+        --no-check)        CHECK=0 ;;
         -h|--help)         usage ;;
         *)                 echo "unknown option: $arg" >&2; exit 2 ;;
     esac
@@ -67,6 +79,19 @@ if ! sudo dd if="$TARGET" of=/dev/null bs=1M count=1 status=none 2>/dev/null; th
     exit 1
 fi
 
+# md sysfs name of the target ("" when it is not an md array).  Resolve
+# symlinks so /dev/md/<name> maps to its mdNNN node.
+MDNAME=$(basename "$(readlink -f "$TARGET")")
+[ -d "/sys/block/$MDNAME/md" ] || MDNAME=
+
+wait_sync_idle() {
+    [ -n "$MDNAME" ] || return 0
+    local a
+    while a=$(cat "/sys/block/$MDNAME/md/sync_action" 2>/dev/null) && [ "$a" != idle ]; do
+        sleep 1
+    done
+}
+
 echo "raidkm-standard-benchmark.sh"
 echo "  target:    $TARGET"
 echo "  runs:      $RUNS"
@@ -75,6 +100,12 @@ echo "  output:    $OUTPUT"
 echo "  platform:  $(hostname) $(uname -r)"
 echo "  date:      $(date -Iseconds)"
 echo
+
+if [ -n "$MDNAME" ] && [ "$(cat "/sys/block/$MDNAME/md/sync_action")" != idle ]; then
+    echo "waiting for $(cat "/sys/block/$MDNAME/md/sync_action") on $MDNAME to finish before benchmarking..."
+    wait_sync_idle
+    echo
+fi
 
 drop_caches() {
     if [ "$DROP_CACHES" = "1" ]; then
@@ -141,10 +172,10 @@ resolve_mdadm() {
 }
 
 rebuild_test() {
-    local md; md=$(basename "$TARGET")
+    local md="$MDNAME"
     local victim="$REBUILD_VICTIM"
     resolve_mdadm || return 1
-    if [ ! -e "/sys/block/$md/md/sync_action" ]; then
+    if [ -z "$md" ] || [ ! -e "/sys/block/$md/md/sync_action" ]; then
         echo "warning: $TARGET is not an md array — skipping rebuild test" >&2
         return 1
     fi
@@ -223,13 +254,22 @@ for run in $(seq 1 "$RUNS"); do
         RESULTS["$n,$run"]="$iops"
         printf "  %s: %s IOPS — %s\n" "$n" "$iops" "${WORKLOAD_DESC[$n]}"
     done
-    # Test 6: array integrity check.  Doesn't produce IOPS, just
-    # confirms the array is consistent after the workload.
-    if sudo bash -c "echo check > /sys/block/$(basename "$TARGET")/md/sync_action" 2>/dev/null; then
-        echo "  6: consistency check initiated"
-    fi
     echo
 done
+
+# Test 6: parity consistency check after all the workloads.  Doesn't produce
+# IOPS.  Runs once, after the last run (a check left running into the next
+# run's fio would compete with it and skew that run), and waits for completion.
+if [ "$CHECK" = 1 ] && [ -n "$MDNAME" ] && [ -e "/sys/block/$MDNAME/md/sync_action" ]; then
+    echo "=== Test 6: parity check ==="
+    wait_sync_idle
+    echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
+    sleep 1
+    wait_sync_idle
+    MISMATCH=$(cat "/sys/block/$MDNAME/md/mismatch_cnt")
+    printf "  6: mismatch_cnt=%s%s\n" "$MISMATCH" "$([ "$MISMATCH" = 0 ] || echo '  <-- FAIL')"
+    echo
+fi
 
 # Test 7: rebuild / populate wall-clock (only if a victim was named).
 if [ -n "$REBUILD_VICTIM" ]; then
@@ -259,9 +299,17 @@ else:
     printf "%-5s %-50s %-30s %s\n" "$n" "${WORKLOAD_DESC[$n]}" "$summary" "$vals"
 done
 
+if [ -n "$MISMATCH" ]; then
+    printf "%-5s %-50s %s\n" "6" "Parity check mismatch_cnt" "$MISMATCH"
+fi
 if [ -n "$REBUILD_SECS" ]; then
     printf "%-5s %-50s %s\n" "7" "Rebuild / populate wall-clock" "${REBUILD_SECS}s"
 fi
 
 echo
 echo "Raw fio JSON files in: $OUTPUT"
+
+if [ -n "$MISMATCH" ] && [ "$MISMATCH" != 0 ]; then
+    echo "FAIL: parity check found mismatch_cnt=$MISMATCH" >&2
+    exit 3
+fi

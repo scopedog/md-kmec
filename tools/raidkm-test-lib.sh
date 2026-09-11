@@ -7,7 +7,8 @@
 # Configuration (all overridable via the environment):
 #   MD          md device to use                  (default /dev/md70)
 #   MDADM       path to the raidkm-aware mdadm     (auto: fork, else PATH)
-#   RAIDKM_KO   raidkm.ko path                     (default <tree>/km/raidkm.ko)
+#   RAIDKM_KO   raidkm.ko path                     (default <tree>/km/raidkm.ko;
+#               absent -> modprobe raidkm, for packaged installs)
 #   ISAL_KO     isal_lib.ko path                   (default <tree>/isa-l/isal_lib.ko)
 #   RK_RELOAD   1 = rmmod+insmod raidkm each run   (default 0: load only if absent)
 #   BRD_NR      ramdisks to create if none present (default 12)
@@ -17,8 +18,10 @@
 #
 # Tests need root (sudo) for modprobe/insmod, mdadm, sysfs and drop_caches.
 
-RK_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RK_TREE="$(cd "$RK_LIB_DIR/.." && pwd)"          # md-kmec checkout root
+# pwd -P: run via the mdraid-super `tools -> md-kmec/tools` symlink, a logical
+# path would make <tree> the umbrella root, where km/raidkm.ko does not exist.
+RK_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+RK_TREE="$(cd "$RK_LIB_DIR/.." && pwd -P)"       # md-kmec checkout root
 
 MD="${MD:-/dev/md70}"
 MDNAME="$(basename "$MD")"
@@ -121,7 +124,12 @@ rk_load_modules() {
 		else
 			sudo modprobe isal_lib 2>/dev/null || true
 		fi
-		sudo insmod "$RAIDKM_KO" 2>/dev/null || true
+		if [ -f "$RAIDKM_KO" ]; then
+			sudo insmod "$RAIDKM_KO" 2>/dev/null || true
+		else
+			# packaged install: no build tree, the module is depmod'd
+			sudo modprobe raidkm 2>/dev/null || true
+		fi
 	fi
 	lsmod | grep -q '^raidkm ' || {
 		echo "ERROR: raidkm not loaded (RAIDKM_KO=$RAIDKM_KO, ISAL_KO=$ISAL_KO)" >&2
