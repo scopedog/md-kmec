@@ -140,6 +140,25 @@ static int default_group_thread_cnt = -1;
 module_param(default_group_thread_cnt, int, 0644);
 MODULE_PARM_DESC(default_group_thread_cnt,
 		 "Initial group_thread_cnt for new arrays (-1 = auto: max(num_online_cpus()/(2*num_possible_nodes()), 2); 0 = disabled).");
+
+/*
+ * Starting stripe cache.  The cache grows on demand, but only through a narrow
+ * window in raid5_get_active_stripe(): once one request is waiting for a
+ * stripe (R5_INACTIVE_BLOCKED), later requests skip the allocation attempt that
+ * asks raid5d to grow it.  With worker groups a fresh array under sustained
+ * large I/O can stay at or near the old 256-stripe start: intermittently
+ * measured at 1.6-2.1 GB/s against ~6.2 GB/s on 8+2 (1 MiB QD8 x4 on
+ * null_blk).  4 jobs x QD8 of 1 MiB rows need ~1,000 stripe heads, so start
+ * there, capped by a memory budget so very wide arrays keep a modest
+ * footprint.
+ */
+#define RAIDKM_STRIPE_CACHE_START	1024
+#define RAIDKM_STRIPE_CACHE_BUDGET_KB	(128 * 1024)
+
+static int default_stripe_cache_size = -1;
+module_param(default_stripe_cache_size, int, 0644);
+MODULE_PARM_DESC(default_stripe_cache_size,
+		 "Initial stripe_cache_size for new arrays (-1 = auto: 1024 stripes, capped at a 128 MiB cache and never below 256; 0 = the stock 256 start; N = N stripes).");
 static struct workqueue_struct *raid5_wq;
 
 static void raid5_quiesce(struct mddev *mddev, int quiesce);
@@ -14833,6 +14852,18 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	}
 
 	conf->min_nr_stripes = NR_STRIPES;
+	if (default_stripe_cache_size > 0) {
+		/* the same bounds raid_km_set_cache_size() accepts */
+		conf->min_nr_stripes = clamp(default_stripe_cache_size, 17,
+					     RAID5_MAX_NR_STRIPES);
+	} else if (default_stripe_cache_size < 0) {
+		int per_stripe_kb = (sizeof(struct stripe_head) +
+			max_disks * (sizeof(struct bio) + PAGE_SIZE)) / 1024;
+
+		conf->min_nr_stripes = clamp(RAIDKM_STRIPE_CACHE_BUDGET_KB /
+					     max(per_stripe_kb, 1),
+					     NR_STRIPES, RAIDKM_STRIPE_CACHE_START);
+	}
 	if (mddev->reshape_position != MaxSector) {
 		int stripes = max_t(int,
 			((mddev->chunk_sectors << 9) / RAID5_STRIPE_SIZE(conf)) * 4,

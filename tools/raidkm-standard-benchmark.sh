@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# raidkm-standard-benchmark.sh — 6-workload enterprise benchmark suite
+# raidkm-standard-benchmark.sh — fio benchmark suite for an md array or raw device
 #
 # Improvements over the archived version:
 #   * Drops page cache + dentries before every test (eliminates the
@@ -29,7 +29,19 @@
 #   --no-check         skip Test 6 (the post-workload parity check) — use it
 #                      on --assume-clean arrays over dirty disks, whose parity
 #                      was never made consistent
+#   --workloads=LIST   comma-separated workload numbers (default 1,2,3,4,5,8,9)
 #   -h, --help         show this help
+#
+# Workloads:  1 random 4K write, 2 mixed 75/25 8K, 3 mixed 70/30 4K x16 jobs,
+#             4 OLTP 70/30 16K, 5 random 8K write, 8 sequential 1 MiB write,
+#             9 sequential 1 MiB read (QD8, 4 jobs, each in its own region)
+#
+# Member request size: around every workload the suite snapshots the request
+# counters of the devices under the target (md/dm slaves; NVMe multipath heads
+# expanded to their paths) and records the average request size and merge
+# share that reached them in <test>_run<N>.members.json.  On flash with a
+# coarse indirection unit, a write below that unit is rewritten whole by the
+# drive, so this is tracked alongside throughput.
 #
 # On an md target the suite first waits for any running resync to finish (a
 # sync competing with fio skews the numbers), and Test 6 runs once after all
@@ -49,6 +61,7 @@ REBUILD_VICTIM=          # member device to fail+rebuild (enables Test 7)
 MDADM=                   # raidkm-aware mdadm (auto-resolved if empty)
 REBUILD_SECS=
 MISMATCH=
+WORKLOADS="1 2 3 4 5 8 9"
 
 usage() {
     sed -n '3,/^$/p' "$0" | sed 's/^# \?//'
@@ -66,10 +79,18 @@ for arg in "$@"; do
         --rebuild-victim=*) REBUILD_VICTIM="${arg#*=}" ;;
         --mdadm=*)         MDADM="${arg#*=}" ;;
         --no-check)        CHECK=0 ;;
+        --workloads=*)     WORKLOADS="$(echo "${arg#*=}" | tr ',' ' ')" ;;
         -h|--help)         usage ;;
         *)                 echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
+
+for n in $WORKLOADS; do
+    case "$n" in 1|2|3|4|5|8|9) ;; *) echo "unknown workload: $n" >&2; exit 2 ;; esac
+done
+
+# shellcheck source=raidkm-member-stats.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/raidkm-member-stats.sh"
 
 OUTPUT="${OUTPUT:-/tmp/kmec_bench_$$}"
 mkdir -p "$OUTPUT"
@@ -92,8 +113,18 @@ wait_sync_idle() {
     done
 }
 
+# Devices whose request counters see the target's member I/O.
+LEAVES=$(rk_leaf_devs "$TARGET" | sort -u | tr '\n' ' ')
+
+# Sequential workloads: 4 jobs, each in its own region.  Regions are a quarter
+# of the device rounded down to 16 MiB, so any power-of-two row up to 16 MiB
+# starts every job on a row boundary.
+SEQ_SPAN=$(( $(sudo blockdev --getsize64 "$TARGET") / 4 / (16 << 20) * (16 << 20) ))
+
 echo "raidkm-standard-benchmark.sh"
 echo "  target:    $TARGET"
+echo "  members:   $LEAVES"
+echo "  workloads: $WORKLOADS"
 echo "  runs:      $RUNS"
 echo "  runtime:   ${RUNTIME}s per test"
 echo "  output:    $OUTPUT"
@@ -121,11 +152,17 @@ drop_caches() {
 run_test() {
     local name="$1" run="$2"; shift 2
     local out="$OUTPUT/${name}_run${run}.json"
+    local before after
     drop_caches
+    # shellcheck disable=SC2086  # LEAVES is a word list
+    before=$(rk_stat_snap $LEAVES)
     sudo fio --output-format=json --output="$out" \
         --filename="$TARGET" --direct=1 --ioengine=libaio \
         --time_based --runtime="$RUNTIME" --group_reporting \
         --name="$name" "$@" > /dev/null
+    # shellcheck disable=SC2086
+    after=$(rk_stat_snap $LEAVES)
+    rk_stat_report "$before" "$after" > "$OUTPUT/${name}_run${run}.members.json"
     # Parse read+write IOPS from the JSON.
     python3 -c "
 import json, sys
@@ -144,6 +181,11 @@ WORKLOAD_DESC[2]="Database Mixed 75/25 8K"
 WORKLOAD_DESC[3]="High Concurrency 70/30 4K (16 jobs)"
 WORKLOAD_DESC[4]="OLTP 70/30 16K"
 WORKLOAD_DESC[5]="Partial Stripe Write 8K"
+WORKLOAD_DESC[8]="Sequential 1 MiB Write QD8"
+WORKLOAD_DESC[9]="Sequential 1 MiB Read QD8"
+declare -A WORKLOAD_NAME=([1]=test1_rand4kw [2]=test2_dbmixed [3]=test3_highconc
+                          [4]=test4_oltp [5]=test5_partial_stripe
+                          [8]=test8_seqwrite1m [9]=test9_seqread1m)
 
 run_workload() {
     local n="$1" run="$2"
@@ -153,7 +195,25 @@ run_workload() {
         3) run_test "test3_highconc"       "$run" --rw=randrw --rwmixread=70 --bs=4k  --numjobs=16 --iodepth=8  ;;
         4) run_test "test4_oltp"           "$run" --rw=randrw --rwmixread=70 --bs=16k --numjobs=6  --iodepth=16 ;;
         5) run_test "test5_partial_stripe" "$run" --rw=randwrite --bs=8k  --numjobs=4  --iodepth=32 ;;
+        8) run_test "test8_seqwrite1m"     "$run" --rw=write --bs=1M --numjobs=4 --iodepth=8 \
+               --size="$SEQ_SPAN" --offset_increment="$SEQ_SPAN" ;;
+        9) run_test "test9_seqread1m"      "$run" --rw=read  --bs=1M --numjobs=4 --iodepth=8 \
+               --size="$SEQ_SPAN" --offset_increment="$SEQ_SPAN" ;;
     esac
+}
+
+# member_line <test-name> <run>: "w 123.4 KiB (97% merged)  r 128.0 KiB (0% merged)"
+member_line() {
+    python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+parts = []
+for side, tag in (("write", "w"), ("read", "r")):
+    s = m[side]
+    if s["requests"]:
+        parts.append("%s %.1f KiB (%.0f%% merged)" % (tag, s["avg_kib"], s["merged_pct"]))
+print("  ".join(parts) or "no member I/O")
+' "$OUTPUT/${1}_run${2}.members.json"
 }
 
 # Test 7: rebuild / populate wall-clock (opt-in via --rebuild-victim).
@@ -249,10 +309,11 @@ declare -A RESULTS    # RESULTS[test_n,run_i] = IOPS
 
 for run in $(seq 1 "$RUNS"); do
     echo "=== Run $run / $RUNS ==="
-    for n in 1 2 3 4 5; do
+    for n in $WORKLOADS; do
         iops=$(run_workload "$n" "$run")
         RESULTS["$n,$run"]="$iops"
         printf "  %s: %s IOPS — %s\n" "$n" "$iops" "${WORKLOAD_DESC[$n]}"
+        printf "     members: %s\n" "$(member_line "${WORKLOAD_NAME[$n]}" "$run")"
     done
     echo
 done
@@ -281,7 +342,7 @@ fi
 # Summary.
 echo "=== Summary (mean ± stdev across $RUNS run(s)) ==="
 printf "%-5s %-50s %-20s %s\n" "Test" "Description" "mean IOPS ± stdev" "per-run"
-for n in 1 2 3 4 5; do
+for n in $WORKLOADS; do
     vals=""
     for run in $(seq 1 "$RUNS"); do
         vals+="${RESULTS[$n,$run]} "
@@ -297,6 +358,27 @@ if len(v) > 1:
 else:
     print(f'{mean:.0f}')")
     printf "%-5s %-50s %-30s %s\n" "$n" "${WORKLOAD_DESC[$n]}" "$summary" "$vals"
+done
+
+# Member request size, mean across runs, per workload.
+echo
+echo "=== Member request size (mean across $RUNS run(s)) ==="
+printf "%-5s %-50s %s\n" "Test" "Description" "at the members"
+for n in $WORKLOADS; do
+    msum=$(python3 -c '
+import glob, json, statistics, sys
+files = sorted(glob.glob(sys.argv[1]))
+out = []
+for side, tag in (("write", "w"), ("read", "r")):
+    runs = [json.load(open(f))[side] for f in files]
+    runs = [r for r in runs if r["requests"]]
+    if runs:
+        out.append("%s %.1f KiB (%.0f%% merged)" % (tag,
+            statistics.mean(r["avg_kib"] for r in runs),
+            statistics.mean(r["merged_pct"] for r in runs)))
+print("  ".join(out) or "no member I/O")
+' "$OUTPUT/${WORKLOAD_NAME[$n]}_run*.members.json")
+    printf "%-5s %-50s %s\n" "$n" "${WORKLOAD_DESC[$n]}" "$msum"
 done
 
 if [ -n "$MISMATCH" ]; then

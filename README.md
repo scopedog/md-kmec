@@ -323,6 +323,15 @@ random-I/O table above.  *(brd is RAM-backed and compute-bound; on real disks
 the rebuild is capped by disk write bandwidth, so the gap narrows — the full win
 shows on fast NVMe or when the rebuild is CPU/EC-bound.)*
 
+**On a device-bound array the gap closes.**  An independent evaluation over
+NVMe-oF with QLC namespaces (k=8 m=2, 128 KiB chunk, 1 TiB of each member)
+measured raidkm and stock raid6 at parity at every matched worker count:
+535 vs 545 MiB/s at `group_thread_cnt` 32 with default block-layer settings,
+615 vs 611 MiB/s tuned.  There the rebuild is bound by its I/O pattern, not by
+CPU: both engines read survivors and write the spare in ~4 KiB stripe units
+(see *Flash with a large indirection unit*).  Treat the 2× / 6× figures above as
+the CPU-bound ceiling, not as a promise for disk-bound arrays.
+
 A three-way rebuild comparison on real NVMe (16 × local SSD, RHEL 10.2,
 `raidkm-standard-benchmark.sh --rebuild-victim`, 16 GiB member) — **declustered**
 vs **classic** on the current build, vs **classic on the pre-declustered build**
@@ -489,12 +498,15 @@ item is expanded in the sections that follow.
    row width, so an 80-disk pool keeps a small, easily-filled row instead of a
    ~5 MiB one, and rebuilds far faster.
 3. **Keep the 64K chunk default** unless deliberately trading for a specific
-   row width.
+   row width — or the members are flash with a large indirection unit: then
+   make the chunk a power-of-two multiple of the largest unit you expect to
+   deploy (128K for 16–64K units; see *Flash with a large indirection unit*).
 
 **Storage layout:**
 
 4. **Put the filesystem journal on a separate device** — the single largest win
-   here (see *Keep the filesystem journal off the array*).
+   here (see *Keep the filesystem journal off the array*).  This is the
+   filesystem's own journal (ext4/jbd2), not md's `--write-journal`.
 5. **Start the partition or LV on a row boundary** — nothing detects a
    violation at runtime; it silently phase-shifts every allocation.
 6. **Keep other small, barriered write streams off the array** — same mechanism
@@ -517,6 +529,49 @@ item is expanded in the sections that follow.
 
 **One-line version:** get `k`, the journal, and the partition offset right at
 build time; everything else is already the default or automatic.
+
+#### Flash with a large indirection unit (QLC)
+
+High-capacity QLC drives map logical blocks in units of 16 KiB, 32 KiB or
+64 KiB instead of 4 KiB — the *indirection unit* (IU).  A write smaller than
+the unit, or one that straddles a unit boundary, makes the drive read the rest
+of the unit and rewrite all of it: extra flash wear, extra latency.  Reads below
+the unit cost only performance.  So on these drives the number that matters is
+the request size **at the member devices**, after md has split and the block
+layer has merged the I/O.
+
+Measured on a calibrated rig (`tools/raidkm-bench-iosize.sh`, k=8 m=2, 128 KiB
+chunk, 1 MiB sequential I/O; the rig reproduces an NVMe-oF QLC array's table):
+
+| state | request size at the members |
+|---|---|
+| healthy and degraded full-row writes, m=2 (classic or declustered) | ~123–128 KiB |
+| full-row writes, **m ≥ 3** | **~5 KiB** — full-row batching is off above m=2 |
+| degraded reads (classic / declustered) | **~5 KiB / ~6 KiB** |
+| rebuild onto a spare: survivor reads / spare writes | **~5 KiB / ~7 KiB** |
+| declustered population: survivor reads / spare-column writes | **~5.5 KiB / ~7 KiB** |
+| declustered copy back to a replacement | ~128 KiB |
+
+Degraded reads and rebuild go through 4 KiB stripe units on both raidkm and
+stock raid6, and with worker groups enabled those units reach the members out
+of order, so the block layer cannot merge them.  With `group_thread_cnt=0` the
+same rebuild merges to ~120–125 KiB on both engines — but runs on one thread,
+about 2.5–3× slower on a CPU-bound rig; degraded reads improve only to
+~7–10 KiB.  Chunk-sized rebuild and degraded read are being worked on.  Until
+then, on large-IU flash:
+
+- **chunk = a power-of-two multiple of the IU, with room to grow** — 128 KiB
+  covers 16, 32 and 64 KiB units; with `k=8` that is a 1 MiB row;
+- **keep `k × chunk` equal to the application's large I/O size** (item 1 above);
+- **use m=2** for now;
+- **no `--write-journal` and no PPL** — an attached md log or PPL turns off
+  full-row batching, which brings back ~5 KiB member writes even at m=2;
+- **external filesystem journal on a device that is not QLC** — a mirror or an
+  NVMe with power-loss protection;
+- **start namespaces, partitions and LVs on an IU boundary** as well as a row
+  boundary (mdadm already rounds its data offset to 1 MiB);
+- **check, don't assume**: `raidkm-ab-benchmark.sh` and
+  `raidkm-standard-benchmark.sh` report the member request size per workload.
 
 #### Worker threads
 
@@ -727,12 +782,17 @@ md-kmec/
 │   ├── raidkm-test-reshape-crash.sh    # power-loss/torn-write recovery of the COW reshape (fault-inject build)
 │   ├── raidkm-test-selfheal.sh        # checksum-driven self-heal (NATIVE=1 or dm-integrity)
 │   ├── raidkm-test-csum-thrash.sh     # native-checksum region-cache eviction round-trip
-│   ├── raidkm-standard-benchmark.sh   # fio harness (6 workloads) + Test-7
-│   │                                    # rebuild/populate wall-clock item
+│   ├── raidkm-standard-benchmark.sh   # fio harness (7 workloads incl. 1 MiB
+│   │                                    # sequential) + member request size,
+│   │                                    # Test-7 rebuild/populate wall-clock
 │   │                                    # (--rebuild-victim=DEV)
 │   ├── raidkm-ab-benchmark.sh         # A/B vs stock md on the same disks:
 │   │                                    # raw / raid6 / raid6-intree / raidkm<M>,
 │   │                                    # ABBA order, ratio tables
+│   ├── raidkm-bench-iosize.sh         # request size + merge share at the members
+│   │                                    # per I/O state (healthy, degraded, rebuild,
+│   │                                    # declustered populate/copyback); null_blk rig
+│   ├── raidkm-member-stats.sh         # sourced helper: member request counters
 │   └── raidkm-create.sh               # sysfs array creation; needs adapting
 │                                    # to "raidkm" name / level 71
 └── km/

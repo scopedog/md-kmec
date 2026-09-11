@@ -817,12 +817,15 @@ everything else is already default or automatic.
    width, so an 80-disk pool keeps a small, easily-filled row instead of a ~5
    MiB one, and rebuilds far faster.
 3. **Keep the 64K chunk default** unless deliberately trading for a specific row
-   width.
+   width — or the members are flash with a large indirection unit (IU): then
+   make the chunk a power-of-two multiple of the largest unit you expect to
+   deploy (128K for 16–64K units).
 
 **Storage layout:**
 
 4. **Put the filesystem journal on a separate device** — the single largest win
-   here.
+   here. This is the filesystem's own journal (ext4/jbd2), not md's
+   `--write-journal`.
 5. **Start the partition or LV on a row boundary.** Nothing detects a violation
    at runtime; it silently phase-shifts every allocation.
 6. **Keep other small, barriered write streams off the array** — same mechanism
@@ -842,6 +845,16 @@ everything else is already default or automatic.
    measure rather than assume.
 10. `stripe_cache_size` (default fine) and `preread_bypass_threshold`
     (irrelevant to full-row writes) are not worth sweeping.
+
+**Flash with a large indirection unit (QLC).** A write below the drive's IU
+(16, 32 or 64 KiB) makes the drive rewrite the whole unit, so check the request
+size that reaches the members, not just throughput. Today full-row writes at
+m=2 reach the members at ~123–128 KiB, but full-row writes at m ≥ 3, degraded
+reads and rebuild reach them at ~5–8 KiB. On such drives: chunk a power-of-two
+multiple of the IU (128K), m=2 for now, no `--write-journal` or PPL (either
+turns off full-row batching), the filesystem journal on a device that is not
+QLC, and namespaces/partitions on an IU boundary. `tools/raidkm-bench-iosize.sh`
+measures it per I/O state; the benchmarks report it per workload.
 
 ```sh
 cat /sys/block/md70/queue/optimal_io_size    # = k × chunk; mkfs.ext4 picks this up unaided
@@ -931,8 +944,13 @@ NATIVE=1 tools/raidkm-test-selfheal.sh # checksum-driven heal (or dm-integrity b
 NATIVE=1 tools/raidkm-test-csum-thrash.sh  # CRC-region cache eviction round-trip
 tools/raidkm-test-declustered-*.sh     # ~30 declustered gates: map, io, populate, rebalance, reshape…
 
-# benchmark harness: 6 fio workloads + a rebuild/populate wall-clock item
+# benchmark harness: 7 fio workloads (member request size recorded per workload)
+# + a rebuild/populate wall-clock item
 tools/raidkm-standard-benchmark.sh --runs=3 --rebuild-victim=/dev/ram2
+
+# request size at the members per I/O state (healthy, degraded, rebuild,
+# declustered populate/copyback) on a null_blk rig
+tools/raidkm-bench-iosize.sh --arms=raid6:8+2,raidkm:8+2,dcl:8+2:12:2
 ```
 
 The **reshape crash/fault suite** needs a `CONFIG_RAIDKM_FAULT_INJECT` kernel

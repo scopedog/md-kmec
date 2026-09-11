@@ -67,6 +67,8 @@
 #   --gtc=N             set group_thread_cnt on every md arm
 #   --stripe-cache=N    set stripe_cache_size on every md arm
 #   --rebuild           also time a rebuild of the last member (Test 7) per md run
+#   --workloads=LIST    workloads passed to raidkm-standard-benchmark.sh
+#                       (default 1,2,3,4,5,8,9; 8/9 = sequential 1 MiB write/read)
 #   --precondition      sequential full write of every member before the first arm
 #   --output=DIR        results directory (default /var/tmp/raidkm-ab-<timestamp>)
 #   --md=DEV            md node to create the arms on (default /dev/md70)
@@ -84,6 +86,8 @@
 # No pipefail: raidkm-test-lib.sh tests `lsmod | grep -q`, which under pipefail
 # spuriously fails when grep exits early and lsmod takes SIGPIPE.
 set -u
+# blkid, wipefs, modinfo and friends live in sbin, which a non-root PATH may lack
+PATH="$PATH:/usr/sbin:/sbin"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 BENCH="$DIR/raidkm-standard-benchmark.sh"
@@ -98,6 +102,7 @@ BITMAP=none
 GTC=
 SCS=
 REBUILD=0
+WORKLOADS=
 PRECOND=0
 OUTPUT=
 FORCE=0
@@ -138,6 +143,7 @@ for arg in "$@"; do
 	--stripe-cache=*) SCS="${arg#*=}" ;;
 	--rebuild)        REBUILD=1 ;;
 	--precondition)   PRECOND=1 ;;
+	--workloads=*)    WORKLOADS="${arg#*=}" ;;
 	--output=*)       OUTPUT="${arg#*=}" ;;
 	--md=*)           MD_ARG="${arg#*=}" ;;
 	--mdadm=*)        MDADM_ARG="${arg#*=}" ;;
@@ -227,40 +233,66 @@ INTREE_SV=
 DEFAULT_456=$(modinfo -n raid456 2>/dev/null)
 DEFAULT_SV=$(modinfo -F srcversion raid456 2>/dev/null)
 mod_loaded() { [ -e "/sys/module/$1/initstate" ]; }   # loadable module present
-ORIG_456_SV=$(cat /sys/module/raid456/srcversion 2>/dev/null)
 ORIG_DM_RAID=0
 mod_loaded dm_raid && ORIG_DM_RAID=1
 [ "$NEED_INTREE" = 1 ] && [ -z "$INTREE_456" ] &&
 	preflight_fail "an -intree arm was requested but $KVER has no kernel/drivers/md/raid456.ko*"
 
+# Which raid456 is loaded.  Kernels built with srcversions let us verify it; on
+# kernels without them (e.g. Debian) we track the flavour we loaded ourselves.
+# When modprobe already resolves the in-tree file, there is only one flavour.
+SV_OK=0
+[ -n "$DEFAULT_SV" ] && SV_OK=1
+SAME_456=0
+[ -n "$INTREE_456" ] && [ "$(readlink -f "$INTREE_456")" = "$(readlink -f "$DEFAULT_456")" ] && SAME_456=1
+
 loaded_456_sv() { cat /sys/module/raid456/srcversion 2>/dev/null; }
 
-describe_456() {
-	local sv; sv=$(loaded_456_sv)
-	if [ -z "$sv" ]; then
-		echo "raid456 not loaded"
-	elif [ -n "$INTREE_SV" ] && [ "$sv" = "$INTREE_SV" ]; then
-		echo "in-tree $INTREE_456 (srcversion $sv)"
-	elif [ "$sv" = "$DEFAULT_SV" ]; then
-		echo "$DEFAULT_456 (srcversion $sv)"
+# current_456 -> none | default | intree | unknown
+current_456() {
+	local sv
+	mod_loaded raid456 || { echo none; return; }
+	if [ "$SV_OK" = 1 ]; then
+		sv=$(loaded_456_sv)
+		if [ -n "$INTREE_SV" ] && [ "$sv" = "$INTREE_SV" ]; then echo intree
+		elif [ "$sv" = "$DEFAULT_SV" ]; then echo default
+		else echo unknown; fi
 	else
-		echo "unknown raid456 (srcversion $sv)"
+		echo "${TRACKED_456:-unknown}"
 	fi
+}
+TRACKED_456=
+ORIG_456=$(current_456)
+
+describe_456() {
+	case "$(current_456)" in
+	none)    echo "raid456 not loaded" ;;
+	intree)  echo "in-tree $INTREE_456$( [ "$SV_OK" = 1 ] && echo " (srcversion $(loaded_456_sv))" || echo " (loaded by this script; no srcversion on this kernel)")" ;;
+	default) if [ "$SAME_456" = 1 ]; then
+			 echo "$DEFAULT_456 (the kernel's only raid456)"
+		 else
+			 echo "$DEFAULT_456$( [ "$SV_OK" = 1 ] && echo " (srcversion $(loaded_456_sv))" || echo " (loaded by this script; no srcversion on this kernel)")"
+		 fi ;;
+	*)       echo "raid456 of unknown origin$( [ "$SV_OK" = 1 ] && echo " (srcversion $(loaded_456_sv))")" ;;
+	esac
 }
 
 unload_456() {
 	mod_loaded raid456 || return 0
 	rmmod dm_raid 2>/dev/null
 	rmmod raid456 || die "cannot unload raid456 (a raid4/5/6 array or dm-raid LV is using it)"
+	TRACKED_456=
 }
 
 # use_456 default|intree : make the requested raid456 the loaded one
 use_456() {
-	local want_sv m
-	[ "$1" = intree ] && want_sv="$INTREE_SV" || want_sv="$DEFAULT_SV"
-	[ -n "$(loaded_456_sv)" ] && [ "$(loaded_456_sv)" = "$want_sv" ] && return 0
+	local want=$1 m
+	[ "$SAME_456" = 1 ] && want=default
+	if [ "$(current_456)" = "$want" ]; then
+		return 0
+	fi
 	unload_456
-	if [ "$1" = intree ]; then
+	if [ "$want" = intree ]; then
 		for m in md_mod libcrc32c xor raid6_pq async_tx async_memcpy async_xor \
 			 async_pq async_raid6_recov; do
 			modprobe "$m" 2>/dev/null
@@ -269,8 +301,9 @@ use_456() {
 	else
 		modprobe raid456 || die "modprobe raid456 failed"
 	fi
-	[ "$(loaded_456_sv)" = "$want_sv" ] ||
-		die "loaded raid456 srcversion $(loaded_456_sv) is not the requested $1 ($want_sv)"
+	TRACKED_456=$want
+	[ "$SV_OK" = 0 ] || [ "$(current_456)" = "$want" ] ||
+		die "loaded raid456 srcversion $(loaded_456_sv) is not the requested $want"
 }
 
 # ---- arm lifecycle ----------------------------------------------------------
@@ -308,14 +341,12 @@ teardown_arm() {
 cleanup() {
 	teardown_arm
 	# put raid456 (and a dm_raid we unloaded to swap it) back the way we found it
-	if [ "$(loaded_456_sv)" != "$ORIG_456_SV" ]; then
-		if [ -z "$ORIG_456_SV" ]; then
-			unload_456
-		elif [ -n "$INTREE_SV" ] && [ "$ORIG_456_SV" = "$INTREE_SV" ]; then
-			use_456 intree
-		else
-			use_456 default
-		fi
+	if [ "$(current_456)" != "$ORIG_456" ]; then
+		case "$ORIG_456" in
+		none)   unload_456 ;;
+		intree) use_456 intree ;;
+		*)      use_456 default ;;
+		esac
 	fi
 	[ "$ORIG_DM_RAID" = 1 ] && modprobe dm_raid 2>/dev/null
 	return 0
@@ -343,6 +374,7 @@ arm_create_cmd() {
 # arm_bench_args <arm> <dir> <target> : set BENCH_ARGS for raidkm-standard-benchmark.sh
 arm_bench_args() {
 	BENCH_ARGS=(--target="$3" --runs=1 --runtime="$RUNTIME" --output="$2" --no-check)
+	[ -n "$WORKLOADS" ] && BENCH_ARGS+=(--workloads="$WORKLOADS")
 	if [ "$REBUILD" = 1 ] && [ "$1" != raw ]; then
 		BENCH_ARGS+=(--rebuild-victim="$LAST_MEMBER" --mdadm="$MDADM")
 	fi
@@ -397,7 +429,7 @@ record_arm() {
 		fi
 		case "$arm" in
 		raid*-*|raid5|raid6) echo "module=$(describe_456)" ;;
-		raidkm*) echo "module=raidkm $([ -f "$RAIDKM_KO" ] && echo "$RAIDKM_KO" || modinfo -n raidkm 2>/dev/null) (srcversion $(cat /sys/module/raidkm/srcversion 2>/dev/null))" ;;
+		raidkm*) echo "module=raidkm $([ -f "$RAIDKM_KO" ] && echo "$RAIDKM_KO" || modinfo -n raidkm 2>/dev/null)$(sv=$(cat /sys/module/raidkm/srcversion 2>/dev/null); [ -n "$sv" ] && echo " (srcversion $sv)")" ;;
 		esac
 	} > "$out"
 }
@@ -420,7 +452,8 @@ echo "  members:   ${MEMBERS[*]} (N=$N)"
 echo "  arms:      ${ARM_LIST[*]}  (baseline $BASELINE)"
 echo "  order:     ${ORDER[*]}"
 echo "  chunk:     ${CHUNK}K  bitmap=$BITMAP  gtc=${GTC:-default}  stripe_cache=${SCS:-default}"
-echo "  runtime:   ${RUNTIME}s x 5 workloads per arm run  (~$(( ${#ORDER[@]} * 5 * (RUNTIME + 3) / 60 )) min of fio)"
+NWL=$(echo "${WORKLOADS:-1,2,3,4,5,8,9}" | tr ',' ' ' | wc -w)
+echo "  runtime:   ${RUNTIME}s x $NWL workloads per arm run  (~$(( ${#ORDER[@]} * NWL * (RUNTIME + 3) / 60 )) min of fio)"
 echo "  raid456:   modprobe -> ${DEFAULT_456:-none}${INTREE_456:+;  in-tree -> $INTREE_456}"
 echo "  output:    $OUTPUT"
 if [ "$DRYRUN" = 1 ]; then
@@ -443,13 +476,17 @@ if [ "$DRYRUN" = 1 ]; then
 	for arm in "${ARM_LIST[@]}"; do
 		echo "== arm $arm =="
 		case "$arm" in
-		raid5|raid6)
-			[ -n "$(loaded_456_sv)" ] && [ "$(loaded_456_sv)" != "$DEFAULT_SV" ] &&
-				echo "  rmmod dm_raid raid456        # the loaded raid456 is not the modprobe default"
-			echo "  modprobe raid456             # -> ${DEFAULT_456:-?}" ;;
-		raid5-intree|raid6-intree)
-			echo "  rmmod dm_raid raid456"
-			echo "  insmod ${INTREE_456:-<no in-tree raid456.ko>}   # distro raid456; the original is restored at exit" ;;
+		raid5|raid6|raid5-intree|raid6-intree)
+			if [ "$SAME_456" = 1 ]; then
+				echo "  modprobe raid456             # -> ${DEFAULT_456:-?} (the kernel's only raid456; no swap)"
+			elif [[ "$arm" == *-intree ]]; then
+				echo "  rmmod dm_raid raid456"
+				echo "  insmod ${INTREE_456:-<no in-tree raid456.ko>}   # distro raid456; the original is restored at exit"
+			else
+				[ "$SV_OK" = 1 ] && [ "$(current_456)" = intree ] &&
+					echo "  rmmod dm_raid raid456        # the in-tree raid456 is loaded; swap to the modprobe default"
+				echo "  modprobe raid456             # -> ${DEFAULT_456:-?}"
+			fi ;;
 		raidkm*)
 			if [ -f "$ISAL_KO" ]; then echo "  insmod $ISAL_KO"; else echo "  modprobe isal_lib"; fi
 			if [ -f "$RAIDKM_KO" ]; then
@@ -528,6 +565,8 @@ DESC = {
     "test3_highconc": "70/30 4K x16 jobs",
     "test4_oltp": "OLTP 70/30 16K",
     "test5_partial_stripe": "partial-stripe 8K write",
+    "test8_seqwrite1m": "sequential 1 MiB write",
+    "test9_seqread1m": "sequential 1 MiB read",
 }
 tests = list(DESC)
 
@@ -554,8 +593,16 @@ for arm in arms:
             if not os.path.exists(f):
                 continue
             iops, bw, p99 = load(f)
-            d = data.setdefault((arm, t), {"iops": [], "bw": [], "p99": []})
+            d = data.setdefault((arm, t), {"iops": [], "bw": [], "p99": [],
+                                           "mw": [], "mwp": [], "mr": [], "mrp": []})
             d["iops"].append(iops); d["bw"].append(bw); d["p99"].append(p99)
+            mf = os.path.join(rdir, f"{t}_run1.members.json")
+            if os.path.exists(mf):
+                mj = json.load(open(mf))
+                for side, k in (("write", "mw"), ("read", "mr")):
+                    if mj[side]["requests"]:
+                        d[k].append(mj[side]["avg_kib"])
+                        d[k + "p"].append(mj[side]["merged_pct"])
         log = os.path.join(rdir, "bench.log")
         if os.path.exists(log):
             m = re.search(r"^\s+7: ([0-9.]+)s", open(log).read(), re.M)
@@ -598,6 +645,8 @@ for metric, label, fmt, higher in (("iops", "IOPS", "{:.0f}", True),
     emit(hdr)
     emit("|" + "---|" * (1 + len(arms) + len(arms) - 1))
     for t in tests:
+        if not any((a, t) in data for a in arms):
+            continue
         base_m, _ = mean_cv(data.get((baseline, t), {}).get(metric, []))
         cells, ratios = [], []
         for arm in arms:
@@ -616,6 +665,30 @@ for metric, label, fmt, higher in (("iops", "IOPS", "{:.0f}", True),
                          "cv_pct": round(cv, 2),
                          "ratio_vs_baseline": round(m / base_m, 4) if base_m else ""})
         emit(f"| {t} ({DESC[t]}) | " + " | ".join(cells) + " | " + " | ".join(ratios) + " |")
+
+# Request size at the members: what the devices under each arm received.
+if any(data[k]["mw"] or data[k]["mr"] for k in data):
+    emit()
+    emit("## Request size at the members, KiB (merged share)")
+    emit()
+    emit("| workload | " + " | ".join(arms) + " |")
+    emit("|" + "---|" * (1 + len(arms)))
+    for t in tests:
+        if not any((a, t) in data for a in arms):
+            continue
+        cells = []
+        for arm in arms:
+            d = data.get((arm, t), {})
+            parts = []
+            for k, tag in (("mw", "w"), ("mr", "r")):
+                if d.get(k):
+                    parts.append(f"{tag} {statistics.mean(d[k]):.1f} ({statistics.mean(d[k + 'p']):.0f}%)")
+                    rows.append({"arm": arm, "workload": t,
+                                 "metric": "member_write_kib" if k == "mw" else "member_read_kib",
+                                 "mean": round(statistics.mean(d[k]), 3), "cv_pct": "",
+                                 "ratio_vs_baseline": ""})
+            cells.append(" · ".join(parts) or "-")
+        emit(f"| {t} ({DESC[t]}) | " + " | ".join(cells) + " |")
 
 if rebuild:
     emit()
