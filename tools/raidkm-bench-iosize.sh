@@ -35,6 +35,8 @@
 #                     rows (default 4G)
 #   --chunk=KB        md chunk size (default 128)
 #   --gtc=N           group_thread_cnt for every arm (default: engine default)
+#   --md-attr=NAME=V  write V to /sys/block/mdX/md/NAME on every arm after the
+#                     create (repeatable), e.g. --md-attr=rk_row_dread=1
 #   --stripe-cache=N  stripe_cache_size for every arm (default: engine default, 256).
 #                     That is the cache's minimum: it grows by itself under
 #                     pressure, so each state records the peak stripe_cache_active.
@@ -73,6 +75,7 @@ REGION=4G
 CHUNK=128
 GTC=
 SCS=
+MD_ATTRS=()
 DEVS=
 FORCE=0
 NULLB_GB=48
@@ -99,6 +102,7 @@ for arg in "$@"; do
 	--chunk=*)      CHUNK="${arg#*=}" ;;
 	--gtc=*)        GTC="${arg#*=}" ;;
 	--stripe-cache=*) SCS="${arg#*=}" ;;
+	--md-attr=*)    MD_ATTRS+=("${arg#*=}") ;;
 	--devs=*)       DEVS="${arg#*=}" ;;
 	--force)        FORCE=1 ;;
 	--nullb-gb=*)   NULLB_GB="${arg#*=}" ;;
@@ -364,6 +368,11 @@ for spec in $ARMS; do
 	[ -n "$GTC" ] && echo "$GTC" > "/sys/block/$MDNAME/md/group_thread_cnt"
 	[ -n "$SCS" ] && { echo "$SCS" > "/sys/block/$MDNAME/md/stripe_cache_size" ||
 		log "$spec: could not set stripe_cache_size=$SCS"; }
+	# guarded: under set -u an empty array expansion aborts on bash < 4.4
+	for attr in ${MD_ATTRS[@]+"${MD_ATTRS[@]}"}; do
+		echo "${attr#*=}" > "/sys/block/$MDNAME/md/${attr%%=*}" ||
+			die "$spec: could not set ${attr%%=*}=${attr#*=}"
+	done
 	module=$( [ "$eng" = raid5 ] || [ "$eng" = raid6 ] && modinfo -n raid456 ||
 		  { [ -f "$RAIDKM_KO" ] && echo "$RAIDKM_KO" || modinfo -n raidkm; } )
 	log "arm $spec: level=$(cat /sys/block/$MDNAME/md/level) disks=$pool row=$((ROW / 1024)) KiB ($align)" \

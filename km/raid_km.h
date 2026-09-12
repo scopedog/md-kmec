@@ -344,6 +344,9 @@ struct stripe_head {
 						 * of a row share one device sector
 						 * (D3).  Always 0 on non-declustered
 						 * arrays. */
+	atomic_t		row_wpending;	/* row layer: member writes of this
+						 * stripe still out (+1 guard while
+						 * ops_run_io is issuing them) */
 	int			overwrite_disks; /* total overwrite disks in stripe,
 						  * this is only checked when stripe
 						  * has STRIPE_BATCH_READY
@@ -570,6 +573,8 @@ enum {
 				 * in conf->r5c_full_stripe_list)
 				 */
 	STRIPE_R5C_PREFLUSH,	/* need to flush journal device */
+	STRIPE_ROW_GUARD,	/* row layer: this ops_run_io call holds a
+				 * guard on the stripe's row write count */
 };
 
 #define STRIPE_EXPAND_SYNC_FLAGS \
@@ -877,6 +882,17 @@ struct r5conf {
 	struct bio		*retry_read_aligned_list; /* aligned bios retry list  */
 	atomic_t		preread_active_stripes; /* stripes with scheduled io */
 	atomic_t		active_aligned_reads;
+	/*
+	 * Row layer (raid_km.c): per-row write counts for row operations that
+	 * read several members outside the stripe cache, the degraded-read
+	 * knob (sysfs rk_row_dread) and its counters (sysfs rk_row_stats).
+	 */
+	struct raidkm_row_bucket *row_buckets;
+	int			row_dread;
+	atomic64_t		row_dread_done;		/* served by decode */
+	atomic64_t		row_dread_bypass;	/* member healthy: bypass */
+	atomic64_t		row_dread_raced;	/* raced a write or failed: stripe cache */
+	atomic64_t		row_dread_declined;	/* not eligible: stripe cache */
 	atomic_t		pending_full_writes; /* full write backlog */
 	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */

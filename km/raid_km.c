@@ -159,6 +159,89 @@ static int default_stripe_cache_size = -1;
 module_param(default_stripe_cache_size, int, 0644);
 MODULE_PARM_DESC(default_stripe_cache_size,
 		 "Initial stripe_cache_size for new arrays (-1 = auto: 1024 stripes, capped at a 128 MiB cache and never below 256; 0 = the stock 256 start; N = N stripes).");
+
+static bool default_row_dread;
+module_param(default_row_dread, bool, 0644);
+MODULE_PARM_DESC(default_row_dread,
+		 "Initial rk_row_dread for new arrays: serve degraded reads through the row layer (default N).");
+
+/*
+ * Row layer.  A row is one chunk-sized band at the same member offset across a
+ * stripe's members, identified by (member sector >> chunk bits, declustered
+ * group).  Row operations read several members of a row outside the stripe
+ * cache, so they are only valid if no member of the row changed meanwhile.
+ *
+ * Every member write the stripe cache issues is counted per row: before a
+ * stripe head's first member write, its row's @inflight and @gen go up; when
+ * its last member write completes, @inflight comes down.  A row reader
+ * snapshots @gen while @inflight is zero, reads, and requires both unchanged
+ * afterwards; otherwise the stripe cache serves the read.  Readers never block
+ * writers.  Buckets are hashed, so a collision only costs a spurious retry.
+ */
+#define RAIDKM_ROW_BUCKET_BITS	12
+#define RAIDKM_ROW_BUCKETS	(1 << RAIDKM_ROW_BUCKET_BITS)
+
+struct raidkm_row_bucket {
+	atomic_t	inflight;	/* stripe heads with member writes out */
+	atomic_t	gen;		/* bumped when such a stripe starts */
+};
+
+static struct workqueue_struct *raidkm_row_wq;
+
+static inline struct raidkm_row_bucket *
+raidkm_row_bucket(struct r5conf *conf, sector_t member_sector, int group)
+{
+	u64 key = (member_sector >> ilog2(conf->chunk_sectors)) ^
+		  ((u64)(u16)group << 48);
+
+	return &conf->row_buckets[(key * 0x9E3779B97F4A7C15ULL) >>
+				  (64 - RAIDKM_ROW_BUCKET_BITS)];
+}
+
+/*
+ * ops_run_io: count one member write bio of @sh.  The first write of an
+ * ops_run_io call also takes a guard reference, dropped by
+ * raidkm_row_wguard_drop() once the call has issued everything, so a bio that
+ * completes before its siblings are issued cannot close the row's window early.
+ * ops_run_io never runs concurrently for one stripe, so a zero count seen here
+ * has no bio outstanding.
+ */
+static inline void raidkm_row_wget(struct r5conf *conf, struct stripe_head *sh)
+{
+	if (!test_and_set_bit(STRIPE_ROW_GUARD, &sh->state) &&
+	    !atomic_inc_not_zero(&sh->row_wpending)) {
+		struct raidkm_row_bucket *b =
+			raidkm_row_bucket(conf, sh->sector, sh->dcl_group);
+
+		atomic_set(&sh->row_wpending, 1);
+		atomic_inc(&b->inflight);
+		atomic_inc(&b->gen);
+	}
+	atomic_inc(&sh->row_wpending);
+}
+
+static inline void raidkm_row_wput(struct r5conf *conf, struct stripe_head *sh)
+{
+	if (atomic_dec_and_test(&sh->row_wpending))
+		atomic_dec(&raidkm_row_bucket(conf, sh->sector,
+					      sh->dcl_group)->inflight);
+}
+
+/* drop the guards ops_run_io took on @head_sh and its batch members */
+static void raidkm_row_wguard_drop(struct r5conf *conf,
+				   struct stripe_head *head_sh)
+{
+	struct stripe_head *sh = head_sh;
+
+	do {
+		if (test_and_clear_bit(STRIPE_ROW_GUARD, &sh->state))
+			raidkm_row_wput(conf, sh);
+		if (!head_sh->batch_head)
+			break;
+		sh = list_first_entry(&sh->batch_list, struct stripe_head,
+				      batch_list);
+	} while (sh != head_sh);
+}
 static struct workqueue_struct *raid5_wq;
 
 static void raid5_quiesce(struct mddev *mddev, int quiesce);
@@ -2845,6 +2928,8 @@ again:
 				? raid5_end_write_request
 				: raid5_end_read_request;
 			bi->bi_private = sh;
+			if (op_is_write(op))
+				raidkm_row_wget(conf, sh);
 
 			pr_debug("%s: for %llu schedule op %d on disc %d\n",
 				__func__, (unsigned long long)sh->sector,
@@ -2904,6 +2989,7 @@ again:
 			BUG_ON(!op_is_write(op));
 			rbi->bi_end_io = raid5_end_write_request;
 			rbi->bi_private = sh;
+			raidkm_row_wget(conf, sh);
 
 			pr_debug("%s: for %llu schedule op %d on "
 				 "replacement disc %d\n",
@@ -2953,6 +3039,8 @@ again:
 		if (sh != head_sh)
 			goto again;
 	}
+
+	raidkm_row_wguard_drop(conf, head_sh);
 
 	if (should_defer && !bio_list_empty(&pending_bios))
 		defer_issue_bios(conf, head_sh->sector, &pending_bios);
@@ -5303,6 +5391,7 @@ static void raid5_end_write_request(struct bio *bi)
 	if (!test_and_clear_bit(R5_DOUBLE_LOCKED, &sh->dev[i].flags))
 		clear_bit(R5_LOCKED, &sh->dev[i].flags);
 	set_bit(STRIPE_HANDLE, &sh->state);
+	raidkm_row_wput(conf, sh);
 
 	if (sh->batch_head && sh != sh->batch_head)
 		raid5_release_stripe(sh->batch_head);
@@ -8965,6 +9054,320 @@ static struct bio *chunk_aligned_read(struct mddev *mddev, struct bio *raid_bio)
 	return NULL;
 }
 
+/*
+ * Row layer, degraded read.  In a degraded array the stock path sends every
+ * read through the stripe cache: 32 stripe heads per 128 KiB chunk, each
+ * reading every surviving member 4 KiB at a time.  Here a read inside one
+ * chunk is served by the aligned-read bypass when its member is healthy, and
+ * when its member is missing by reading the same range from k surviving
+ * members in one request each and decoding once.  Anything this path cannot
+ * serve safely goes back to the stripe cache.  v1: classic layouts only.
+ */
+struct raidkm_row_src {
+	struct md_rdev	*rdev;
+	struct folio	*folio;
+	int		row;	/* generator row: data index, or k + parity index */
+};
+
+struct raidkm_row_read {
+	struct work_struct	work;
+	struct r5conf		*conf;
+	struct bio		*raid_bio;
+	struct raidkm_row_bucket *bucket;
+	int			gen0;
+	atomic_t		pending;
+	blk_status_t		status;
+	int			k, m, target;	/* target: missing data index */
+	unsigned int		len, skip;	/* aligned span; bio offset in it */
+	struct folio		*out;
+	struct raidkm_row_src	src[];
+};
+
+static void raidkm_row_read_free(struct raidkm_row_read *rr)
+{
+	int i;
+
+	for (i = 0; i < rr->k; i++)
+		if (rr->src[i].folio)
+			folio_put(rr->src[i].folio);
+	if (rr->out)
+		folio_put(rr->out);
+	kfree(rr);
+}
+
+/* rebuild the missing data column over rr->len bytes: one inversion, one pass */
+static int raidkm_row_decode(struct raidkm_row_read *rr)
+{
+	int k = rr->k, total = rr->k + rr->m, i, j, err = 0;
+	unsigned char *a, *b, *inv, *row1, *tbls, *dst[1];
+	unsigned char **src;
+
+	a = kmalloc(total * k + 2 * k * k + k + k * 32, GFP_NOIO);
+	src = kmalloc_array(k, sizeof(*src), GFP_NOIO);
+	if (!a || !src) {
+		err = -ENOMEM;
+		goto out;
+	}
+	b = a + total * k;
+	inv = b + k * k;
+	row1 = inv + k * k;
+	tbls = row1 + k;
+
+	/* the same generator raidkm_build_ec() encodes with (m == 2 included) */
+	if (rr->m <= RAIDKM_VANDERMONDE_MAX_M)
+		gf_gen_rs_matrix(a, total, k);
+	else
+		gf_gen_cauchy1_matrix(a, total, k);
+	for (i = 0; i < k; i++)
+		for (j = 0; j < k; j++)
+			b[i * k + j] = a[rr->src[i].row * k + j];
+	if (gf_invert_matrix(b, inv, k) < 0) {
+		err = -EIO;
+		goto out;
+	}
+	for (j = 0; j < k; j++)
+		row1[j] = inv[rr->target * k + j];
+	for (i = 0; i < k; i++)
+		src[i] = folio_address(rr->src[i].folio);
+	dst[0] = folio_address(rr->out);
+
+	if (isal_have_avx512_gfni()) {
+		ec_init_tables_gfni(k, 1, row1, tbls);
+		ec_encode_data_avx512_gfni(rr->len, k, 1, tbls, src, dst);
+	} else if (isal_have_gfni()) {
+		ec_init_tables_gfni(k, 1, row1, tbls);
+		ec_encode_data_avx2_gfni(rr->len, k, 1, tbls, src, dst);
+	} else {
+		ec_init_tables_base(k, 1, row1, tbls);
+		ec_encode_data_base(rr->len, k, 1, tbls, src, dst);
+	}
+out:
+	kfree(src);
+	kfree(a);
+	return err;
+}
+
+static void raidkm_row_read_work(struct work_struct *work)
+{
+	struct raidkm_row_read *rr = container_of(work, struct raidkm_row_read,
+						  work);
+	struct r5conf *conf = rr->conf;
+	struct bio *raid_bio = rr->raid_bio;
+	int i;
+
+	for (i = 0; i < rr->k; i++)
+		rdev_dec_pending(rr->src[i].rdev, conf->mddev);
+
+	/* every member read is in memory: valid iff no write touched the row */
+	if (!rr->status && !atomic_read(&rr->bucket->inflight) &&
+	    atomic_read(&rr->bucket->gen) == rr->gen0 &&
+	    !raidkm_row_decode(rr)) {
+		const u8 *out = folio_address(rr->out);
+		unsigned int off = rr->skip;
+		struct bvec_iter it;
+		struct bio_vec bv;
+
+		bio_for_each_segment(bv, raid_bio, it) {
+			memcpy_to_page(bv.bv_page, bv.bv_offset, out + off,
+				       bv.bv_len);
+			off += bv.bv_len;
+		}
+		atomic64_inc(&conf->row_dread_done);
+		bio_endio(raid_bio);
+		if (atomic_dec_and_test(&conf->active_aligned_reads))
+			wake_up(&conf->wait_for_quiescent);
+	} else {
+		atomic64_inc(&conf->row_dread_raced);
+		/* the stripe cache serves it; retry_aligned_read drops
+		 * active_aligned_reads */
+		add_bio_to_retry(raid_bio, conf);
+	}
+	raidkm_row_read_free(rr);
+}
+
+static void raidkm_row_read_endio(struct bio *bi)
+{
+	struct raidkm_row_read *rr = bi->bi_private;
+
+	if (bi->bi_status)
+		rr->status = bi->bi_status;
+	bio_put(bi);
+	if (atomic_dec_and_test(&rr->pending))
+		queue_work(raidkm_row_wq, &rr->work);
+}
+
+/* member usable for [a0, a1) of the data area */
+static bool raidkm_row_member_ok(struct md_rdev *rdev, sector_t a0, sector_t a1)
+{
+	return rdev && !test_bit(Faulty, &rdev->flags) &&
+	       (test_bit(In_sync, &rdev->flags) || rdev->recovery_offset >= a1);
+}
+
+/* serve a one-chunk read whose member is missing; 0 = not served */
+static int raidkm_row_dread_one(struct mddev *mddev, struct bio *raid_bio)
+{
+	struct r5conf *conf = mddev->private;
+	int n = conf->raid_disks, m = conf->m, k = n - m;
+	struct raidkm_row_read *rr;
+	struct raidkm_row_bucket *b;
+	sector_t msect, a0, a1, row;
+	unsigned int len, order;
+	int dd_idx, pd, target, i, nsrc = 0, seq;
+	bool did_inc;
+
+	if (!in_chunk_boundary(mddev, raid_bio))
+		return 0;
+	seq = read_seqcount_begin(&conf->gen_lock);
+	if (conf->reshape_progress != MaxSector)
+		return 0;
+	msect = raid5_compute_sector(conf, raid_bio->bi_iter.bi_sector, 0,
+				     &dd_idx, NULL);
+	if (read_seqcount_retry(&conf->gen_lock, seq))
+		return 0;
+
+	/* the row's parity starts at slot pd; data index d sits at pd+m+d */
+	row = msect >> ilog2(conf->chunk_sectors);
+	pd = conf->rotating ? n - 1 - (int)sector_div(row, n) : k;
+	target = (dd_idx - pd - m + 2 * n) % n;
+	a0 = msect & ~((sector_t)RAIDKM_PAGE_SECTORS - 1);
+	a1 = round_up(msect + bio_sectors(raid_bio),
+		      (sector_t)RAIDKM_PAGE_SECTORS);
+	len = (a1 - a0) << 9;
+	if (target >= k || raidkm_row_member_ok(conf->disks[dd_idx].rdev, a0, a1))
+		return 0;	/* member present: bypass or stripe cache */
+
+	rr = kzalloc(struct_size(rr, src, k), GFP_NOIO);
+	if (!rr)
+		return 0;
+	rr->k = k;
+	rr->m = m;
+	for (i = 0; i < k + m && nsrc < k; i++) {
+		int slot = i < k ? (pd + m + i) % n : (pd + i - k) % n;
+		struct md_rdev *rdev = conf->disks[slot].rdev;
+
+		if (i == target || !raidkm_row_member_ok(rdev, a0, a1))
+			continue;
+		atomic_inc(&rdev->nr_pending);
+		if (rdev_has_badblock(rdev, a0, a1 - a0)) {
+			rdev_dec_pending(rdev, mddev);
+			continue;
+		}
+		rr->src[nsrc].rdev = rdev;
+		rr->src[nsrc].row = i;
+		nsrc++;
+	}
+	if (nsrc < k)
+		goto decline;
+
+	b = raidkm_row_bucket(conf, msect, 0);
+	rr->gen0 = atomic_read(&b->gen);
+	if (atomic_read(&b->inflight))
+		goto decline;		/* hot row: leave it to the stripe cache */
+
+	order = get_order(len);
+	for (i = 0; i < k; i++) {
+		rr->src[i].folio = folio_alloc(GFP_NOIO | __GFP_NOWARN, order);
+		if (!rr->src[i].folio)
+			goto decline;
+	}
+	rr->out = folio_alloc(GFP_NOIO | __GFP_NOWARN, order);
+	if (!rr->out)
+		goto decline;
+
+	/* quiesce accounting, as raid5_read_one_chunk */
+	did_inc = false;
+	if (conf->quiesce == 0) {
+		atomic_inc(&conf->active_aligned_reads);
+		did_inc = true;
+	}
+	if (!did_inc || smp_load_acquire(&conf->quiesce) != 0) {
+		if (did_inc && atomic_dec_and_test(&conf->active_aligned_reads))
+			wake_up(&conf->wait_for_quiescent);
+		spin_lock_irq(&conf->device_lock);
+		wait_event_lock_irq(conf->wait_for_quiescent, conf->quiesce == 0,
+				    conf->device_lock);
+		atomic_inc(&conf->active_aligned_reads);
+		spin_unlock_irq(&conf->device_lock);
+	}
+	/* a quiesce may have been a reshape starting: the mapping must still hold */
+	if (conf->reshape_progress != MaxSector ||
+	    read_seqcount_retry(&conf->gen_lock, seq)) {
+		if (atomic_dec_and_test(&conf->active_aligned_reads))
+			wake_up(&conf->wait_for_quiescent);
+		goto decline;
+	}
+
+	rr->conf = conf;
+	rr->bucket = b;
+	rr->target = target;
+	rr->len = len;
+	rr->skip = (msect - a0) << 9;
+	INIT_WORK(&rr->work, raidkm_row_read_work);
+	atomic_set(&rr->pending, 1);
+	md_account_bio(mddev, &raid_bio);
+	rr->raid_bio = raid_bio;
+
+	{
+		struct blk_plug plug;
+
+		blk_start_plug(&plug);
+		for (i = 0; i < k; i++) {
+			struct md_rdev *rdev = rr->src[i].rdev;
+			struct bio *bi = bio_alloc_bioset(rdev->bdev, 1,
+							  REQ_OP_READ, GFP_NOIO,
+							  &mddev->bio_set);
+
+			bi->bi_iter.bi_sector = a0 + rdev->data_offset;
+			bio_add_folio_nofail(bi, rr->src[i].folio, len, 0);
+			bi->bi_end_io = raidkm_row_read_endio;
+			bi->bi_private = rr;
+			atomic_inc(&rr->pending);
+			submit_bio_noacct(bi);
+		}
+		blk_finish_plug(&plug);
+	}
+	if (atomic_dec_and_test(&rr->pending))
+		queue_work(raidkm_row_wq, &rr->work);
+	return 1;
+
+decline:
+	for (i = 0; i < nsrc; i++)
+		rdev_dec_pending(rr->src[i].rdev, mddev);
+	raidkm_row_read_free(rr);
+	return 0;
+}
+
+/* degraded read entry: split at the chunk boundary like chunk_aligned_read */
+static struct bio *raidkm_row_read(struct mddev *mddev, struct bio *raid_bio)
+{
+	struct r5conf *conf = mddev->private;
+	sector_t sector = raid_bio->bi_iter.bi_sector;
+	unsigned int chunk_sects = mddev->chunk_sectors;
+	unsigned int sectors = chunk_sects - (sector & (chunk_sects - 1));
+	struct bio *split;
+
+	if (conf->dcl || conf->csum || raid5_has_log(conf) ||
+	    raid5_has_ppl(conf) || mddev->degraded > conf->m ||
+	    conf->raid_disks > RAIDKM_MAX_STRIPE_DISKS)
+		return raid_bio;
+
+	if (sectors < bio_sectors(raid_bio)) {
+		split = bio_split(raid_bio, sectors, GFP_NOIO, &conf->bio_split);
+		bio_chain(split, raid_bio);
+		submit_bio_noacct(raid_bio);
+		raid_bio = split;
+	}
+
+	if (raid5_read_one_chunk(mddev, raid_bio)) {
+		atomic64_inc(&conf->row_dread_bypass);
+		return NULL;
+	}
+	if (raidkm_row_dread_one(mddev, raid_bio))
+		return NULL;
+	atomic64_inc(&conf->row_dread_declined);
+	return raid_bio;
+}
+
 /* __get_priority_stripe - get the next stripe to process
  *
  * Full stripe writes are allowed to pass preread active stripes up until
@@ -9580,6 +9983,14 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 		 * failed or still-recovering member).
 		 */
 		bi = chunk_aligned_read(mddev, bi);
+		if (!bi)
+			return true;
+	}
+
+	/* degraded: healthy-member chunks bypass, missing ones decode per row */
+	if (rw == READ && mddev->degraded && READ_ONCE(conf->row_dread) &&
+	    mddev->reshape_position == MaxSector) {
+		bi = raidkm_row_read(mddev, bi);
 		if (!bi)
 			return true;
 	}
@@ -14061,6 +14472,70 @@ raidkm_reshape_start = __ATTR(raidkm_reshape_start, S_IWUSR,
 			      NULL, raidkm_reshape_start_store);
 #endif /* RAIDKM_FAULT_INJECT */
 
+static ssize_t
+raidkm_row_dread_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	int ret = 0;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf)
+		ret = sprintf(page, "%d\n", READ_ONCE(conf->row_dread));
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+static ssize_t
+raidkm_row_dread_store(struct mddev *mddev, const char *page, size_t len)
+{
+	struct r5conf *conf;
+	unsigned long new;
+	int err;
+
+	if (len >= PAGE_SIZE)
+		return -EINVAL;
+	if (kstrtoul(page, 10, &new))
+		return -EINVAL;
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf)
+		err = -ENODEV;
+	else
+		WRITE_ONCE(conf->row_dread, !!new);
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_row_dread_entry = __ATTR(rk_row_dread, S_IRUGO | S_IWUSR,
+				raidkm_row_dread_show, raidkm_row_dread_store);
+
+static ssize_t
+raidkm_row_stats_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	int ret = 0;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf)
+		ret = sprintf(page,
+			      "dread_done %lld\ndread_bypass %lld\ndread_raced %lld\ndread_declined %lld\n",
+			      (long long)atomic64_read(&conf->row_dread_done),
+			      (long long)atomic64_read(&conf->row_dread_bypass),
+			      (long long)atomic64_read(&conf->row_dread_raced),
+			      (long long)atomic64_read(&conf->row_dread_declined));
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+static struct md_sysfs_entry
+raidkm_row_stats_entry = __ATTR(rk_row_stats, S_IRUGO,
+				raidkm_row_stats_show, NULL);
+
 static struct attribute *raid5_attrs[] =  {
 	&raid5_stripecache_size.attr,
 	&raid5_stripecache_active.attr,
@@ -14069,6 +14544,8 @@ static struct attribute *raid5_attrs[] =  {
 	&raid5_group_thread_cnt.attr,
 	&raid5_worker_thread_cnt.attr,
 	&raid5_skip_copy.attr,
+	&raidkm_row_dread_entry.attr,
+	&raidkm_row_stats_entry.attr,
 	&raidkm_dcl_populate.attr,
 	&raidkm_dcl_auto.attr,
 	&raidkm_dcl_reshape.attr,
@@ -14324,6 +14801,7 @@ static void free_conf(struct r5conf *conf)
 	bioset_exit(&conf->bio_split);
 	kfree(conf->stripe_hashtbl);
 	kfree(conf->pending_data);
+	kfree(conf->row_buckets);
 	kfree(conf->ec_a_matrix);
 	kfree(conf->ec_g_tbls_gfni);
 	kfree(conf->ec_g_tbls_base);
@@ -14526,6 +15004,11 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		goto abort;
 	for (i = 0; i < PENDING_IO_MAX; i++)
 		list_add(&conf->pending_data[i].sibling, &conf->free_list);
+	conf->row_buckets = kcalloc(RAIDKM_ROW_BUCKETS,
+				    sizeof(*conf->row_buckets), GFP_KERNEL);
+	if (!conf->row_buckets)
+		goto abort;
+	conf->row_dread = default_row_dread;
 	/*
 	 * Multi-threaded handle_stripe via worker groups. Stock kernel ships
 	 * disabled (cnt=0), but a probe on raid6 over tmpfs loops showed +43%
@@ -17278,12 +17761,19 @@ static int __init raid5_init(void)
 		WQ_UNBOUND|WQ_MEM_RECLAIM|WQ_CPU_INTENSIVE|WQ_SYSFS, 0);
 	if (!raid5_wq)
 		return -ENOMEM;
+	raidkm_row_wq = alloc_workqueue("raidkm_row",
+		WQ_UNBOUND|WQ_MEM_RECLAIM|WQ_CPU_INTENSIVE, 0);
+	if (!raidkm_row_wq) {
+		destroy_workqueue(raid5_wq);
+		return -ENOMEM;
+	}
 
 	ret = cpuhp_setup_state_multi(CPUHP_BP_PREPARE_DYN,
 				      "md/raidkm:prepare",
 				      raid456_cpu_up_prepare,
 				      raid456_cpu_dead);
 	if (ret < 0) {
+		destroy_workqueue(raidkm_row_wq);
 		destroy_workqueue(raid5_wq);
 		return ret;
 	}
@@ -17296,6 +17786,7 @@ static void raid5_exit(void)
 {
 	unregister_md_personality(&raid_km_personality);
 	cpuhp_remove_multi_state(raid_km_cpuhp_state);
+	destroy_workqueue(raidkm_row_wq);
 	destroy_workqueue(raid5_wq);
 }
 
