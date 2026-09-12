@@ -9061,7 +9061,10 @@ static struct bio *chunk_aligned_read(struct mddev *mddev, struct bio *raid_bio)
  * chunk is served by the aligned-read bypass when its member is healthy, and
  * when its member is missing by reading the same range from k surviving
  * members in one request each and decoding once.  Anything this path cannot
- * serve safely goes back to the stripe cache.  v1: classic layouts only.
+ * serve safely goes back to the stripe cache.  Classic layouts and
+ * declustered layouts in a steady spare state are served here; anything
+ * else (reshape, a live population/copy-back session, native checksum, a
+ * write journal or PPL) falls back to the stripe cache.
  */
 struct raidkm_row_src {
 	struct md_rdev	*rdev;
@@ -9203,6 +9206,50 @@ static bool raidkm_row_member_ok(struct md_rdev *rdev, sector_t a0, sector_t a1)
 	       (test_bit(In_sync, &rdev->flags) || rdev->recovery_offset >= a1);
 }
 
+/*
+ * Generator row i (data index i, or k + parity index) -> the member that
+ * holds it for this row.  Classic: the row's parity starts at slot pd and
+ * data index d sits at slot pd+m+d.  Declustered: parity sits at the group
+ * tail, so the in-group slot IS i, and the member is that slot's mapped
+ * pool disk after the READ-side redirect chain (same map the aligned-read
+ * bypass and the stripe path's endio lookups use).
+ */
+static struct md_rdev *raidkm_row_member(struct r5conf *conf, sector_t logical,
+					 sector_t msect, int pd, int k, int m,
+					 int i)
+{
+	int n = conf->raid_disks;
+	int slot;
+
+	if (conf->dcl)
+		return conf->disks[raidkm_dcl_read_pdisk(conf, logical, msect,
+							 i)].rdev;
+	slot = i < k ? (pd + m + i) % n : (pd + i - k) % n;
+	return conf->disks[slot].rdev;
+}
+
+/*
+ * Declustered arrays are eligible only while every spare assignment is in a
+ * STEADY state: NONE (no redirect) or POPULATED (redirect is a constant).
+ * POPULATING and COPYING resolve per row against conf->reb_mark, which moves
+ * under us while the member reads are in flight, so those sessions stay on
+ * the stripe path (the population/copy-back paths themselves are phases 3-4
+ * of the IU plan).
+ */
+static bool raidkm_row_dcl_steady(struct r5conf *conf)
+{
+	int nreb = smp_load_acquire(&conf->nreb);	/* pairs with arm */
+	int i;
+
+	for (i = 0; i < nreb; i++) {
+		int st = READ_ONCE(conf->reb[i].state);
+
+		if (st != RKDCL_ASSIGN_NONE && st != RKDCL_ASSIGN_POPULATED)
+			return false;
+	}
+	return true;
+}
+
 /* serve a one-chunk read whose member is missing; 0 = not served */
 static int raidkm_row_dread_one(struct mddev *mddev, struct bio *raid_bio)
 {
@@ -9210,9 +9257,11 @@ static int raidkm_row_dread_one(struct mddev *mddev, struct bio *raid_bio)
 	int n = conf->raid_disks, m = conf->m, k = n - m;
 	struct raidkm_row_read *rr;
 	struct raidkm_row_bucket *b;
+	sector_t logical = raid_bio->bi_iter.bi_sector;
 	sector_t msect, a0, a1, row;
 	unsigned int len, order;
-	int dd_idx, pd, target, i, nsrc = 0, seq;
+	struct md_rdev *tgt;
+	int dd_idx, pd, target, group = 0, i, nsrc = 0, seq;
 	bool did_inc;
 
 	if (!in_chunk_boundary(mddev, raid_bio))
@@ -9220,20 +9269,33 @@ static int raidkm_row_dread_one(struct mddev *mddev, struct bio *raid_bio)
 	seq = read_seqcount_begin(&conf->gen_lock);
 	if (conf->reshape_progress != MaxSector)
 		return 0;
-	msect = raid5_compute_sector(conf, raid_bio->bi_iter.bi_sector, 0,
-				     &dd_idx, NULL);
-	if (read_seqcount_retry(&conf->gen_lock, seq))
-		return 0;
-
-	/* the row's parity starts at slot pd; data index d sits at pd+m+d */
-	row = msect >> ilog2(conf->chunk_sectors);
-	pd = conf->rotating ? n - 1 - (int)sector_div(row, n) : k;
-	target = (dd_idx - pd - m + 2 * n) % n;
+	msect = raid5_compute_sector(conf, logical, 0, &dd_idx, NULL);
+	if (conf->dcl) {
+		/* per-group code word; dd_idx is the in-group slot */
+		k = conf->dcl->k;
+		m = conf->dcl->m;
+		pd = k;
+		target = dd_idx;
+		group = raidkm_dcl_group_of(conf, logical, 0);
+	} else {
+		/* the row's parity starts at slot pd; data index d sits at
+		 * pd+m+d */
+		row = msect >> ilog2(conf->chunk_sectors);
+		pd = conf->rotating ? n - 1 - (int)sector_div(row, n) : k;
+		target = (dd_idx - pd - m + 2 * n) % n;
+	}
 	a0 = msect & ~((sector_t)RAIDKM_PAGE_SECTORS - 1);
 	a1 = round_up(msect + bio_sectors(raid_bio),
 		      (sector_t)RAIDKM_PAGE_SECTORS);
 	len = (a1 - a0) << 9;
-	if (target >= k || raidkm_row_member_ok(conf->disks[dd_idx].rdev, a0, a1))
+	if (target >= k)
+		return 0;
+	/* the target's member (and, on a declustered array, every source's)
+	 * is mapped under the same seqcount window as the sector itself */
+	tgt = raidkm_row_member(conf, logical, msect, pd, k, m, target);
+	if (read_seqcount_retry(&conf->gen_lock, seq))
+		return 0;
+	if (raidkm_row_member_ok(tgt, a0, a1))
 		return 0;	/* member present: bypass or stripe cache */
 
 	rr = kzalloc(struct_size(rr, src, k), GFP_NOIO);
@@ -9242,8 +9304,8 @@ static int raidkm_row_dread_one(struct mddev *mddev, struct bio *raid_bio)
 	rr->k = k;
 	rr->m = m;
 	for (i = 0; i < k + m && nsrc < k; i++) {
-		int slot = i < k ? (pd + m + i) % n : (pd + i - k) % n;
-		struct md_rdev *rdev = conf->disks[slot].rdev;
+		struct md_rdev *rdev = raidkm_row_member(conf, logical, msect,
+							 pd, k, m, i);
 
 		if (i == target || !raidkm_row_member_ok(rdev, a0, a1))
 			continue;
@@ -9259,7 +9321,7 @@ static int raidkm_row_dread_one(struct mddev *mddev, struct bio *raid_bio)
 	if (nsrc < k)
 		goto decline;
 
-	b = raidkm_row_bucket(conf, msect, 0);
+	b = raidkm_row_bucket(conf, msect, group);
 	rr->gen0 = atomic_read(&b->gen);
 	if (atomic_read(&b->inflight))
 		goto decline;		/* hot row: leave it to the stripe cache */
@@ -9346,9 +9408,11 @@ static struct bio *raidkm_row_read(struct mddev *mddev, struct bio *raid_bio)
 	unsigned int sectors = chunk_sects - (sector & (chunk_sects - 1));
 	struct bio *split;
 
-	if (conf->dcl || conf->csum || raid5_has_log(conf) ||
+	if (conf->csum || raid5_has_log(conf) ||
 	    raid5_has_ppl(conf) || mddev->degraded > conf->m ||
 	    conf->raid_disks > RAIDKM_MAX_STRIPE_DISKS)
+		return raid_bio;
+	if (conf->dcl && !raidkm_row_dcl_steady(conf))
 		return raid_bio;
 
 	if (sectors < bio_sectors(raid_bio)) {

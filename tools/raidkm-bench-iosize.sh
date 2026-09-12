@@ -370,6 +370,12 @@ for spec in $ARMS; do
 		log "$spec: could not set stripe_cache_size=$SCS"; }
 	# guarded: under set -u an empty array expansion aborts on bash < 4.4
 	for attr in ${MD_ATTRS[@]+"${MD_ATTRS[@]}"}; do
+		# an attribute this engine does not have (e.g. a raidkm knob on a
+		# raid6 arm) is skipped, so one --md-attr can span mixed arm lists
+		if [ ! -e "/sys/block/$MDNAME/md/${attr%%=*}" ]; then
+			log "$spec: no ${attr%%=*} on this engine, skipped"
+			continue
+		fi
 		echo "${attr#*=}" > "/sys/block/$MDNAME/md/${attr%%=*}" ||
 			die "$spec: could not set ${attr%%=*}=${attr#*=}"
 	done

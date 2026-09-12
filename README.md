@@ -547,7 +547,7 @@ chunk, 1 MiB sequential I/O; the rig reproduces an NVMe-oF QLC array's table):
 |---|---|
 | healthy and degraded full-row writes, m=2 (classic or declustered) | ~123–128 KiB |
 | full-row writes, **m ≥ 3** | **~5 KiB** — full-row batching is off above m=2 |
-| degraded reads (classic / declustered) | **~5 KiB / ~6 KiB** |
+| degraded reads (classic / declustered) | **~5 KiB / ~6 KiB** — 128 KiB with `rk_row_dread=1` |
 | rebuild onto a spare: survivor reads / spare writes | **~5 KiB / ~7 KiB** |
 | declustered population: survivor reads / spare-column writes | **~5.5 KiB / ~7 KiB** |
 | declustered copy back to a replacement | ~128 KiB |
@@ -557,8 +557,32 @@ stock raid6, and with worker groups enabled those units reach the members out
 of order, so the block layer cannot merge them.  With `group_thread_cnt=0` the
 same rebuild merges to ~120–125 KiB on both engines — but runs on one thread,
 about 2.5–3× slower on a CPU-bound rig; degraded reads improve only to
-~7–10 KiB.  Chunk-sized rebuild and degraded read are being worked on.  Until
-then, on large-IU flash:
+~7–10 KiB.
+
+**`rk_row_dread` — chunk-sized degraded reads (opt-in).**  Writing 1 to
+`/sys/block/mdX/md/rk_row_dread` (or loading raidkm with
+`default_row_dread=1`) serves a degraded read that lies inside one chunk by
+reading that range once from each of the k surviving members and decoding it in
+a single pass, instead of driving 32 × 4 KiB stripe heads through the worker
+pool.  Measured on the same rig (8+2, 128 KiB chunk, 1 MiB sequential reads,
+100 µs member latency, `group_thread_cnt=8`):
+
+| arm | member request size | degraded read | share of healthy read | busy cores |
+|---|---|---|---|---|
+| stock raid6 | 4.8 KiB | 10.4 GB/s | 24% | 10.1 |
+| raidkm, knob off | 4.8 KiB | 9.0 GB/s | 21% | 9.7 |
+| raidkm, knob on | **128 KiB** | **23.3 GB/s** | **54%** | 5.0 |
+| declustered, knob off | 5.7 KiB | 9.2 GB/s | 22% | 9.7 |
+| declustered, knob on | **128 KiB** | **24.7 GB/s** | **59%** | 4.9 |
+
+It is off by default while it collects field evidence.  Anything it cannot
+serve safely falls back to the stripe cache unchanged: native-checksum arrays,
+an attached write journal or PPL, a reshape in progress, more than m missing
+members, a read racing a write to the same row, and — on a declustered array —
+a live spare population or copy-back session.  Rebuild and population are
+still 4 KiB (next in the same work).
+
+Until chunk-sized rebuild lands, on large-IU flash:
 
 - **chunk = a power-of-two multiple of the IU, with room to grow** — 128 KiB
   covers 16, 32 and 64 KiB units; with `k=8` that is a 1 MiB row;
