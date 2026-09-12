@@ -547,7 +547,7 @@ chunk, 1 MiB sequential I/O; the rig reproduces an NVMe-oF QLC array's table):
 |---|---|
 | healthy and degraded full-row writes, m=2 (classic or declustered) | ~123–128 KiB |
 | full-row writes, **m ≥ 3** | **~5 KiB** — full-row batching is off above m=2 |
-| degraded reads (classic / declustered) | **~5 KiB / ~6 KiB** — 128 KiB with `rk_row_dread=1` |
+| degraded reads (classic / declustered) | **128 KiB** (`rk_row_dread`, on by default) |
 | rebuild onto a spare: survivor reads / spare writes | **~5 KiB / ~7 KiB** |
 | declustered population: survivor reads / spare-column writes | **~5.5 KiB / ~7 KiB** |
 | declustered copy back to a replacement | ~128 KiB |
@@ -559,28 +559,46 @@ same rebuild merges to ~120–125 KiB on both engines — but runs on one thread
 about 2.5–3× slower on a CPU-bound rig; degraded reads improve only to
 ~7–10 KiB.
 
-**`rk_row_dread` — chunk-sized degraded reads (opt-in).**  Writing 1 to
-`/sys/block/mdX/md/rk_row_dread` (or loading raidkm with
-`default_row_dread=1`) serves a degraded read that lies inside one chunk by
-reading that range once from each of the k surviving members and decoding it in
-a single pass, instead of driving 32 × 4 KiB stripe heads through the worker
-pool.  Measured on the same rig (8+2, 128 KiB chunk, 1 MiB sequential reads,
-100 µs member latency, `group_thread_cnt=8`):
+**`rk_row_dread` — chunk-sized degraded reads (on by default).**  A degraded
+read that lies inside one chunk is served by reading that range once from each
+of the k surviving members and decoding it in a single pass, instead of driving
+32 × 4 KiB stripe heads through the worker pool.  It reads k members, not
+k + 1, and never touches the worker pool.  `/sys/block/mdX/md/rk_row_dread`
+turns it off per array (`0`), and the module parameter `default_row_dread=N`
+makes new arrays start with it off.  Measured on the rig (8+2, 128 KiB chunk,
+100 µs member latency, `group_thread_cnt=8`, degraded array):
 
-| arm | member request size | degraded read | share of healthy read | busy cores |
-|---|---|---|---|---|
-| stock raid6 | 4.8 KiB | 10.4 GB/s | 24% | 10.1 |
-| raidkm, knob off | 4.8 KiB | 9.0 GB/s | 21% | 9.7 |
-| raidkm, knob on | **128 KiB** | **23.3 GB/s** | **54%** | 5.0 |
-| declustered, knob off | 5.7 KiB | 9.2 GB/s | 22% | 9.7 |
-| declustered, knob on | **128 KiB** | **24.7 GB/s** | **59%** | 4.9 |
+| workload | member request size, off → on | throughput, off → on | busy cores |
+|---|---|---|---|
+| 1 MiB sequential read | 4.8 KiB → **128 KiB** | 9.0 → **23.3 GB/s** (21% → **54%** of healthy) | 9.7 → 5.0 |
+| 64 KiB random read | 10.2 KiB → **64 KiB** | 2.9 → **12.6 GB/s** | 9.4 → 3.9 |
+| 16 KiB random read | 10.5 KiB → **16 KiB** | 1.8 → **3.8 GB/s** | 6.2 → 2.4 |
+| 4 KiB random read | 4.0 → 4.0 KiB | 684 → **984 MiB/s** | 3.1 → 1.8 |
+| 4 KiB random 70/30 mixed | 4.0 → 4.0 KiB | 491 → **621 MiB/s** | 3.2 → 2.9 |
 
-It is off by default while it collects field evidence.  Anything it cannot
-serve safely falls back to the stripe cache unchanged: native-checksum arrays,
-an attached write journal or PPL, a reshape in progress, more than m missing
-members, a read racing a write to the same row, and — on a declustered array —
-a live spare population or copy-back session.  Rebuild and population are
-still 4 KiB (next in the same work).
+Stock raid6 on the same rig reads 4.8 KiB at 10.4 GB/s (24% of healthy) in the
+sequential case.  A declustered array (8+2 groups over a 12-disk pool) behaves
+the same as the classic one within a few percent at every point above.  Below
+the chunk size the row layer does not change the request size — it wins there
+by reading one fewer member and skipping the stripe-head machinery.
+
+Anything it cannot serve safely falls back to the stripe cache unchanged:
+native-checksum arrays, an attached write journal or PPL, a reshape in
+progress, more than m missing members, a read racing a write to the same row,
+a failed buffer allocation, and — on a declustered array — a live spare
+population or copy-back session.  Rebuild and population are still 4 KiB (next
+in the same work).
+
+Validation behind the default: the degraded, replace and declustered suites
+plus gated race harnesses (concurrent 4 KiB read-modify-writes into the rows
+being decoded, with a checker proven able to fail and stock-md control arms) on
+a KASAN + lockdep kernel — clean over ~58,000 decodes and ~530 raced fallbacks;
+and a build with half of the row layer's buffer allocations forced to fail,
+where 8,410 declines fell back to the stripe cache and every byte still
+verified.  Not yet covered: real large-IU flash — every number here is from a
+memory-backed rig with a latency model.  If you hit a case where the stripe
+path is better, `echo 0 > /sys/block/mdX/md/rk_row_dread` is the switch, and
+please report it.
 
 Until chunk-sized rebuild lands, on large-IU flash:
 

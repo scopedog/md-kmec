@@ -160,10 +160,10 @@ module_param(default_stripe_cache_size, int, 0644);
 MODULE_PARM_DESC(default_stripe_cache_size,
 		 "Initial stripe_cache_size for new arrays (-1 = auto: 1024 stripes, capped at a 128 MiB cache and never below 256; 0 = the stock 256 start; N = N stripes).");
 
-static bool default_row_dread;
+static bool default_row_dread = true;
 module_param(default_row_dread, bool, 0644);
 MODULE_PARM_DESC(default_row_dread,
-		 "Initial rk_row_dread for new arrays: serve degraded reads through the row layer (default N).");
+		 "Initial rk_row_dread for new arrays: serve degraded reads through the row layer (default Y; N restores the 4 KiB stripe-cache path).");
 
 /*
  * Row layer.  A row is one chunk-sized band at the same member offset across a

@@ -30,6 +30,10 @@
 #                       copyback  declustered only: copy onto a replacement once populated
 #   --runtime=SEC     seconds per state (default 20)
 #   --bs=SIZE         fio block size for the sequential states (default 1M)
+#   --rw=PATTERN      fio access pattern for EVERY state that runs fio, e.g.
+#                     randread or randrw (default: read for the *_read states,
+#                     write for the *_write states).  Pick states to match.
+#   --rwmix=N         read share for a mixed --rw pattern (default 70)
 #   --jobs=N          fio jobs, each in its own row-aligned region (default 4)
 #   --region=SIZE     target size of each job's region, rounded down to whole
 #                     rows (default 4G)
@@ -70,6 +74,8 @@ ARMS="raid6:8+2,raidkm:8+2"
 STATES="healthy_write,healthy_read,degraded_write,degraded_read,rebuild,copyback"
 RUNTIME=20
 BS=1M
+RW=
+RWMIX=70
 JOBS=4
 REGION=4G
 CHUNK=128
@@ -97,6 +103,8 @@ for arg in "$@"; do
 	--states=*)     STATES="${arg#*=}" ;;
 	--runtime=*)    RUNTIME="${arg#*=}" ;;
 	--bs=*)         BS="${arg#*=}" ;;
+	--rw=*)         RW="${arg#*=}" ;;
+	--rwmix=*)      RWMIX="${arg#*=}" ;;
 	--jobs=*)       JOBS="${arg#*=}" ;;
 	--region=*)     REGION="${arg#*=}" ;;
 	--chunk=*)      CHUNK="${arg#*=}" ;;
@@ -248,7 +256,11 @@ snap_all() {
 
 run_fio() {	# rw -> MiB/s
 	local j="$OUTPUT/fio-$ARMNAME-$STATE.json"
-	fio --name=w --filename="$MD" --rw="$1" --bs="$BS" --iodepth=8 --numjobs="$JOBS" \
+	local rw="${RW:-$1}" mix=()
+	# a mixed pattern needs the read share; plain read/write ignore it
+	case "$rw" in *rw) mix=(--rwmixread="$RWMIX") ;; esac
+	fio --name=w --filename="$MD" --rw="$rw" --bs="$BS" --iodepth=8 --numjobs="$JOBS" \
+	    "${mix[@]}" \
 	    --size="$SPAN" --offset_increment="$SPAN" --direct=1 --ioengine=libaio \
 	    --time_based --runtime="$RUNTIME" --group_reporting \
 	    --output-format=json --output="$j" >/dev/null 2>&1
@@ -382,6 +394,7 @@ for spec in $ARMS; do
 	module=$( [ "$eng" = raid5 ] || [ "$eng" = raid6 ] && modinfo -n raid456 ||
 		  { [ -f "$RAIDKM_KO" ] && echo "$RAIDKM_KO" || modinfo -n raidkm; } )
 	log "arm $spec: level=$(cat /sys/block/$MDNAME/md/level) disks=$pool row=$((ROW / 1024)) KiB ($align)" \
+	    "bs=$BS${RW:+ rw=$RW}" \
 	    "gtc=$(cat /sys/block/$MDNAME/md/group_thread_cnt) skip_copy=$(cat /sys/block/$MDNAME/md/skip_copy 2>/dev/null) module=$module"
 
 	for STATE in $STATES; do
