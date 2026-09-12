@@ -548,8 +548,8 @@ chunk, 1 MiB sequential I/O; the rig reproduces an NVMe-oF QLC array's table):
 | healthy and degraded full-row writes, m=2 (classic or declustered) | ~123–128 KiB |
 | full-row writes, **m ≥ 3** | **~5 KiB** — full-row batching is off above m=2 |
 | degraded reads (classic / declustered) | **128 KiB** (`rk_row_dread`, on by default) |
-| rebuild onto a spare: survivor reads / spare writes | **~5 KiB / ~7 KiB** |
-| declustered population: survivor reads / spare-column writes | **~5.5 KiB / ~7 KiB** |
+| rebuild onto a spare: survivor reads / spare writes | **128 KiB / 128 KiB** with `rk_row_rebuild=1` (~5 / ~7 KiB without) |
+| declustered population: survivor reads / spare-column writes | ~25 / ~49 KiB with `rk_bio_sort=2` (~5.5 / ~8 KiB without) |
 | declustered copy back to a replacement | ~128 KiB |
 
 Degraded reads and rebuild go through 4 KiB stripe units on both raidkm and
@@ -557,7 +557,7 @@ stock raid6, and with worker groups enabled those units reach the members out
 of order, so the block layer cannot merge them.  With `group_thread_cnt=0` the
 same rebuild merges to ~120–125 KiB on both engines — but runs on one thread,
 about 2.5–3× slower on a CPU-bound rig; degraded reads improve only to
-~7–10 KiB.
+~7–10 KiB.  Two knobs replace that trade-off; both are off by default.
 
 **`rk_row_dread` — chunk-sized degraded reads (on by default).**  A degraded
 read that lies inside one chunk is served by reading that range once from each
@@ -600,7 +600,39 @@ memory-backed rig with a latency model.  If you hit a case where the stripe
 path is better, `echo 0 > /sys/block/mdX/md/rk_row_dread` is the switch, and
 please report it.
 
-Until chunk-sized rebuild lands, on large-IU flash:
+**`rk_row_rebuild` — rebuild a whole row at a time (opt-in).**  Writing 1 to
+`/sys/block/mdX/md/rk_row_rebuild` (or `default_row_rebuild=1` at module load)
+recovers a failed member one chunk-aligned row per operation: the k survivors
+are read once each at chunk size, decoded once, and the member being rebuilt is
+written once — instead of 32 stripe heads of 4 KiB per row.  The row's stripes
+are held for the duration, so a foreground write to that row waits and retries;
+a row that already has I/O in flight is left to the stripe cache instead, so a
+rebuild never blocks foreground I/O.  Measured on the rig (8+2, 128 KiB chunk,
+100 µs member latency, `group_thread_cnt=8`):
+
+| rebuild | survivor reads | spare writes | rate | busy cores |
+|---|---|---|---|---|
+| stripe path | 5.2 KiB | 7.4 KiB | 743 MiB/s | 7.6 |
+| `rk_row_rebuild=1` | **128 KiB** | **128 KiB** | **1284 MiB/s** | **1.8** |
+
+It covers classic layouts only: a declustered population, native checksum, an
+attached log or PPL, a live reshape, a second missing member and
+replacement-device rebuilds all keep the stripe path.  `rk_row_stats` reports
+`rebuild_done` and `rebuild_declined`.
+
+**`rk_bio_sort` — order the resync/recovery submissions (opt-in).**  raid5 can
+collect a handled stripe's member bios and submit them in stripe-sector order,
+but upstream only does so when every member is rotational, which switches it
+off on all flash.  `rk_bio_sort` makes that a choice: `0` off, `1` writes
+(upstream's rule), `2` resync/recovery stripes only — reads included.  Mode 2
+is the useful one on flash: it lifts the paths `rk_row_rebuild` does not cover,
+notably **declustered population** (survivor reads ~6 → 25 KiB, spare-column
+writes ~8 → 49 KiB, +11% rate), with foreground I/O unchanged.  Mode 1 costs
+~35% of healthy sequential write throughput, because those writes already reach
+the members at 127 KiB and only pay the added latency — do not use it on flash.
+`default_bio_sort` sets it for new arrays.
+
+On large-IU flash:
 
 - **chunk = a power-of-two multiple of the IU, with room to grow** — 128 KiB
   covers 16, 32 and 64 KiB units; with `k=8` that is a 1 MiB row;

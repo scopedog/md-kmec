@@ -575,6 +575,9 @@ enum {
 	STRIPE_R5C_PREFLUSH,	/* need to flush journal device */
 	STRIPE_ROW_GUARD,	/* row layer: this ops_run_io call holds a
 				 * guard on the stripe's row write count */
+	STRIPE_ROW_SYNC,	/* row layer: a row rebuild owns this stripe's
+				 * chunk — new writes bounce on R5_Overlap
+				 * until it clears (raidkm_row_rebuild_chunk) */
 };
 
 #define STRIPE_EXPAND_SYNC_FLAGS \
@@ -739,6 +742,10 @@ enum r5_cache_state {
 				 */
 };
 
+#define RK_BIO_SORT_OFF		0	/* submit as each stripe is handled */
+#define RK_BIO_SORT_WRITES	1	/* collect writes, submit in order */
+#define RK_BIO_SORT_SYNC	2	/* ... resync/recovery stripes only */
+
 #define PENDING_IO_MAX 512
 #define PENDING_IO_ONE_FLUSH 128
 struct r5pending_data {
@@ -893,6 +900,9 @@ struct r5conf {
 	atomic64_t		row_dread_bypass;	/* member healthy: bypass */
 	atomic64_t		row_dread_raced;	/* raced a write or failed: stripe cache */
 	atomic64_t		row_dread_declined;	/* not eligible: stripe cache */
+	int			row_rebuild;		/* sysfs rk_row_rebuild */
+	atomic64_t		row_rebuild_done;	/* rows rebuilt as one chunk */
+	atomic64_t		row_rebuild_declined;	/* rows left to the stripe cache */
 	atomic_t		pending_full_writes; /* full write backlog */
 	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */
@@ -1089,7 +1099,9 @@ struct r5conf {
 	void			*log_private;
 
 	spinlock_t		pending_bios_lock;
-	bool			batch_bio_dispatch;
+	/* rk_bio_sort: RK_BIO_SORT_{OFF,WRITES,SYNC} — how member bios are
+	 * submitted.  Named batch_bio_dispatch upstream, where it is a bool. */
+	int			batch_bio_dispatch;
 	struct r5pending_data	*pending_data;
 	struct list_head	free_list;
 	struct list_head	pending_list;

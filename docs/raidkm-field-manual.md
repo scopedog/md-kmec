@@ -848,13 +848,26 @@ everything else is already default or automatic.
 
 **Flash with a large indirection unit (QLC).** A write below the drive's IU
 (16, 32 or 64 KiB) makes the drive rewrite the whole unit, so check the request
-size that reaches the members, not just throughput. Today full-row writes at
-m=2 reach the members at ~123–128 KiB, but full-row writes at m ≥ 3, degraded
-reads and rebuild reach them at ~5–8 KiB. On such drives: chunk a power-of-two
-multiple of the IU (128K), m=2 for now, no `--write-journal` or PPL (either
-turns off full-row batching), the filesystem journal on a device that is not
-QLC, and namespaces/partitions on an IU boundary. `tools/raidkm-bench-iosize.sh`
-measures it per I/O state; the benchmarks report it per workload.
+size that reaches the members, not just throughput. Full-row writes at m=2
+reach the members at ~123–128 KiB, and degraded reads at 128 KiB (the row
+layer, `rk_row_dread`, on by default). Still small without opt-in knobs:
+full-row writes at m ≥ 3 (~5 KiB), rebuild (~5/7 KiB) and declustered
+population (~5.5/8 KiB).
+
+- `rk_row_rebuild=1` rebuilds a whole row at a time — 128 KiB survivor reads
+  and a 128 KiB write to the member being rebuilt, 1284 vs 743 MiB/s on the
+  rig, a quarter of the CPU. Classic layouts only; anything else keeps the
+  stripe path, and a row with foreground I/O in flight is skipped rather than
+  blocked.
+- `rk_bio_sort=2` orders the resync/recovery submissions instead, which is what
+  lifts **declustered population** (~25/49 KiB, +11%). Mode `1` (upstream's
+  "all writes") costs ~35% of healthy sequential write — do not use it here.
+
+Both default off. On such drives: chunk a power-of-two multiple of the IU
+(128K), m=2 for now, no `--write-journal` or PPL (either turns off full-row
+batching), the filesystem journal on a device that is not QLC, and
+namespaces/partitions on an IU boundary. `tools/raidkm-bench-iosize.sh`
+measures request size per I/O state; the benchmarks report it per workload.
 
 ```sh
 cat /sys/block/md70/queue/optimal_io_size    # = k × chunk; mkfs.ext4 picks this up unaided
