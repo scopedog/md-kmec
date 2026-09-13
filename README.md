@@ -546,7 +546,7 @@ chunk, 1 MiB sequential I/O; the rig reproduces an NVMe-oF QLC array's table):
 | state | request size at the members |
 |---|---|
 | healthy and degraded full-row writes, m=2 (classic or declustered) | ~123–128 KiB |
-| full-row writes, **m ≥ 3** | **~5 KiB** — full-row batching is off above m=2 |
+| full-row writes, **m ≥ 3** | **127 KiB** with `rk_batch_mparity=1` (~5 KiB without) |
 | degraded reads (classic / declustered) | **128 KiB** (`rk_row_dread`, on by default) |
 | rebuild onto a spare: survivor reads / spare writes | **128 KiB / 128 KiB** with `rk_row_rebuild=1` (~5 / ~7 KiB without) |
 | declustered population: survivor reads / spare-column writes | ~25 / ~49 KiB with `rk_bio_sort=2` (~5.5 / ~8 KiB without) |
@@ -632,12 +632,32 @@ writes ~8 → 49 KiB, +11% rate), with foreground I/O unchanged.  Mode 1 costs
 the members at 127 KiB and only pay the added latency — do not use it on flash.
 `default_bio_sort` sets it for new arrays.
 
+**`rk_batch_mparity` — batch full-row writes at m ≥ 3 (opt-in).**  Above m=2,
+`stripe_can_batch()` refuses to batch, so a full-row write reaches the members
+at ~5 KiB instead of ~127 KiB — 30× the requests, while the array is *healthy*.
+The refusal was deliberate: the m>2 parity compute is synchronous, so batching
+buys no pipelining, and an early measurement on ramdisks without GFNI made it
+1.8× slower.  On the current build that cost is gone.  Measured (128 KiB chunk,
+100 µs member latency, `group_thread_cnt=8`, 1 MiB writes):
+
+| arm | member request size | throughput | busy cores |
+|---|---|---|---|
+| 8+3 healthy write | 5.4 → **127.3 KiB** | 6370 → 6278 MiB/s (−1.4%) | **9.6 → 4.6** |
+| 8+3 degraded write | 5.1 → **128.0 KiB** | 6522 → 6781 MiB/s (+4%) | **9.5 → 4.7** |
+| 7+3 healthy write | 5.8 → 10.1 KiB | 5028 → 6563 MiB/s (+31%) | 8.6 → 9.7 |
+
+The 7+3 row is alignment, not batching: seven data disks make an 896 KiB row,
+so 1 MiB writes straddle rows and merge poorly either way — keep `k × chunk`
+equal to the application's I/O size and the effect disappears.  Off by default
+until a real-device A/B confirms it; on large-IU flash with an aligned geometry,
+turn it on.
+
 On large-IU flash:
 
 - **chunk = a power-of-two multiple of the IU, with room to grow** — 128 KiB
   covers 16, 32 and 64 KiB units; with `k=8` that is a 1 MiB row;
 - **keep `k × chunk` equal to the application's large I/O size** (item 1 above);
-- **use m=2** for now;
+- **m ≥ 3 needs `rk_batch_mparity=1`** (or stay at m=2);
 - **no `--write-journal` and no PPL** — an attached md log or PPL turns off
   full-row batching, which brings back ~5 KiB member writes even at m=2;
 - **external filesystem journal on a device that is not QLC** — a mirror or an

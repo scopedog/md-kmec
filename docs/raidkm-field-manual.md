@@ -852,7 +852,7 @@ size that reaches the members, not just throughput. Full-row writes at m=2
 reach the members at ~123–128 KiB, and degraded reads at 128 KiB (the row
 layer, `rk_row_dread`, on by default). Still small without opt-in knobs:
 full-row writes at m ≥ 3 (~5 KiB), rebuild (~5/7 KiB) and declustered
-population (~5.5/8 KiB).
+population (~5.5/8 KiB).  Three knobs, all off by default, fix those:
 
 - `rk_row_rebuild=1` rebuilds a whole row at a time — 128 KiB survivor reads
   and a 128 KiB write to the member being rebuilt, 1284 vs 743 MiB/s on the
@@ -862,6 +862,10 @@ population (~5.5/8 KiB).
 - `rk_bio_sort=2` orders the resync/recovery submissions instead, which is what
   lifts **declustered population** (~25/49 KiB, +11%). Mode `1` (upstream's
   "all writes") costs ~35% of healthy sequential write — do not use it here.
+- `rk_batch_mparity=1` batches full-row writes at m ≥ 3: 8+3 healthy write
+  5.4 → 127 KiB for ~1% throughput and half the CPU. Needs an aligned geometry
+  (`k × chunk` = the application's I/O size); at 7+3 the row is 896 KiB and
+  1 MiB writes straddle it, so the size only reaches ~10 KiB.
 
 Both default off. On such drives: chunk a power-of-two multiple of the IU
 (128K), m=2 for now, no `--write-journal` or PPL (either turns off full-row

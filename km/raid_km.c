@@ -165,6 +165,11 @@ module_param(default_bio_sort, int, 0644);
 MODULE_PARM_DESC(default_bio_sort,
 		 "Collect member bios and submit them in stripe-sector order (sysfs rk_bio_sort) for new arrays: -1 = auto (writes only, on rotational members, as upstream), 0 = off, 1 = writes, 2 = resync/recovery stripes only (reads and writes).");
 
+static bool default_batch_mparity;
+module_param(default_batch_mparity, bool, 0644);
+MODULE_PARM_DESC(default_batch_mparity,
+		 "Initial rk_batch_mparity for new arrays: batch full-row writes at m > 2, trading CPU for member request size (default N).");
+
 static bool default_row_rebuild;
 module_param(default_row_rebuild, bool, 0644);
 MODULE_PARM_DESC(default_row_rebuild,
@@ -1644,8 +1649,19 @@ static bool stripe_can_batch(struct stripe_head *sh)
 	 * m == 2 is exempt: its parity compute routes through the stock
 	 * async_gen_syndrome (raid6_call) fast path, which IS async/DMA-
 	 * pipelinable, so batching pays off exactly as it does for stock
-	 * raid6.  Only gate out m > 2 here. */
-	if (is_raidkm(conf) && conf->m > 2)
+	 * raid6.  Only gate out m > 2 here.
+	 *
+	 * The other side of that trade is request SIZE: unbatched, an m > 2
+	 * full-row write reaches the members at ~5 KiB instead of ~123 KiB
+	 * (30x the requests), which on flash with a large indirection unit
+	 * means the drive rewrites a whole unit per request -- in NORMAL
+	 * operation, not just while degraded.  Which side wins depends on the
+	 * members: on a CPU-bound rig batching costs 22-27% throughput, on
+	 * large-IU flash the request count should dominate.  So it is a knob
+	 * (sysfs rk_batch_mparity), off by default until a real-device A/B
+	 * says otherwise. */
+	if (is_raidkm(conf) && conf->m > 2 &&
+	    !READ_ONCE(conf->batch_mparity))
 		return false;
 	return test_bit(STRIPE_BATCH_READY, &sh->state) &&
 		!test_bit(STRIPE_BITMAP_PENDING, &sh->state) &&
@@ -15112,6 +15128,48 @@ raidkm_row_rebuild_entry = __ATTR(rk_row_rebuild, S_IRUGO | S_IWUSR,
 				  raidkm_row_rebuild_store);
 
 static ssize_t
+raidkm_batch_mparity_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	int ret = 0;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf)
+		ret = sprintf(page, "%d\n", READ_ONCE(conf->batch_mparity));
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+static ssize_t
+raidkm_batch_mparity_store(struct mddev *mddev, const char *page, size_t len)
+{
+	struct r5conf *conf;
+	unsigned long new;
+	int err;
+
+	if (len >= PAGE_SIZE || kstrtoul(page, 10, &new) || new > 1)
+		return -EINVAL;
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf)
+		err = -ENODEV;
+	else
+		/* stripe_can_batch() reads it per stripe; a change takes
+		 * effect on the next write, mixed batching is harmless */
+		WRITE_ONCE(conf->batch_mparity, !!new);
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_batch_mparity_entry = __ATTR(rk_batch_mparity, S_IRUGO | S_IWUSR,
+				    raidkm_batch_mparity_show,
+				    raidkm_batch_mparity_store);
+
+static ssize_t
 raidkm_row_stats_show(struct mddev *mddev, char *page)
 {
 	struct r5conf *conf;
@@ -15187,6 +15245,7 @@ static struct attribute *raid5_attrs[] =  {
 	&raid5_skip_copy.attr,
 	&raidkm_row_dread_entry.attr,
 	&raidkm_row_rebuild_entry.attr,
+	&raidkm_batch_mparity_entry.attr,
 	&raidkm_row_stats_entry.attr,
 	&raidkm_bio_sort_entry.attr,
 	&raidkm_dcl_populate.attr,
@@ -15653,6 +15712,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		goto abort;
 	conf->row_dread = default_row_dread;
 	conf->row_rebuild = default_row_rebuild;
+	conf->batch_mparity = default_batch_mparity;
 	/*
 	 * Multi-threaded handle_stripe via worker groups. Stock kernel ships
 	 * disabled (cnt=0), but a probe on raid6 over tmpfs loops showed +43%

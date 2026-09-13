@@ -901,6 +901,9 @@ struct r5conf {
 	atomic64_t		row_dread_raced;	/* raced a write or failed: stripe cache */
 	atomic64_t		row_dread_declined;	/* not eligible: stripe cache */
 	int			row_rebuild;		/* sysfs rk_row_rebuild */
+	int			batch_mparity;		/* sysfs rk_batch_mparity:
+							 * batch full-row writes
+							 * at m > 2 */
 	atomic64_t		row_rebuild_done;	/* rows rebuilt as one chunk */
 	atomic64_t		row_rebuild_declined;	/* rows left to the stripe cache */
 	atomic_t		pending_full_writes; /* full write backlog */
