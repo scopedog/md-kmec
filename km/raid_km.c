@@ -165,15 +165,15 @@ module_param(default_bio_sort, int, 0644);
 MODULE_PARM_DESC(default_bio_sort,
 		 "Collect member bios and submit them in stripe-sector order (sysfs rk_bio_sort) for new arrays: -1 = auto (writes only, on rotational members, as upstream), 0 = off, 1 = writes, 2 = resync/recovery stripes only (reads and writes).");
 
-static bool default_batch_mparity;
+static bool default_batch_mparity = true;
 module_param(default_batch_mparity, bool, 0644);
 MODULE_PARM_DESC(default_batch_mparity,
-		 "Initial rk_batch_mparity for new arrays: batch full-row writes at m > 2, trading CPU for member request size (default N).");
+		 "Initial rk_batch_mparity for new arrays: batch full-row writes at m > 2, so they reach the members in chunk-sized requests (default Y; N restores per-stripe writes).");
 
-static bool default_row_rebuild;
+static bool default_row_rebuild = true;
 module_param(default_row_rebuild, bool, 0644);
 MODULE_PARM_DESC(default_row_rebuild,
-		 "Initial rk_row_rebuild for new arrays: rebuild a whole chunk at a time through the row layer (default N).");
+		 "Initial rk_row_rebuild for new arrays: rebuild a whole chunk at a time through the row layer (default Y; N restores the 4 KiB stripe-cache rebuild).");
 
 static bool default_row_dread = true;
 module_param(default_row_dread, bool, 0644);

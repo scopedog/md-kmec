@@ -1,0 +1,277 @@
+#!/bin/bash
+#
+# raidkm-test-ci.sh — one CI entry point for the raidkm (md level 71) test suites
+#
+# Runs a named tier of the suites in tools/, each against its own ramdisks and
+# /dev/md70, and reports the result the way CI systems consume it: one exit
+# status, a per-suite summary, JUnit XML, and a kernel-log scan that fails a
+# suite on any WARNING / BUG / KASAN / lockdep report even when the suite itself
+# passed.  The tier contents are owned here, so a CI job that calls this script
+# picks up new gates by updating the checkout — no job change.
+#
+# Usage:
+#   sudo bash tools/raidkm-test-ci.sh [--tier=smoke|quick|full] [options]
+#   bash tools/raidkm-test-ci.sh --list [--tier=...]
+#
+# Tiers:
+#   smoke   ~25 min.  The row layer (degraded read once per row, native
+#           checksum through the row paths), declustered population to
+#           completion, rebuild onto a spare and hot-replace (through the row
+#           layer, the default), plus the functional and degraded smoke.  Meant
+#           for every CI run.
+#   quick   smoke + the same rebuilds on the 4 KiB stripe path
+#           (replace@default_row_rebuild=0) and declustered population (~40 min).
+#   full    quick + the core regression (grow, reshape) and the declustered
+#           crash / multi-assignment suites.  Several of those stop EVERY md array
+#           on the host (mdadm --stop --scan): refused without --allow-stop-all.
+#           Run it only on a disposable machine.
+#
+# Options:
+#   --tier=NAME            smoke (default), quick or full
+#   --suites=LIST          run exactly these suites instead (comma-separated
+#                          names as in tools/raidkm-test-<name>.sh)
+#   --output=DIR           results directory (default /var/tmp/raidkm-test-ci-<timestamp>)
+#   --suite-timeout=SEC    per-suite wall-clock limit (default 2400)
+#   --allow-stop-all       permit suites that stop every md array (tier full)
+#   --allow-existing-arrays  run even though other md arrays are active.  The
+#                          smoke/quick suites only use $MD (/dev/md70) and their
+#                          own ramdisks, so this is safe for those tiers only.
+#   --keep-brd             leave the brd ramdisks loaded at the end
+#   --list                 print the suites of the tier and exit
+#   -h, --help             show this help
+#
+# Environment (passed to every suite; see raidkm-test-lib.sh):
+#   MDADM        raidkm-aware mdadm (default: resolved like the suites do)
+#   BRD_NR=16 BRD_SIZE_KB=131072 NATIVE=1 RK_RELOAD=0 — the settings the release
+#   gates pass with; override any of them in the environment.
+#
+# Needs: root, bash, the raidkm and isal_lib modules (build tree or packaged),
+# the brd module, and about 2 GiB of free memory for the ramdisks.
+#
+# Output (DIR): <suite>.log and <suite>.dmesg per suite, summary.txt, results.xml
+# (JUnit), env.txt.  Exit status: 0 only when every suite passed with a clean
+# kernel log; 1 on any failure; 2 on a pre-flight refusal.
+#
+
+set -u
+PATH="$PATH:/usr/sbin:/sbin"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window declustered-degraded replace)
+# <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
+# new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
+# 4 KiB stripe-cache rebuild that row rebuild falls back to.
+QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate)
+FULL=("${QUICK[@]}" grow grow-traditional reshape-concurrent declustered-create declustered-io
+      declustered-rebalance declustered-csum declustered-autoarm declustered-multi declustered-crash)
+# suites in FULL that run `mdadm --stop --scan` (directly or via rk_udev_quiesce)
+STOP_ALL=(declustered-multi declustered-crash)
+
+TIER=smoke
+SUITES_ARG=
+OUTPUT=
+SUITE_TIMEOUT=2400
+ALLOW_STOP_ALL=0
+ALLOW_EXISTING=0
+KEEP_BRD=0
+LIST=0
+
+usage() { sed -n '3,/^$/p' "$0" | sed 's/^# \?//'; exit 0; }
+die()   { echo "ERROR: $*" >&2; exit 2; }
+
+for arg in "$@"; do
+	case "$arg" in
+	--tier=*)                TIER="${arg#*=}" ;;
+	--suites=*)              SUITES_ARG="${arg#*=}" ;;
+	--output=*)              OUTPUT="${arg#*=}" ;;
+	--suite-timeout=*)       SUITE_TIMEOUT="${arg#*=}" ;;
+	--allow-stop-all)        ALLOW_STOP_ALL=1 ;;
+	--allow-existing-arrays) ALLOW_EXISTING=1 ;;
+	--keep-brd)              KEEP_BRD=1 ;;
+	--list)                  LIST=1 ;;
+	-h|--help)               usage ;;
+	*)                       die "unknown option: $arg (see --help)" ;;
+	esac
+done
+
+case "$TIER" in
+smoke) SUITES=("${SMOKE[@]}") ;;
+quick) SUITES=("${QUICK[@]}") ;;
+full)  SUITES=("${FULL[@]}") ;;
+*)     die "--tier must be smoke, quick or full" ;;
+esac
+[ -n "$SUITES_ARG" ] && IFS=, read -r -a SUITES <<< "$SUITES_ARG"
+[[ "$SUITE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--suite-timeout must be a positive integer"
+
+for s in "${SUITES[@]}"; do
+	[ -f "$DIR/raidkm-test-${s%%@*}.sh" ] || die "no such suite: tools/raidkm-test-${s%%@*}.sh"
+	case "$s" in
+	*@*=*) [[ "${s#*@}" =~ ^[a-z_]+=[A-Za-z0-9_-]+$ ]] || die "bad suite parameter: $s (want suite@param=value)" ;;
+	*@*)   die "bad suite parameter: $s (want suite@param=value)" ;;
+	esac
+done
+
+if [ "$LIST" = 1 ]; then
+	printf '%s\n' "${SUITES[@]}"
+	exit 0
+fi
+
+# ---- pre-flight ----------------------------------------------------------------
+
+for t in timeout dmesg lsmod modprobe; do
+	command -v "$t" >/dev/null || die "$t not found"
+done
+
+needs_stop_all=0
+for s in "${SUITES[@]}"; do
+	for x in "${STOP_ALL[@]}"; do [ "$s" = "$x" ] && needs_stop_all=1; done
+done
+[ "$needs_stop_all" = 1 ] && [ "$ALLOW_STOP_ALL" = 0 ] &&
+	die "the selected suites stop EVERY md array on this host; pass --allow-stop-all on a disposable machine"
+
+export MD="${MD:-/dev/md70}"
+active=$(awk '/^md[0-9]+ : active/ {print $1}' /proc/mdstat 2>/dev/null | grep -v -x "$(basename "$MD")" | tr '\n' ' ')
+if [ -n "$active" ] && [ "$ALLOW_EXISTING" = 0 ]; then
+	die "active md arrays on this host: ${active}— run on a dedicated test machine, or pass --allow-existing-arrays (smoke/quick only)"
+fi
+[ -n "$active" ] && [ "$needs_stop_all" = 1 ] &&
+	die "--allow-existing-arrays cannot be combined with suites that stop every array (active: $active)"
+
+[ "$(id -u)" = 0 ] || die "run as root (sudo)"
+modinfo brd >/dev/null 2>&1 || [ -e /sys/module/brd ] || [ -e /dev/ram0 ] ||
+	die "no brd (RAM disk) module: install the kernel's modules package (CONFIG_BLK_DEV_RAM=m)"
+
+# The gate settings, set BEFORE sourcing the library: it fills in its own
+# defaults (12 x 256 MiB ramdisks) for anything still unset.
+export BRD_NR="${BRD_NR:-16}" BRD_SIZE_KB="${BRD_SIZE_KB:-131072}"
+export NATIVE="${NATIVE:-1}" RK_RELOAD="${RK_RELOAD:-0}"
+
+# shellcheck source=raidkm-test-lib.sh
+. "$DIR/raidkm-test-lib.sh"
+rk_resolve_mdadm || exit 2
+export MDADM
+rk_load_modules || die "raidkm / isal_lib could not be loaded"
+
+free_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+need_kb=$(( BRD_NR * BRD_SIZE_KB + 524288 ))
+[ -n "$free_kb" ] && [ "$free_kb" -lt "$need_kb" ] &&
+	die "about $((need_kb / 1024)) MiB of free memory needed for $BRD_NR x $((BRD_SIZE_KB / 1024)) MiB ramdisks, $((free_kb / 1024)) MiB available"
+
+OUTPUT="${OUTPUT:-/var/tmp/raidkm-test-ci-$(date +%Y%m%d-%H%M%S)}"
+mkdir -p "$OUTPUT" || die "cannot create $OUTPUT"
+
+{
+	echo "date=$(date -Iseconds)"
+	echo "host=$(hostname)"
+	echo "kernel=$(uname -r)"
+	echo "tier=$TIER"
+	echo "suites=${SUITES[*]}"
+	echo "raidkm_srcversion=$(cat /sys/module/raidkm/srcversion 2>/dev/null)"
+	echo "raidkm_module=$([ -f "$RAIDKM_KO" ] && echo "$RAIDKM_KO" || modinfo -n raidkm 2>/dev/null)"
+	echo "isal_lib_srcversion=$(cat /sys/module/isal_lib/srcversion 2>/dev/null)"
+	echo "mdadm=$MDADM ($("$MDADM" --version 2>&1 | head -1))"
+	echo "tree=$(git -C "$RK_TREE" describe --always --dirty 2>/dev/null || echo "not a git checkout")"
+	command -v rpm >/dev/null && echo "packages=$(rpm -qa 'kmod-tlc-*' 'mdadm-tlc-*' 2>/dev/null | sort | tr '\n' ' ')"
+	echo "env=BRD_NR=$BRD_NR BRD_SIZE_KB=$BRD_SIZE_KB NATIVE=$NATIVE RK_RELOAD=$RK_RELOAD MD=$MD"
+} > "$OUTPUT/env.txt"
+sed 's/^/  /' "$OUTPUT/env.txt"
+echo
+
+# ---- run -----------------------------------------------------------------------
+
+SPLAT='BUG: KASAN|KASAN:|possible circular locking|inconsistent lock state|WARNING: possible|BUG: sleeping function|ODEBUG:|suspicious RCU usage|BUG: spinlock|bad unlock balance|held lock freed|WARNING: CPU|BUG: unable|Oops|kernel BUG|task .* blocked for more than'
+
+xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+
+declare -a R_NAME R_STATUS R_PASSED R_FAILED R_SECS R_NOTE
+dmesg -C 2>/dev/null
+total_start=$(date +%s)
+nfail=0
+
+for s in "${SUITES[@]}"; do
+	echo "==== $s ===="
+	f="${s//[@=]/_}"			# file-name form of the suite spec
+	pfile= pold=
+	if [[ "$s" == *@* ]]; then
+		pfile="/sys/module/raidkm/parameters/${s#*@}"; pfile="${pfile%%=*}"
+		pold=$(cat "$pfile" 2>/dev/null) || die "$s: raidkm has no module parameter ${pfile##*/}"
+		echo "${s##*=}" > "$pfile" || die "$s: cannot set ${pfile##*/}=${s##*=}"
+	fi
+	start=$(date +%s)
+	timeout --foreground --kill-after=60 "$SUITE_TIMEOUT" \
+		bash "$DIR/raidkm-test-${s%%@*}.sh" > "$OUTPUT/$f.log" 2>&1
+	rc=$?
+	secs=$(( $(date +%s) - start ))
+	[ -n "$pfile" ] && echo "$pold" > "$pfile"
+	dmesg > "$OUTPUT/$f.dmesg" 2>/dev/null
+	dmesg -C 2>/dev/null
+	line=$(grep -E "==== .*: [0-9]+ passed, [0-9]+ failed ====" "$OUTPUT/$f.log" | tail -1)
+	passed=$(sed -n 's/.*: \([0-9]*\) passed.*/\1/p' <<< "$line")
+	failed=$(sed -n 's/.* \([0-9]*\) failed.*/\1/p' <<< "$line")
+	splats=$(grep -c -E "$SPLAT" "$OUTPUT/$f.dmesg" 2>/dev/null)
+	note=""
+	status=pass
+	if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+		status=fail; note="timed out after ${SUITE_TIMEOUT}s"
+	elif [ "$rc" != 0 ]; then
+		status=fail; note="exit $rc"
+	elif [ -z "$line" ]; then
+		status=fail; note="no pass/fail summary line in the log"
+	elif [ "${failed:-0}" != 0 ]; then
+		status=fail; note="$failed failed"
+	fi
+	if [ "${splats:-0}" != 0 ]; then
+		status=fail; note="${note:+$note; }$splats kernel warning line(s) in $f.dmesg"
+	fi
+	[ "$status" = fail ] && nfail=$((nfail + 1))
+	R_NAME+=("$s"); R_STATUS+=("$status"); R_PASSED+=("${passed:-0}")
+	R_FAILED+=("${failed:-0}"); R_SECS+=("$secs"); R_NOTE+=("$note")
+	printf '  %s  %s passed, %s failed, %ss%s\n' "${status^^}" "${passed:-?}" "${failed:-?}" "$secs" "${note:+  ($note)}"
+done
+total_secs=$(( $(date +%s) - total_start ))
+
+# ---- cleanup -------------------------------------------------------------------
+
+"$MDADM" --stop "$MD" >/dev/null 2>&1
+if [ "$KEEP_BRD" = 0 ] && lsmod | grep -q '^brd '; then
+	rmmod brd 2>/dev/null || echo "  NOTE: brd is still in use and stays loaded"
+fi
+
+# ---- report --------------------------------------------------------------------
+
+{
+	echo "raidkm-test-ci: tier $TIER, ${#SUITES[@]} suites, $nfail failed, ${total_secs}s"
+	printf '%-36s %-5s %7s %7s %7s  %s\n' suite status passed failed seconds note
+	for i in "${!R_NAME[@]}"; do
+		printf '%-36s %-5s %7s %7s %7s  %s\n' "${R_NAME[$i]}" "${R_STATUS[$i]}" \
+			"${R_PASSED[$i]}" "${R_FAILED[$i]}" "${R_SECS[$i]}" "${R_NOTE[$i]}"
+	done
+} > "$OUTPUT/summary.txt"
+
+{
+	echo '<?xml version="1.0" encoding="UTF-8"?>'
+	echo "<testsuites name=\"raidkm-test-ci\" tests=\"${#SUITES[@]}\" failures=\"$nfail\" time=\"$total_secs\">"
+	echo "  <testsuite name=\"raidkm-$TIER\" tests=\"${#SUITES[@]}\" failures=\"$nfail\" time=\"$total_secs\" hostname=\"$(hostname | xml_escape)\">"
+	for i in "${!R_NAME[@]}"; do
+		n="${R_NAME[$i]//[@=]/_}"
+		echo "    <testcase classname=\"raidkm.$TIER\" name=\"$(printf '%s' "${R_NAME[$i]}" | xml_escape)\" time=\"${R_SECS[$i]}\">"
+		if [ "${R_STATUS[$i]}" = fail ]; then
+			echo "      <failure message=\"$(printf '%s' "${R_NOTE[$i]}" | xml_escape)\">"
+			{ grep -E "FAIL|ERROR" "$OUTPUT/$n.log" | head -20
+			  echo "---- last 40 lines of $n.log ----"
+			  tail -40 "$OUTPUT/$n.log"
+			  echo "---- kernel warnings ----"
+			  grep -E "$SPLAT" "$OUTPUT/$n.dmesg" | head -20; } | xml_escape
+			echo "      </failure>"
+		fi
+		echo "      <system-out>${R_PASSED[$i]} passed, ${R_FAILED[$i]} failed; log $OUTPUT/$n.log</system-out>"
+		echo "    </testcase>"
+	done
+	echo "  </testsuite>"
+	echo "</testsuites>"
+} > "$OUTPUT/results.xml"
+
+echo
+cat "$OUTPUT/summary.txt"
+echo "Results: $OUTPUT (summary.txt, results.xml, <suite>.log, <suite>.dmesg)"
+[ "$nfail" = 0 ]

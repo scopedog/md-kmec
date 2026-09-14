@@ -546,9 +546,9 @@ chunk, 1 MiB sequential I/O; the rig reproduces an NVMe-oF QLC array's table):
 | state | request size at the members |
 |---|---|
 | healthy and degraded full-row writes, m=2 (classic or declustered) | ~123–128 KiB |
-| full-row writes, **m ≥ 3** | **127 KiB** with `rk_batch_mparity=1` (~5 KiB without) |
+| full-row writes, **m ≥ 3** | **127 KiB** (`rk_batch_mparity`, on by default; ~5 KiB with it off) |
 | degraded reads (classic / declustered) | **128 KiB** (`rk_row_dread`, on by default) |
-| rebuild onto a spare: survivor reads / spare writes | **128 KiB / 128 KiB** with `rk_row_rebuild=1` (~5 / ~7 KiB without) |
+| rebuild onto a spare: survivor reads / spare writes | **128 KiB / 128 KiB** (`rk_row_rebuild`, on by default; ~5 / ~7 KiB with it off) |
 | declustered population: survivor reads / spare-column writes | ~5.5 / ~8 KiB (a population-completion bug is fixed; see below) |
 | declustered copy back to a replacement | ~128 KiB |
 
@@ -557,7 +557,8 @@ stock raid6, and with worker groups enabled those units reach the members out
 of order, so the block layer cannot merge them.  With `group_thread_cnt=0` the
 same rebuild merges to ~120–125 KiB on both engines — but runs on one thread,
 about 2.5–3× slower on a CPU-bound rig; degraded reads improve only to
-~7–10 KiB.  Two knobs replace that trade-off; both are off by default.
+~7–10 KiB.  The row layer replaces that trade-off: `rk_row_dread` and
+`rk_row_rebuild`, both on by default, each switchable off per array.
 
 **`rk_row_dread` — chunk-sized degraded reads (on by default).**  A degraded
 read that lies inside one chunk is served by reading that range once from each
@@ -630,9 +631,9 @@ heals, exactly as an unverified bypass read is; `rk_row_stats` counts those as
 `dread_csum_bad` and `rebuild_csum_bad`.  So integrity and chunk-unit I/O are
 no longer an either/or.
 
-**`rk_row_rebuild` — rebuild a whole row at a time (opt-in).**  Writing 1 to
-`/sys/block/mdX/md/rk_row_rebuild` (or `default_row_rebuild=1` at module load)
-recovers a failed member one chunk-aligned row per operation: the k survivors
+**`rk_row_rebuild` — rebuild a whole row at a time (on by default).**  A
+rebuild onto a spare recovers the failed member one chunk-aligned row per
+operation: the k survivors
 are read once each at chunk size, decoded once, and the member being rebuilt is
 written once — instead of 32 stripe heads of 4 KiB per row.  The row's stripes
 are held for the duration, so a foreground write to that row waits and retries;
@@ -642,8 +643,14 @@ rebuild never blocks foreground I/O.  Measured on the rig (8+2, 128 KiB chunk,
 
 | rebuild | survivor reads | spare writes | rate | busy cores |
 |---|---|---|---|---|
-| stripe path | 5.2 KiB | 7.4 KiB | 743 MiB/s | 7.6 |
-| `rk_row_rebuild=1` | **128 KiB** | **128 KiB** | **1284 MiB/s** | **1.8** |
+| stripe path (`rk_row_rebuild=0`) | 5.2 KiB | 7.4 KiB | 743 MiB/s | 7.6 |
+| row layer (default) | **128 KiB** | **128 KiB** | **1284 MiB/s** | **1.8** |
+
+On 8+2 local NVMe, where a single spare's write speed is the limit, a 375 GiB
+rebuild takes 990 s through the row layer against 1,027 s on the stripe path —
+128 KiB requests on 0.5 busy cores instead of 5.8 / 6.5 KiB on 2.8.
+`echo 0 > /sys/block/mdX/md/rk_row_rebuild` turns it off for one array, and the
+module parameter `default_row_rebuild=0` makes new arrays start with it off.
 
 It covers classic layouts only: a declustered population, an attached log or
 PPL, a live reshape, a second missing member and replacement-device rebuilds
@@ -679,7 +686,7 @@ the members at 127 KiB and only pay the added latency — do not use it on flash
 > mode-2 population numbers above were measured before the fix and need
 > re-measuring before `rk_bio_sort` is recommended on declustered arrays again.
 
-**`rk_batch_mparity` — batch full-row writes at m ≥ 3 (opt-in).**  Above m=2,
+**`rk_batch_mparity` — batch full-row writes at m ≥ 3 (on by default).**  Above m=2,
 `stripe_can_batch()` refuses to batch, so a full-row write reaches the members
 at ~5 KiB instead of ~127 KiB — 30× the requests, while the array is *healthy*.
 The refusal was deliberate: the m>2 parity compute is synchronous, so batching
@@ -695,16 +702,25 @@ buys no pipelining, and an early measurement on ramdisks without GFNI made it
 
 The 7+3 row is alignment, not batching: seven data disks make an 896 KiB row,
 so 1 MiB writes straddle rows and merge poorly either way — keep `k × chunk`
-equal to the application's I/O size and the effect disappears.  Off by default
-until a real-device A/B confirms it; on large-IU flash with an aligned geometry,
-turn it on.
+equal to the application's I/O size and the effect disappears.
+
+On real devices (8+3 on 12 local NVMe, 128 KiB chunk, 1 MiB writes, two runs
+each in ABBA order) healthy writes reach the members at 127.9 KiB instead of
+13–14 KiB at the same throughput (2,407–2,567 against 2,641 MiB/s), on 1.5
+busy cores instead of 2.6; degraded writes go from 15–18 KiB to 128 KiB, also
+at parity.  A data check with batching on — write-then-verify, a parity scrub
+of the region, a read with three members failed, and a scrub that must catch a
+deliberately corrupted member — passed.  So it is on by default:
+`echo 0 > /sys/block/mdX/md/rk_batch_mparity`, or `default_batch_mparity=0` at
+module load, returns an array to per-stripe writes.
 
 On large-IU flash:
 
 - **chunk = a power-of-two multiple of the IU, with room to grow** — 128 KiB
   covers 16, 32 and 64 KiB units; with `k=8` that is a 1 MiB row;
 - **keep `k × chunk` equal to the application's large I/O size** (item 1 above);
-- **m ≥ 3 needs `rk_batch_mparity=1`** (or stay at m=2);
+- **m ≥ 3 relies on `rk_batch_mparity`**, on by default — don't turn it off on
+  large-IU flash;
 - **no `--write-journal` and no PPL** — an attached md log or PPL turns off
   full-row batching, which brings back ~5 KiB member writes even at m=2;
 - **external filesystem journal on a device that is not QLC** — a mirror or an
@@ -753,10 +769,15 @@ win sitting unused.  The one knob worth revisiting per host:
   Same underlying state as `worker_thread_cnt`; either knob updates the other.
   Useful when migrating tuning scripts from stock RAID5/6 or when you want explicit
   per-group control on multi-NUMA hosts.
-- **`stripe_cache_size`** — leave at the default **256**.  Raising it *reduced*
-  throughput on ramdisk (no device latency to hide, just more cache churn):
-  256 → 8192 lost ~15-25% on both boxes.  It may help on real spinning disks, so
-  measure before changing rather than bumping it blindly.
+- **`stripe_cache_size`** — new arrays start at **1024** stripes (capped at a
+  128 MiB cache for very wide arrays; module parameter
+  `default_stripe_cache_size`).  At the old 256 start, fresh arrays under
+  1 MiB × QD8 × 4 writers intermittently stalled at a third of their throughput,
+  because the cache only grows in narrow windows; 1024 removed the stalls and
+  added ~15% healthy write.  Every 1 MiB row in flight holds 32 stripe heads, so
+  a heavier write load than that (more jobs or deeper queues) may want more —
+  measure.  (An early brd-ramdisk sweep found 256 → 8192 *lost* 15–25%: no device
+  latency to hide the cache churn.  That does not carry over to real devices.)
 
 (Measured on brd ramdisks, which are CPU/memcpy-bound; on real disks the worker-
 group win should be larger — threads overlap device latency — and the stripe-cache
@@ -930,6 +951,8 @@ md-kmec/
 │   ├── raidkm-test-row-dread-wide.sh  # degraded span read once per row (unaligned, races, dcl)
 │   ├── raidkm-test-row-csum.sh        # native checksum through the row paths (poisoned survivors refused)
 │   ├── raidkm-test-declustered-populate-window.sh  # population backpressure window, pause + retry
+│   ├── raidkm-test-ci.sh              # CI entry point: --tier=smoke|quick|full, JUnit XML,
+│   │                                    # kernel-log scan, refuses hosts with other md arrays
 │   ├── raidkm-standard-benchmark.sh   # fio harness (7 workloads incl. 1 MiB
 │   │                                    # sequential) + member request size,
 │   │                                    # Test-7 rebuild/populate wall-clock

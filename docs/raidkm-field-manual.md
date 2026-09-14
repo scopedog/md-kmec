@@ -854,14 +854,17 @@ layer, `rk_row_dread`, on by default; a read spanning several chunks of a row
 reads that row once, counted as `dread_wide` — on 8+2 local NVMe that is 1.11×
 stock raid6 rotating and 1.16× declustered, on a quarter of the cores). Still
 small without opt-in knobs:
-full-row writes at m ≥ 3 (~5 KiB), rebuild (~5/7 KiB) and declustered
-population (~5.5/8 KiB).  Three knobs, all off by default, fix those:
+full-row writes at m ≥ 3 (~5 KiB) and declustered population (~5.5/8 KiB).
+Rebuild onto a spare no longer is:
 
-- `rk_row_rebuild=1` rebuilds a whole row at a time — 128 KiB survivor reads
-  and a 128 KiB write to the member being rebuilt, 1284 vs 743 MiB/s on the
-  rig, a quarter of the CPU. Classic layouts only; anything else keeps the
-  stripe path, and a row with foreground I/O in flight is skipped rather than
-  blocked.
+- `rk_row_rebuild` (**on by default**) rebuilds a whole row at a time — 128 KiB
+  survivor reads and a 128 KiB write to the member being rebuilt, 1284 vs
+  743 MiB/s on the rig, a quarter of the CPU; on 8+2 local NVMe it completes
+  a 375 GiB rebuild in 990 s vs 1,027 s on the stripe path, on 0.5 cores vs 2.8.
+  Classic layouts only; anything else keeps the stripe path, and a row with
+  foreground I/O in flight is skipped rather than blocked.
+  `echo 0 > /sys/block/mdX/md/rk_row_rebuild` (or `default_row_rebuild=0`)
+  returns an array to 4 KiB stripe rebuild.
 - ~~`rk_bio_sort=2` for declustered population~~ — **withdrawn** until
   re-measured: its gain was measured while a bug (now fixed) could stop
   declustered population from completing on large, fast arrays. Population
@@ -869,10 +872,13 @@ population (~5.5/8 KiB).  Three knobs, all off by default, fix those:
   in `rk_dcl_populate`), and pauses with an error naming the sector if a
   stripe cannot be reconstructed. Mode `1` costs ~35% of healthy sequential
   write on flash.
-- `rk_batch_mparity=1` batches full-row writes at m ≥ 3: 8+3 healthy write
-  5.4 → 127 KiB for ~1% throughput and half the CPU. Needs an aligned geometry
-  (`k × chunk` = the application's I/O size); at 7+3 the row is 896 KiB and
-  1 MiB writes straddle it, so the size only reaches ~10 KiB.
+- `rk_batch_mparity` (**on by default**) batches full-row writes at m ≥ 3: on
+  8+3 over 12 local NVMe, healthy writes reach the members at 127.9 KiB
+  instead of 13–14 KiB at the same throughput, on 1.5 busy cores instead of
+  2.6 (5.4 → 127 KiB on the rig). Needs an aligned geometry (`k × chunk` = the
+  application's I/O size); at 7+3 the row is 896 KiB and 1 MiB writes straddle
+  it, so the size only reaches ~10 KiB. `rk_batch_mparity=0` (or
+  `default_batch_mparity=0`) returns an array to per-stripe writes.
 
 Native checksum does not cost you the row layer.  A `--checksum` array used to
 decline both row paths (and say nothing about it), so integrity meant going
@@ -882,7 +888,7 @@ decoding, and publishes CRCs for a chunk before a rebuild writes it.  Rows whose
 CRCs disagree go to the stripe cache to be re-read, warned about and healed —
 `rk_row_stats` counts them as `dread_csum_bad` / `rebuild_csum_bad`.
 
-The knobs above default off. On such drives: chunk a power-of-two multiple of the IU
+`rk_bio_sort` defaults off (re-measured on real NVMe, mode 2 lifts declustered population only from ~6 to ~7 KiB at the same rate). On such drives: chunk a power-of-two multiple of the IU
 (128K), m=2 for now, no `--write-journal` or PPL (either turns off full-row
 batching), the filesystem journal on a device that is not QLC, and
 namespaces/partitions on an IU boundary. `tools/raidkm-bench-iosize.sh`
@@ -963,7 +969,14 @@ The suites double as the acceptance gates. They create their own ramdisks and
 load the module; point `MDADM` at the fork — they refuse a stock mdadm.
 
 ```sh
-sudo MDADM=../mdadm/mdadm bash tools/raidkm-test.sh          # full regression suite
+sudo MDADM=../mdadm/mdadm bash tools/raidkm-test.sh          # core regression suite
+
+# CI entry point: one exit status, summary.txt + JUnit results.xml, a kernel-log
+# scan per suite.  smoke (~25 min, incl. rebuild/replace) for every CI run,
+# quick (~40 min, adds the stripe-path rebuild), full (stops every md array on
+# the host: --allow-stop-all, disposable machines only).
+# It refuses a host with other active md arrays; the list per tier: --list.
+sudo MDADM=../mdadm/mdadm bash tools/raidkm-test-ci.sh --tier=smoke
 
 # individual gates
 tools/raidkm-test-functional.sh        # create/write/read/scrub × both layouts × m=2/3/4
