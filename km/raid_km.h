@@ -577,7 +577,9 @@ enum {
 				 * guard on the stripe's row write count */
 	STRIPE_ROW_SYNC,	/* row layer: a row rebuild owns this stripe's
 				 * chunk — new writes bounce on R5_Overlap
-				 * until it clears (raidkm_row_rebuild_chunk) */
+				 * until it clears (raidkm_row_rebuild_chunk);
+				 * with native csum on, reads bounce too, so
+				 * no verify-driven heal can start under it */
 };
 
 #define STRIPE_EXPAND_SYNC_FLAGS \
@@ -898,14 +900,17 @@ struct r5conf {
 	int			row_dread;
 	atomic64_t		row_dread_done;		/* served by decode */
 	atomic64_t		row_dread_bypass;	/* member healthy: bypass */
+	atomic64_t		row_dread_wide;		/* spans served by one row read */
 	atomic64_t		row_dread_raced;	/* raced a write or failed: stripe cache */
 	atomic64_t		row_dread_declined;	/* not eligible: stripe cache */
+	atomic64_t		row_dread_csum_bad;	/* native csum rejected it: stripe cache */
 	int			row_rebuild;		/* sysfs rk_row_rebuild */
 	int			batch_mparity;		/* sysfs rk_batch_mparity:
 							 * batch full-row writes
 							 * at m > 2 */
 	atomic64_t		row_rebuild_done;	/* rows rebuilt as one chunk */
 	atomic64_t		row_rebuild_declined;	/* rows left to the stripe cache */
+	atomic64_t		row_rebuild_csum_bad;	/* native csum rejected it: stripe cache */
 	atomic_t		pending_full_writes; /* full write backlog */
 	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */
@@ -1041,7 +1046,22 @@ struct r5conf {
 	u64			reb_gen;	/* journal generation		*/
 	spinlock_t		reb_win_lock;	/* prefix-completion window	*/
 	u64			reb_win_base;	/* == atomic64_read(reb_mark)	*/
-	unsigned long		*reb_win_bits;	/* RKDCL_REB_WINDOW bits	*/
+	unsigned long		*reb_win_bits;	/* reb_win_size bits		*/
+	u32			reb_win_size;	/* granules, power of two, fixed
+						 * at load (raidkm_dcl_load)	*/
+	wait_queue_head_t	reb_win_wait;	/* population backpressure: woken
+						 * when the prefix advances	*/
+	atomic64_t		reb_win_waits;	/* admissions that had to wait,
+						 * this population (sysfs)	*/
+	u64			reb_fail_sector; /* last address population could not
+						 * reconstruct (sysfs); U64_MAX: none */
+	bool			reb_pop_stuck;	/* population paused by it: raid5d
+						 * must not re-request; lifted by
+						 * the next pass start or a clean
+						 * pass end			*/
+	u64			reb_next;	/* where md's next populate call
+						 * lands within a pass; U64_MAX:
+						 * the next call starts a pass	*/
 	int			reb_want;	/* deferred auto-arm target
 						 * (physical index, set by the
 						 * error handler under
@@ -1438,8 +1458,14 @@ struct dcl_geom *raidkm_dcl_geom_new(u32 N, u32 g, u32 m, u32 s,
 void raidkm_dcl_geom_destroy(struct dcl_geom *ge);
 /* Declustered Phase 3: spare-assignment journal + population prefix mark
  * (raid_km-dcl.c; notes/declustered-population-design.md) */
-#define RKDCL_REB_WINDOW	16384	/* stripe-address granules; must
-					 * exceed md's sync flight window */
+/* Default declustered-population completion window, in stripe-address
+ * granules (64 MiB at 4 KiB).  Its size is a throughput knob, NOT a
+ * correctness bound: the sync thread never issues or skips an address at or
+ * past reb_mark + window (raidkm_dcl_pop_admit), so a completion can never
+ * land outside it.  Module parameter raidkm_dcl_pop_window overrides it when
+ * an array is loaded. */
+#define RKDCL_REB_WINDOW	16384
+extern unsigned int raidkm_dcl_pop_window;
 int raidkm_dcl_journal_write(struct r5conf *conf, bool strict);
 void raidkm_dcl_pop_done(struct r5conf *conf, sector_t sector);
 /* dcl_selftest hooks: the RUNTIME chain walks on a synthetic conf

@@ -41,6 +41,13 @@
 #   --gtc=N           group_thread_cnt for every arm (default: engine default)
 #   --md-attr=NAME=V  write V to /sys/block/mdX/md/NAME on every arm after the
 #                     create (repeatable), e.g. --md-attr=rk_row_dread=1
+#   --checksum        create the raidkm/dcl arms with native per-block CRC-32C
+#                     (--checksum), to price what verification costs the row
+#                     layer.  Ignored by the raid5/raid6 arms, which have no
+#                     such feature.  With --devs the members must be freshly
+#                     wiped: mdadm does not yet zero the reserved CRC region at
+#                     create, so a previous array's CRCs would be read as this
+#                     array's and every verify would mismatch.
 #   --stripe-cache=N  stripe_cache_size for every arm (default: engine default, 256).
 #                     That is the cache's minimum: it grows by itself under
 #                     pressure, so each state records the peak stripe_cache_active.
@@ -79,6 +86,7 @@ RWMIX=70
 JOBS=4
 REGION=4G
 CHUNK=128
+CSUM=0
 GTC=
 SCS=
 MD_ATTRS=()
@@ -111,6 +119,7 @@ for arg in "$@"; do
 	--gtc=*)        GTC="${arg#*=}" ;;
 	--stripe-cache=*) SCS="${arg#*=}" ;;
 	--md-attr=*)    MD_ATTRS+=("${arg#*=}") ;;
+	--checksum)     CSUM=1 ;;
 	--devs=*)       DEVS="${arg#*=}" ;;
 	--force)        FORCE=1 ;;
 	--nullb-gb=*)   NULLB_GB="${arg#*=}" ;;
@@ -134,6 +143,13 @@ MDADM="$MDADM_ARG"
 # shellcheck source=raidkm-member-stats.sh
 . "$DIR/raidkm-member-stats.sh"
 rk_resolve_mdadm || exit 1
+
+CSUM_OPT=""
+if [ "$CSUM" = 1 ]; then
+	grep -qa checksum "$MDADM" ||
+		die "--checksum: this mdadm has no native-checksum support (build the fork)"
+	CSUM_OPT="--checksum"
+fi
 
 ARMS=$(echo "$ARMS" | tr ',' ' ')
 STATES=$(echo "$STATES" | tr ',' ' ')
@@ -367,12 +383,14 @@ for spec in $ARMS; do
 		rk_load_modules || die "raidkm not loadable"
 		printf 'y\n' | "$MDADM" --create "$MD" --level=raidkm --parity-count="$m" \
 			--layout=rotating --raid-devices="$pool" --chunk="$CHUNK" --bitmap=none \
+			${CSUM_OPT:-} \
 			--assume-clean --run --force "${members[@]}" > "$OUTPUT/create-$ARMNAME.log" 2>&1 ;;
 	dcl)
 		rk_load_modules || die "raidkm not loadable"
 		printf 'y\n' | "$MDADM" --create "$MD" --level=raidkm --parity-count="$m" \
 			--layout=declustered --group-width=$((k + m)) --spare-columns="$sc" \
-			--raid-devices="$pool" --chunk="$CHUNK" --bitmap=none --assume-clean --run --force \
+			--raid-devices="$pool" --chunk="$CHUNK" --bitmap=none ${CSUM_OPT:-} \
+			--assume-clean --run --force \
 			"${members[@]}" > "$OUTPUT/create-$ARMNAME.log" 2>&1 ;;
 	esac || { log "create $ARMNAME failed: $(tail -2 "$OUTPUT/create-$ARMNAME.log" | tr '\n' ' ')"; continue; }
 	udevadm settle

@@ -850,7 +850,10 @@ everything else is already default or automatic.
 (16, 32 or 64 KiB) makes the drive rewrite the whole unit, so check the request
 size that reaches the members, not just throughput. Full-row writes at m=2
 reach the members at ~123–128 KiB, and degraded reads at 128 KiB (the row
-layer, `rk_row_dread`, on by default). Still small without opt-in knobs:
+layer, `rk_row_dread`, on by default; a read spanning several chunks of a row
+reads that row once, counted as `dread_wide` — on 8+2 local NVMe that is 1.11×
+stock raid6 rotating and 1.16× declustered, on a quarter of the cores). Still
+small without opt-in knobs:
 full-row writes at m ≥ 3 (~5 KiB), rebuild (~5/7 KiB) and declustered
 population (~5.5/8 KiB).  Three knobs, all off by default, fix those:
 
@@ -859,15 +862,27 @@ population (~5.5/8 KiB).  Three knobs, all off by default, fix those:
   rig, a quarter of the CPU. Classic layouts only; anything else keeps the
   stripe path, and a row with foreground I/O in flight is skipped rather than
   blocked.
-- `rk_bio_sort=2` orders the resync/recovery submissions instead, which is what
-  lifts **declustered population** (~25/49 KiB, +11%). Mode `1` (upstream's
-  "all writes") costs ~35% of healthy sequential write — do not use it here.
+- ~~`rk_bio_sort=2` for declustered population~~ — **withdrawn** until
+  re-measured: its gain was measured while a bug (now fixed) could stop
+  declustered population from completing on large, fast arrays. Population
+  now holds md's sync back instead of dropping progress (`backpressure waits`
+  in `rk_dcl_populate`), and pauses with an error naming the sector if a
+  stripe cannot be reconstructed. Mode `1` costs ~35% of healthy sequential
+  write on flash.
 - `rk_batch_mparity=1` batches full-row writes at m ≥ 3: 8+3 healthy write
   5.4 → 127 KiB for ~1% throughput and half the CPU. Needs an aligned geometry
   (`k × chunk` = the application's I/O size); at 7+3 the row is 896 KiB and
   1 MiB writes straddle it, so the size only reaches ~10 KiB.
 
-Both default off. On such drives: chunk a power-of-two multiple of the IU
+Native checksum does not cost you the row layer.  A `--checksum` array used to
+decline both row paths (and say nothing about it), so integrity meant going
+back to 5 KiB degraded reads and rebuilds.  The row engine now does the
+checksum work itself: it verifies each survivor against the stored CRC before
+decoding, and publishes CRCs for a chunk before a rebuild writes it.  Rows whose
+CRCs disagree go to the stripe cache to be re-read, warned about and healed —
+`rk_row_stats` counts them as `dread_csum_bad` / `rebuild_csum_bad`.
+
+The knobs above default off. On such drives: chunk a power-of-two multiple of the IU
 (128K), m=2 for now, no `--write-journal` or PPL (either turns off full-row
 batching), the filesystem journal on a device that is not QLC, and
 namespaces/partitions on an IU boundary. `tools/raidkm-bench-iosize.sh`
@@ -959,11 +974,18 @@ tools/raidkm-test-reshape-concurrent.sh  # I/O across a throttled reshape (dual 
 tools/raidkm-test-reshape-crash.sh     # power-loss / torn-write recovery (fault-inject build)
 NATIVE=1 tools/raidkm-test-selfheal.sh # checksum-driven heal (or dm-integrity by default)
 NATIVE=1 tools/raidkm-test-csum-thrash.sh  # CRC-region cache eviction round-trip
-tools/raidkm-test-declustered-*.sh     # ~30 declustered gates: map, io, populate, rebalance, reshape…
+tools/raidkm-test-row-dread-wide.sh    # degraded span read once per row: unaligned, two failures, races, dcl
+NATIVE=1 tools/raidkm-test-row-csum.sh # checksum verified/published through the row paths
+tools/raidkm-test-declustered-*.sh     # ~30 declustered gates: map, io, populate, populate-window, rebalance, reshape…
 
 # benchmark harness: 7 fio workloads (member request size recorded per workload)
 # + a rebuild/populate wall-clock item
 tools/raidkm-standard-benchmark.sh --runs=3 --rebuild-victim=/dev/ram2
+
+# A/B against stock md on the same disks; on flash keep the default warm-up pass
+# and add --precondition=steady so no arm gets the fresh-drive first run
+tools/raidkm-ab-benchmark.sh --devs="/dev/nvme0n1 ... /dev/nvme0n10" \
+    --arms=raid6,raidkm2 --chunk=128 --rounds=4 --precondition=steady
 
 # request size at the members per I/O state (healthy, degraded, rebuild,
 # declustered populate/copyback) on a null_blk rig

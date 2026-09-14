@@ -7,6 +7,15 @@
 # against a baseline arm (IOPS, MiB/s, p99 latency, optional rebuild time).
 # Arms run in ABBA order — round 1 forward, round 2 reversed, ... — so device
 # drift (NVMe GC, thermals, cache warm-up) does not systematically favour one.
+# ABBA alone does not cover the FIRST run on the drives: on unconditioned flash
+# it is the fast one (fresh NAND, nothing to collect), and the baseline arm
+# always holds that slot — on GCP local NVMe (2026-09-13) the baseline's first
+# run read 12-26% above every later run of either arm on the write-heavy
+# workloads, which alone made stock look 5-9% faster.  So by default one
+# untimed warm-up pass of the whole workload set runs first and is discarded
+# (--warmup), and --precondition=steady brings every member to steady state
+# before that.  The summary lists every run in execution order and flags
+# outliers, so a position effect shows instead of hiding in a mean.
 #
 # Arms (--arms, comma-separated; the first is the baseline unless --baseline):
 #   raw            the first member device alone, no md: the device ceiling
@@ -18,13 +27,30 @@
 #                  in for the arm and swapped back at exit
 #   raidkm<M>      raidkm with M parity, rotating layout (raidkm2, raidkm3, ...).
 #                  raidkm2 stores the same bytes as raid6: the cleanest A/B pair
+#   <arm>@<n>      any md arm built on only the FIRST n of --devs, e.g. raid6@10
+#                  next to dcl2 on 12 devices: stock 8+2 with two idle disks as
+#                  hot spares against declustered 8+2 with two distributed spare
+#                  columns — same disks, same usable capacity, one ABBA run.
+#                  Every run still wipes all of --devs, so a narrow arm never
+#                  inherits a wider arm's superblocks.
+#   dcl<M>         raidkm declustered with M parity: stripes of width
+#                  --group-width scattered over the whole member pool with
+#                  --spare-columns distributed spare columns.  The layout we
+#                  recommend on large-IU flash, so it is what a "stock vs our
+#                  recommendation" comparison needs; note it uses a WIDER pool
+#                  than a matched raid6 arm — a deployment difference, not a
+#                  like-for-like geometry
 #
 # Every md arm is created with the same member list, chunk, bitmap setting and
 # --assume-clean (so no initial resync competes with fio, and the post-run
 # parity check is skipped: an assume-clean array over dirty disks is not
 # parity-consistent).  Tuning knobs are left at each personality's defaults
-# unless --gtc / --stripe-cache are given; the values in force are recorded
-# per arm, so "out of the box" and "matched knobs" runs are both reportable.
+# unless --gtc / --stripe-cache / --md-attr are given; the values in force are
+# recorded per arm, so "out of the box" and "matched knobs" runs are both
+# reportable.  --md-attr is best-effort per arm: an attribute an arm does not
+# have (the rk_* knobs on a stock raid6 arm, say) is skipped and recorded as
+# n/a, which is exactly what "stock keeps its defaults, ours gets our knobs"
+# should mean.
 #
 # DESTRUCTIVE: every member device is overwritten.  Run with --dry-run first:
 # it validates the arguments and devices and prints every command each arm
@@ -66,10 +92,28 @@
 #   --bitmap=MODE       none | internal (default none)
 #   --gtc=N             set group_thread_cnt on every md arm
 #   --stripe-cache=N    set stripe_cache_size on every md arm
+#   --md-attr=NAME=V    write V to /sys/block/mdX/md/NAME on every md arm after
+#                       the create (repeatable).  Best-effort: an arm without
+#                       that attribute keeps its own default and the arm record
+#                       says "n/a", so one command expresses "stock as it ships
+#                       vs ours with our knobs", e.g.
+#                       --md-attr=rk_row_rebuild=1 --md-attr=rk_bio_sort=2
+#   --group-width=G     dcl<M> arms: stripe width g = k + M (required for dcl)
+#   --spare-columns=S   dcl<M> arms: distributed spare columns (default 2)
 #   --rebuild           also time a rebuild of the last member (Test 7) per md run
 #   --workloads=LIST    workloads passed to raidkm-standard-benchmark.sh
 #                       (default 1,2,3,4,5,8,9; 8/9 = sequential 1 MiB write/read)
-#   --precondition      sequential full write of every member before the first arm
+#   --precondition[=seq|steady]
+#                       before anything else.  seq (the bare flag): a sequential
+#                       full write of every member.  steady: that, then
+#                       --precondition-time seconds of 4 KiB random writes over
+#                       every member — flash steady state, for write workloads
+#   --precondition-time=SEC  length of the steady random-write phase (default 600)
+#   --warmup=ARM        one untimed pass of the whole workload set on ARM before
+#                       round 1; its results are kept in DIR/warmup/ but never
+#                       summarised (default: the baseline arm)
+#   --no-warmup         skip the warm-up pass: the first measured run then gets
+#                       the drives in whatever state they are in
 #   --output=DIR        results directory (default /var/tmp/raidkm-ab-<timestamp>)
 #   --md=DEV            md node to create the arms on (default /dev/md70)
 #   --mdadm=PATH        raidkm-aware mdadm (default: auto-resolved)
@@ -80,7 +124,8 @@
 #
 # Output: DIR/summary.md (tables), DIR/summary.csv (one row per arm+workload),
 # DIR/<arm>/round<R>/ (fio JSON + log), DIR/<arm>/round<R>/arm.env (geometry,
-# tuning, module identity).  Exit status is non-zero if any arm run failed.
+# tuning, module identity), DIR/order.txt (execution order), DIR/warmup/<arm>/
+# (the discarded warm-up pass).  Exit status is non-zero if any arm run failed.
 #
 
 # No pipefail: raidkm-test-lib.sh tests `lsmod | grep -q`, which under pipefail
@@ -104,6 +149,9 @@ SCS=
 REBUILD=0
 WORKLOADS=
 PRECOND=0
+PRECOND_TIME=600
+WARMUP=
+NO_WARMUP=0
 OUTPUT=
 FORCE=0
 DRYRUN=0
@@ -129,6 +177,8 @@ preflight_fail() {
 	fi
 }
 
+MD_ATTRS=()
+MD_ATTRS_SET=()
 for arg in "$@"; do
 	case "$arg" in
 	--devs=*)         DEVS="${arg#*=}" ;;
@@ -141,8 +191,15 @@ for arg in "$@"; do
 	--bitmap=*)       BITMAP="${arg#*=}" ;;
 	--gtc=*)          GTC="${arg#*=}" ;;
 	--stripe-cache=*) SCS="${arg#*=}" ;;
+	--md-attr=*)      MD_ATTRS+=("${arg#*=}") ;;
+	--group-width=*)  DCL_G="${arg#*=}" ;;
+	--spare-columns=*) DCL_S="${arg#*=}" ;;
 	--rebuild)        REBUILD=1 ;;
-	--precondition)   PRECOND=1 ;;
+	--precondition|--precondition=seq) PRECOND=1 ;;
+	--precondition=steady) PRECOND=2 ;;
+	--precondition-time=*) PRECOND_TIME="${arg#*=}" ;;
+	--warmup=*)       WARMUP="${arg#*=}" ;;
+	--no-warmup)      NO_WARMUP=1 ;;
 	--workloads=*)    WORKLOADS="${arg#*=}" ;;
 	--output=*)       OUTPUT="${arg#*=}" ;;
 	--md=*)           MD_ARG="${arg#*=}" ;;
@@ -181,27 +238,59 @@ N=${#MEMBERS[@]}
 [ "$N" -ge 4 ] || die "need at least 4 member devices, got $N"
 LAST_MEMBER="${MEMBERS[$((N - 1))]}"
 
+# Per-arm member subsets: "<arm>@<n>" builds the arm on the first n of --devs.
+arm_type() { echo "${1%@*}"; }				# the arm without @<n>
+arm_n() { case "$1" in *@*) echo "${1##*@}" ;; *) echo "$N" ;; esac; }
+arm_select() {					# -> AM (members), AN, ALAST
+	AN=$(arm_n "$1")
+	AM=("${MEMBERS[@]:0:$AN}")
+	ALAST="${AM[$((AN - 1))]}"
+}
+
 IFS=, read -r -a ARM_LIST <<< "$ARMS"
 [ "${#ARM_LIST[@]}" -ge 1 ] || die "--arms is empty"
+DCL_G="${DCL_G:-}"
+DCL_S="${DCL_S:-2}"
 BASELINE="${BASELINE:-${ARM_LIST[0]}}"
 [[ ",$ARMS," == *",$BASELINE,"* ]] || die "--baseline=$BASELINE is not one of --arms"
+if [ "$NO_WARMUP" = 1 ]; then
+	WARMUP=
+else
+	WARMUP="${WARMUP:-$BASELINE}"
+	[[ ",$ARMS," == *",$WARMUP,"* ]] || die "--warmup=$WARMUP is not one of --arms"
+fi
+[[ "$PRECOND_TIME" =~ ^[1-9][0-9]*$ ]] || die "--precondition-time must be a positive integer"
 
 NEED_RAIDKM=0
 NEED_INTREE=0
 for arm in "${ARM_LIST[@]}"; do
-	case "$arm" in
+	t=$(arm_type "$arm"); n=$(arm_n "$arm")
+	if [[ "$arm" == *@* ]]; then
+		[ "$t" != raw ] || die "$arm: the raw arm takes no @<n>"
+		[[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 3 ] && [ "$n" -le "$N" ] ||
+			die "$arm: @<n> must be 3..$N (the number of --devs)"
+	fi
+	case "$t" in
 	raw) ;;
-	raid5|raid5-intree) [ "$N" -ge 3 ] || die "$arm needs >= 3 members" ;;
+	raid5|raid5-intree) [ "$n" -ge 3 ] || die "$arm needs >= 3 members" ;;
 	raid6|raid6-intree) ;;
 	raidkm[0-9]*)
-		m="${arm#raidkm}"
+		m="${t#raidkm}"
 		[[ "$m" =~ ^[0-9]+$ ]] || die "bad arm '$arm' (want raidkm<M>)"
 		[ "$m" -ge 2 ] || die "$arm: raidkm needs M >= 2"
-		[ $((N - m)) -ge 2 ] || die "$arm: $N members leave k=$((N - m)) data disks, need >= 2"
+		[ $((n - m)) -ge 2 ] || die "$arm: $n members leave k=$((n - m)) data disks, need >= 2"
 		NEED_RAIDKM=1 ;;
-	*) die "unknown arm '$arm' (raw, raid5, raid6, raid5-intree, raid6-intree, raidkm<M>)" ;;
+	dcl[0-9]*)
+		m="${t#dcl}"
+		[[ "$m" =~ ^[0-9]+$ ]] || die "bad arm '$arm' (want dcl<M>)"
+		[ "$m" -ge 2 ] || die "$arm: declustered needs M >= 2"
+		[ -n "$DCL_G" ] || die "$arm: --group-width is required for a dcl arm"
+		[ $((DCL_G - m)) -ge 2 ] || die "$arm: group width $DCL_G leaves k=$((DCL_G - m)), need >= 2"
+		[ "$n" -gt "$DCL_G" ] || die "$arm: pool ($n) must be WIDER than the group ($DCL_G); equal scatters nothing"
+		NEED_RAIDKM=1 ;;
+	*) die "unknown arm '$arm' (raw, raid5, raid6, raid5-intree, raid6-intree, raidkm<M>, dcl<M>, each optionally @<n>)" ;;
 	esac
-	[[ "$arm" == *-intree ]] && NEED_INTREE=1
+	[[ "$t" == *-intree ]] && NEED_INTREE=1
 done
 
 # ---- member pre-flight ------------------------------------------------------
@@ -254,7 +343,15 @@ current_456() {
 	mod_loaded raid456 || { echo none; return; }
 	if [ "$SV_OK" = 1 ]; then
 		sv=$(loaded_456_sv)
-		if [ -n "$INTREE_SV" ] && [ "$sv" = "$INTREE_SV" ]; then echo intree
+		if [ "$SAME_456" = 1 ]; then
+			# modprobe resolves to the in-tree file: one flavour, and
+			# use_456() normalises every request to "default".  Reporting
+			# "intree" here (the srcversions are equal, so the in-tree test
+			# below would match first) made the guard fire on every run —
+			# on a box with no fork installed, which is exactly the box you
+			# benchmark stock on.
+			[ "$sv" = "$DEFAULT_SV" ] && echo default || echo unknown
+		elif [ -n "$INTREE_SV" ] && [ "$sv" = "$INTREE_SV" ]; then echo intree
 		elif [ "$sv" = "$DEFAULT_SV" ]; then echo default
 		else echo unknown; fi
 	else
@@ -355,19 +452,26 @@ md_attr() { cat "/sys/block/$(basename "$(readlink -f "$MD")")/md/$1" 2>/dev/nul
 
 # arm_create_cmd <arm> : set CREATE_CMD to the arm's mdadm --create (empty for raw)
 arm_create_cmd() {
-	local arm="$1" lvl
+	local arm="$1" t lvl
+	t=$(arm_type "$arm")
+	arm_select "$arm"
 	CREATE_CMD=()
-	case "$arm" in
+	case "$t" in
 	raw) ;;
 	raidkm*)
-		CREATE_CMD=("$MDADM" --create "$MD" --level=raidkm --parity-count="${arm#raidkm}"
-			--layout=rotating --raid-devices="$N" --chunk="$CHUNK"
-			--bitmap="$BITMAP" --assume-clean --run --force "${MEMBERS[@]}") ;;
+		CREATE_CMD=("$MDADM" --create "$MD" --level=raidkm --parity-count="${t#raidkm}"
+			--layout=rotating --raid-devices="$AN" --chunk="$CHUNK"
+			--bitmap="$BITMAP" --assume-clean --run --force "${AM[@]}") ;;
+	dcl*)
+		CREATE_CMD=("$MDADM" --create "$MD" --level=raidkm --parity-count="${t#dcl}"
+			--layout=declustered --group-width="$DCL_G" --spare-columns="$DCL_S"
+			--raid-devices="$AN" --chunk="$CHUNK"
+			--bitmap="$BITMAP" --assume-clean --run --force "${AM[@]}") ;;
 	*)
-		lvl="${arm#raid}"; lvl="${lvl%-intree}"
+		lvl="${t#raid}"; lvl="${lvl%-intree}"
 		CREATE_CMD=("$MDADM" --create "$MD" --level="$lvl"
-			--raid-devices="$N" --chunk="$CHUNK"
-			--bitmap="$BITMAP" --assume-clean --run --force "${MEMBERS[@]}") ;;
+			--raid-devices="$AN" --chunk="$CHUNK"
+			--bitmap="$BITMAP" --assume-clean --run --force "${AM[@]}") ;;
 	esac
 }
 
@@ -375,22 +479,24 @@ arm_create_cmd() {
 arm_bench_args() {
 	BENCH_ARGS=(--target="$3" --runs=1 --runtime="$RUNTIME" --output="$2" --no-check)
 	[ -n "$WORKLOADS" ] && BENCH_ARGS+=(--workloads="$WORKLOADS")
-	if [ "$REBUILD" = 1 ] && [ "$1" != raw ]; then
-		BENCH_ARGS+=(--rebuild-victim="$LAST_MEMBER" --mdadm="$MDADM")
+	if [ "$REBUILD" = 1 ] && [ "$(arm_type "$1")" != raw ]; then
+		arm_select "$1"	# the last member OF THIS ARM, not of --devs
+		BENCH_ARGS+=(--rebuild-victim="$ALAST" --mdadm="$MDADM")
 	fi
 }
 
 # create_arm <arm> : build the arm; sets TARGET
 create_arm() {
 	local arm="$1"
-	case "$arm" in
+	MD_ATTRS_SET=()			# per arm; the raw arm returns before the knobs
+	case "$(arm_type "$arm")" in
 	raw)
 		wipe_members
 		TARGET="${MEMBERS[0]}"
 		return 0 ;;
 	raid5|raid6)               use_456 default ;;
 	raid5-intree|raid6-intree) use_456 intree ;;
-	raidkm*)                   rk_load_modules || die "raidkm module not loadable" ;;
+	raidkm*|dcl*)              rk_load_modules || die "raidkm module not loadable" ;;
 	esac
 	wipe_members
 	udevadm settle
@@ -402,7 +508,27 @@ create_arm() {
 		die "$arm: cannot set group_thread_cnt=$GTC"; }
 	[ -n "$SCS" ] && { echo "$SCS" > "/sys/block/$(basename "$(readlink -f "$MD")")/md/stripe_cache_size" ||
 		die "$arm: cannot set stripe_cache_size=$SCS"; }
+	# Best-effort extra knobs.  An arm that has no such attribute (rk_* on a
+	# stock raid6 arm) keeps its default rather than failing the run — that
+	# asymmetry IS the comparison.  What actually took is recorded per arm.
+	local a name val mdd="/sys/block/$(basename "$(readlink -f "$MD")")/md"
+	for a in ${MD_ATTRS[@]+"${MD_ATTRS[@]}"}; do
+		name="${a%%=*}"; val="${a#*=}"
+		if [ -w "$mdd/$name" ] && echo "$val" > "$mdd/$name" 2>/dev/null; then
+			MD_ATTRS_SET+=("$name=$(cat "$mdd/$name" 2>/dev/null)")
+		else
+			MD_ATTRS_SET+=("$name=n/a")
+		fi
+	done
 	TARGET="$MD"
+}
+
+# rk_module_id : path + srcversion of the raidkm module actually loaded
+rk_module_id() {
+	local ko sv
+	ko=$([ -f "$RAIDKM_KO" ] && echo "$RAIDKM_KO" || modinfo -n raidkm 2>/dev/null)
+	sv=$(cat /sys/module/raidkm/srcversion 2>/dev/null)
+	echo "$ko${sv:+ (srcversion $sv)}"
 }
 
 # record_arm <arm> <dir> : geometry, tuning and module identity actually in force
@@ -413,9 +539,10 @@ record_arm() {
 		echo "date=$(date -Iseconds)"
 		echo "host=$(hostname)"
 		echo "kernel=$KVER"
-		echo "members=${MEMBERS[*]}"
+		arm_select "$arm"
+		echo "members=${AM[*]}"
 		echo "target=$TARGET"
-		if [ "$arm" != raw ]; then
+		if [ "$(arm_type "$arm")" != raw ]; then
 			echo "level=$(md_attr level)"
 			echo "raid_disks=$(md_attr raid_disks)"
 			echo "chunk_size=$(md_attr chunk_size)"
@@ -424,12 +551,16 @@ record_arm() {
 			echo "group_thread_cnt=$(md_attr group_thread_cnt)"
 			echo "stripe_cache_size=$(md_attr stripe_cache_size)"
 			echo "skip_copy=$(md_attr skip_copy)"
+			[ ${#MD_ATTRS_SET[@]} -gt 0 ] &&
+				echo "md_attrs=${MD_ATTRS_SET[*]}"
 			echo "preread_bypass_threshold=$(md_attr preread_bypass_threshold)"
 			echo "mdadm=$MDADM ($("$MDADM" --version 2>&1 | head -1))"
 		fi
-		case "$arm" in
+		case "$(arm_type "$arm")" in
 		raid*-*|raid5|raid6) echo "module=$(describe_456)" ;;
-		raidkm*) echo "module=raidkm $([ -f "$RAIDKM_KO" ] && echo "$RAIDKM_KO" || modinfo -n raidkm 2>/dev/null)$(sv=$(cat /sys/module/raidkm/srcversion 2>/dev/null); [ -n "$sv" ] && echo " (srcversion $sv)")" ;;
+		dcl*) echo "group_width=$DCL_G spare_columns=$DCL_S"
+		      echo "module=raidkm $(rk_module_id)" ;;
+		raidkm*) echo "module=raidkm $(rk_module_id)" ;;
 		esac
 	} > "$out"
 }
@@ -451,7 +582,15 @@ echo "raidkm-ab-benchmark.sh"
 echo "  members:   ${MEMBERS[*]} (N=$N)"
 echo "  arms:      ${ARM_LIST[*]}  (baseline $BASELINE)"
 echo "  order:     ${ORDER[*]}"
+case "$PRECOND" in
+0) PRECOND_DESC=none ;;
+1) PRECOND_DESC="sequential fill" ;;
+*) PRECOND_DESC="sequential fill + ${PRECOND_TIME}s random 4K writes" ;;
+esac
+echo "  prepare:   precondition=$PRECOND_DESC  warm-up=${WARMUP:-none}${WARMUP:+ (one pass, discarded)}"
 echo "  chunk:     ${CHUNK}K  bitmap=$BITMAP  gtc=${GTC:-default}  stripe_cache=${SCS:-default}"
+[ ${#MD_ATTRS[@]} -gt 0 ] && echo "  md-attr:   ${MD_ATTRS[*]}  (best-effort per arm)"
+[[ ",$ARMS," == *",dcl"* ]] && echo "  dcl:       group-width=$DCL_G spare-columns=$DCL_S"
 NWL=$(echo "${WORKLOADS:-1,2,3,4,5,8,9}" | tr ',' ' ' | wc -w)
 echo "  runtime:   ${RUNTIME}s x $NWL workloads per arm run  (~$(( ${#ORDER[@]} * NWL * (RUNTIME + 3) / 60 )) min of fio)"
 echo "  raid456:   modprobe -> ${DEFAULT_456:-none}${INTREE_456:+;  in-tree -> $INTREE_456}"
@@ -467,19 +606,26 @@ echo
 if [ "$DRYRUN" = 1 ]; then
 	q() { printf '%q ' "$@"; echo; }
 	mdsys="/sys/block/$(basename "$MD")/md"
-	if [ "$PRECOND" = 1 ]; then
+	if [ "$PRECOND" != 0 ]; then
 		echo "== preconditioning (once) =="
 		printf '  '; q fio --direct=1 --ioengine=libaio --rw=write --bs=1M --iodepth=8 \
 			$(for i in "${!MEMBERS[@]}"; do echo "--name=precond$i --filename=${MEMBERS[$i]}"; done)
+		[ "$PRECOND" = 2 ] && { printf '  '; q fio --direct=1 --ioengine=libaio --rw=randwrite --bs=4k \
+			--iodepth=32 --norandommap --randrepeat=0 --time_based --runtime="$PRECOND_TIME" \
+			$(for i in "${!MEMBERS[@]}"; do echo "--name=steady$i --filename=${MEMBERS[$i]}"; done); }
+		echo
+	fi
+	if [ -n "$WARMUP" ]; then
+		echo "== warm-up (once, discarded): arm $WARMUP, every workload, output $OUTPUT/warmup/$WARMUP =="
 		echo
 	fi
 	for arm in "${ARM_LIST[@]}"; do
 		echo "== arm $arm =="
-		case "$arm" in
+		case "$(arm_type "$arm")" in
 		raid5|raid6|raid5-intree|raid6-intree)
 			if [ "$SAME_456" = 1 ]; then
 				echo "  modprobe raid456             # -> ${DEFAULT_456:-?} (the kernel's only raid456; no swap)"
-			elif [[ "$arm" == *-intree ]]; then
+			elif [[ "$(arm_type "$arm")" == *-intree ]]; then
 				echo "  rmmod dm_raid raid456"
 				echo "  insmod ${INTREE_456:-<no in-tree raid456.ko>}   # distro raid456; the original is restored at exit"
 			else
@@ -487,7 +633,7 @@ if [ "$DRYRUN" = 1 ]; then
 					echo "  rmmod dm_raid raid456        # the in-tree raid456 is loaded; swap to the modprobe default"
 				echo "  modprobe raid456             # -> ${DEFAULT_456:-?}"
 			fi ;;
-		raidkm*)
+		raidkm*|dcl*)
 			if [ -f "$ISAL_KO" ]; then echo "  insmod $ISAL_KO"; else echo "  modprobe isal_lib"; fi
 			if [ -f "$RAIDKM_KO" ]; then
 				echo "  insmod $RAIDKM_KO"
@@ -496,7 +642,7 @@ if [ "$DRYRUN" = 1 ]; then
 			fi ;;
 		esac
 		for d in "${MEMBERS[@]}"; do
-			[ "$arm" = raw ] || { printf '  '; q "$MDADM" --zero-superblock "$d"; }
+			[ "$(arm_type "$arm")" = raw ] || { printf '  '; q "$MDADM" --zero-superblock "$d"; }
 			printf '  '; q wipefs -a "$d"
 		done
 		arm_create_cmd "$arm"
@@ -504,12 +650,15 @@ if [ "$DRYRUN" = 1 ]; then
 			printf '  '; q "${CREATE_CMD[@]}"
 			[ -n "$GTC" ] && echo "  echo $GTC > $mdsys/group_thread_cnt"
 			[ -n "$SCS" ] && echo "  echo $SCS > $mdsys/stripe_cache_size"
+			for a in ${MD_ATTRS[@]+"${MD_ATTRS[@]}"}; do
+				echo "  echo ${a#*=} > $mdsys/${a%%=*}   # skipped, recorded n/a, if this arm has no such attribute"
+			done
 			arm_bench_args "$arm" "$OUTPUT/$arm/round<R>" "$MD"
 		else
 			arm_bench_args "$arm" "$OUTPUT/$arm/round<R>" "${MEMBERS[0]}"
 		fi
 		printf '  '; q bash "$BENCH" "${BENCH_ARGS[@]}"
-		if [ "$arm" != raw ]; then
+		if [ "$(arm_type "$arm")" != raw ]; then
 			printf '  '; q "$MDADM" --stop "$MD"
 			echo "  (then --zero-superblock + wipefs -a on each member again)"
 		fi
@@ -524,21 +673,48 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 mkdir -p "$OUTPUT" || die "cannot create $OUTPUT"
 
-if [ "$PRECOND" = 1 ]; then
+if [ "$PRECOND" != 0 ]; then
 	echo "=== preconditioning: sequential fill of every member ==="
 	wipe_members
 	args=(--direct=1 --ioengine=libaio --rw=write --bs=1M --iodepth=8)
 	for i in "${!MEMBERS[@]}"; do args+=(--name="precond$i" --filename="${MEMBERS[$i]}"); done
 	fio "${args[@]}" >"$OUTPUT/precondition.log" 2>&1 || die "preconditioning failed (see $OUTPUT/precondition.log)"
+	if [ "$PRECOND" = 2 ]; then
+		echo "=== preconditioning: ${PRECOND_TIME}s of 4 KiB random writes over every member ==="
+		args=(--direct=1 --ioengine=libaio --rw=randwrite --bs=4k --iodepth=32 --norandommap
+		      --randrepeat=0 --time_based --runtime="$PRECOND_TIME")
+		for i in "${!MEMBERS[@]}"; do args+=(--name="steady$i" --filename="${MEMBERS[$i]}"); done
+		fio "${args[@]}" >"$OUTPUT/precondition-steady.log" 2>&1 ||
+			die "steady-state preconditioning failed (see $OUTPUT/precondition-steady.log)"
+	fi
+	echo
+fi
+
+# The warm-up pass takes the first-run-on-the-drives slot so no measured arm
+# does.  Same workloads and runtime; no rebuild (it would only cost time).
+if [ -n "$WARMUP" ]; then
+	dir="$OUTPUT/warmup/$WARMUP"
+	mkdir -p "$dir"
+	echo "=== warm-up (discarded): $WARMUP ==="
+	create_arm "$WARMUP"
+	record_arm "$WARMUP" "$dir"
+	saved_rebuild=$REBUILD; REBUILD=0
+	arm_bench_args "$WARMUP" "$dir" "$TARGET"
+	REBUILD=$saved_rebuild
+	bash "$BENCH" "${BENCH_ARGS[@]}" > "$dir/bench.log" 2>&1 ||
+		echo "  NOTE: the warm-up run reported a failure (see $dir/bench.log); measured runs continue" >&2
+	teardown_arm
 	echo
 fi
 
 FAILED=0
+: > "$OUTPUT/order.txt"
 for entry in "${ORDER[@]}"; do
 	r="${entry%%:*}"
 	arm="${entry#*:}"
 	dir="$OUTPUT/$arm/round$r"
 	mkdir -p "$dir"
+	echo "$r:$arm" >> "$OUTPUT/order.txt"
 	echo "=== round $r: $arm ==="
 	create_arm "$arm"
 	record_arm "$arm" "$dir"
@@ -584,6 +760,7 @@ def load(path):
     return iops, bw, p99
 
 data = {}       # (arm, test) -> {"iops": [...], "bw": [...], "p99": [...]}
+perrun = {}     # (arm, "round<R>", test) -> IOPS of that one run
 rebuild = {}    # arm -> [secs]
 env = {}
 for arm in arms:
@@ -596,6 +773,7 @@ for arm in arms:
             d = data.setdefault((arm, t), {"iops": [], "bw": [], "p99": [],
                                            "mw": [], "mwp": [], "mr": [], "mrp": []})
             d["iops"].append(iops); d["bw"].append(bw); d["p99"].append(p99)
+            perrun[(arm, os.path.basename(rdir), t)] = iops
             mf = os.path.join(rdir, f"{t}_run1.members.json")
             if os.path.exists(mf):
                 mj = json.load(open(mf))
@@ -706,6 +884,51 @@ if rebuild:
         emit(f"- {arm}: {m:.1f}s{ratio}")
         rows.append({"arm": arm, "workload": "rebuild", "metric": "seconds", "mean": round(m, 3),
                      "cv_pct": round(cv, 2), "ratio_vs_baseline": round(m / b, 4) if b else ""})
+
+# Every run in the order it ran.  A mean hides a position effect (the first run
+# on fresh flash, a GC stall); this table shows it.
+order_file = os.path.join(out, "order.txt")
+order = []
+if os.path.exists(order_file):
+    order = [l.strip().split(":", 1) for l in open(order_file) if ":" in l]
+else:   # results from before order.txt existed: reconstruct ABBA
+    rounds = sorted({int(k[1][5:]) for k in perrun if k[1][5:].isdigit()})
+    for r in rounds:
+        seq = arms if r % 2 else list(reversed(arms))
+        order += [[str(r), a] for a in seq]
+outliers = []
+if len(order) > 2:
+    emit()
+    emit("## IOPS per run, in execution order")
+    emit()
+    emit("`*` = more than 10% away from the median of the other runs of that workload "
+         "(all arms). A flag on the first column is the classic sign of fresh-drive bias; "
+         "use --warmup / --precondition=steady.")
+    emit()
+    emit("| workload | " + " | ".join(f"{i + 1}. {a} r{r}" for i, (r, a) in enumerate(order)) + " |")
+    emit("|" + "---|" * (1 + len(order)))
+    for t in tests:
+        vals = [perrun.get((a, f"round{r}", t)) for r, a in order]
+        if not any(v is not None for v in vals):
+            continue
+        cells = []
+        for i, v in enumerate(vals):
+            if v is None:
+                cells.append("-")
+                continue
+            others = [x for j, x in enumerate(vals) if j != i and x is not None]
+            flag = ""
+            if others and statistics.median(others) and \
+               abs(v / statistics.median(others) - 1) > 0.10:
+                flag = "*"
+                outliers.append(f"{t} run {i + 1} ({order[i][1]} r{order[i][0]})")
+            cells.append(f"{v:.0f}{flag}")
+        emit(f"| {t} ({DESC[t]}) | " + " | ".join(cells) + " |")
+
+if outliers:
+    emit()
+    emit(f"**{len(outliers)} run(s) sit more than 10% from the other runs of the same workload — "
+         "check the per-run table before trusting a ratio:** " + ", ".join(outliers))
 
 if noisy:
     emit()

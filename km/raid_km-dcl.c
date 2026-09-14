@@ -680,13 +680,22 @@ int raidkm_dcl_load(struct r5conf *conf, struct mddev *mddev)
 	 * population redoes rows [journal, crash) — idempotent spare
 	 * rewrites. */
 	spin_lock_init(&conf->reb_win_lock);
+	init_waitqueue_head(&conf->reb_win_wait);
+	conf->reb_fail_sector = U64_MAX;
+	conf->reb_next = U64_MAX;
 	conf->nreb = 0;
 	conf->reb_pop = -1;
 	conf->reb_want = -1;
 	conf->reb_gen = best_gen;
 	/* window + assignment table allocated unconditionally: runtime
 	 * arming needs them too */
-	conf->reb_win_bits = bitmap_zalloc(RKDCL_REB_WINDOW, GFP_KERNEL);
+	/* the completion window, a power of two for the mask arithmetic in
+	 * raidkm_dcl_pop_done().  Its size only sets how far population may
+	 * run ahead of its slowest stripe before it waits
+	 * (raidkm_dcl_pop_admit), never whether it can overrun */
+	conf->reb_win_size = roundup_pow_of_two(
+		clamp_t(u32, raidkm_dcl_pop_window, 64, 1U << 22));
+	conf->reb_win_bits = bitmap_zalloc(conf->reb_win_size, GFP_KERNEL);
 	conf->reb = kcalloc(ge->s, sizeof(*conf->reb), GFP_KERNEL);
 	if (!conf->reb_win_bits || !conf->reb) {
 		err = -ENOMEM;
@@ -923,27 +932,39 @@ int raidkm_dcl_journal_write(struct r5conf *conf, bool strict)
  * DEVICE SECTORS.  Completions may reorder inside md's flight window, so
  * they are collected in a circular bitmap and the mark only advances over a
  * solid prefix (a populated-but-unmarked row keeps decoding on the fly —
- * correct, merely slower). */
+ * correct, merely slower).
+ *
+ * Nothing can arrive past the window: raidkm_dcl_pop_admit() stops the sync
+ * thread from issuing that far ahead.  Before it existed, one slow stripe on
+ * a large, fast array let md run more than the window past the oldest
+ * unfinished address; the overrun was dropped, the mark stopped for the
+ * rest of the pass, and md re-scanned the device forever.  The WARN below is
+ * now an invariant check, not a load warning.  Waiters are woken whenever
+ * the prefix moves. */
 void raidkm_dcl_pop_done(struct r5conf *conf, sector_t sector)
 {
 	u64 granule = (u64)sector;
+	u32 wmask = conf->reb_win_size - 1;
 	unsigned long flags;
+	bool moved = false;
 
 	do_div(granule, RAID5_STRIPE_SECTORS(conf));
 	spin_lock_irqsave(&conf->reb_win_lock, flags);
 	if (granule < conf->reb_win_base)	/* journal-resume redo */
 		goto out;
-	if (WARN_ON_ONCE(granule >= conf->reb_win_base + RKDCL_REB_WINDOW))
-		goto out;	/* mark stalls; correctness kept (decode) */
-	__set_bit(granule % RKDCL_REB_WINDOW, conf->reb_win_bits);
-	while (test_bit(conf->reb_win_base % RKDCL_REB_WINDOW,
-			conf->reb_win_bits)) {
-		__clear_bit(conf->reb_win_base % RKDCL_REB_WINDOW,
-			    conf->reb_win_bits);
+	if (WARN_ON_ONCE(granule >= conf->reb_win_base + conf->reb_win_size))
+		goto out;	/* invariant broken; mark stalls, decode still correct */
+	__set_bit(granule & wmask, conf->reb_win_bits);
+	while (test_bit(conf->reb_win_base & wmask, conf->reb_win_bits)) {
+		__clear_bit(conf->reb_win_base & wmask, conf->reb_win_bits);
 		conf->reb_win_base++;
+		moved = true;
 	}
 	atomic64_set(&conf->reb_mark,
 		     conf->reb_win_base * RAID5_STRIPE_SECTORS(conf));
 out:
 	spin_unlock_irqrestore(&conf->reb_win_lock, flags);
+	/* after the unlock: the mark a waiter tests is already published */
+	if (moved && wq_has_sleeper(&conf->reb_win_wait))
+		wake_up(&conf->reb_win_wait);
 }

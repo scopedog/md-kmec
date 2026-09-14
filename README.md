@@ -549,7 +549,7 @@ chunk, 1 MiB sequential I/O; the rig reproduces an NVMe-oF QLC array's table):
 | full-row writes, **m ≥ 3** | **127 KiB** with `rk_batch_mparity=1` (~5 KiB without) |
 | degraded reads (classic / declustered) | **128 KiB** (`rk_row_dread`, on by default) |
 | rebuild onto a spare: survivor reads / spare writes | **128 KiB / 128 KiB** with `rk_row_rebuild=1` (~5 / ~7 KiB without) |
-| declustered population: survivor reads / spare-column writes | ~25 / ~49 KiB with `rk_bio_sort=2` (~5.5 / ~8 KiB without) |
+| declustered population: survivor reads / spare-column writes | ~5.5 / ~8 KiB (a population-completion bug is fixed; see below) |
 | declustered copy back to a replacement | ~128 KiB |
 
 Degraded reads and rebuild go through 4 KiB stripe units on both raidkm and
@@ -582,12 +582,29 @@ the same as the classic one within a few percent at every point above.  Below
 the chunk size the row layer does not change the request size — it wins there
 by reading one fewer member and skipping the stripe-head machinery.
 
-Anything it cannot serve safely falls back to the stripe cache unchanged:
-native-checksum arrays, an attached write journal or PPL, a reshape in
-progress, more than m missing members, a read racing a write to the same row,
-a failed buffer allocation, and — on a declustered array — a live spare
-population or copy-back session.  Rebuild and population are still 4 KiB (next
-in the same work).
+A read that spans several chunks of one row, with exactly one of them on the
+missing member, reads that row **once**: the k sources are read, the healthy
+chunks are served from them and the missing chunk from the decode (counted as
+`dread_wide` in `rk_row_stats`).  Reading the healthy chunks through the bypass
+and then again as decode sources cost 1.70× survivor reads at 8+2, which on
+bandwidth-bound drives made the row layer slower than stock.  On 8+2 local NVMe
+(128 KiB chunk, 1 MiB sequential, same boot):
+
+| degraded 1 MiB read | throughput | request at the members | busy cores |
+|---|---|---|---|
+| stock raid6 | 5,619 MiB/s | 10.2 KiB | 5.1 |
+| raidkm, rotating | **6,252 MiB/s** (1.11×) | 128 KiB | 1.4 |
+| raidkm, declustered 8+2 over 12 | **6,537 MiB/s** (1.16×) | 128 KiB | 1.1 |
+
+That instance caps its local drives at ~6,565 MiB/s of reads in total, so the
+declustered figure is the platform's ceiling, not the row layer's.
+
+Anything it cannot serve safely falls back to the stripe cache unchanged: an
+attached write journal or PPL, a reshape in progress, more than m missing
+members, a read racing a write to the same row, a failed buffer allocation, a
+block whose native checksum does not verify, and — on a declustered array — a
+live spare population or copy-back session.  Rebuild has its own row path,
+`rk_row_rebuild`, below; declustered population is still 4 KiB stripe work.
 
 Validation behind the default: the degraded, replace and declustered suites
 plus gated race harnesses (concurrent 4 KiB read-modify-writes into the rows
@@ -595,10 +612,23 @@ being decoded, with a checker proven able to fail and stock-md control arms) on
 a KASAN + lockdep kernel — clean over ~58,000 decodes and ~530 raced fallbacks;
 and a build with half of the row layer's buffer allocations forced to fail,
 where 8,410 declines fell back to the stripe cache and every byte still
-verified.  Not yet covered: real large-IU flash — every number here is from a
-memory-backed rig with a latency model.  If you hit a case where the stripe
+verified.  On real NVMe, a 64 GiB region read degraded hashes identical to the
+healthy read at 1 MiB and at unaligned O_DIRECT sizes, classic and declustered,
+with a positive control that must change the hash.  Not yet covered: large-IU
+QLC flash itself — the NVMe above is TLC.  If you hit a case where the stripe
 path is better, `echo 0 > /sys/block/mdX/md/rk_row_dread` is the switch, and
 please report it.
+
+**Native checksum through the row layer.**  A `--checksum` array used to
+decline both row paths and keep 5 KiB degraded reads and 5–8 KiB rebuilds —
+silently, since the bail happened before any counter.  It no longer does: the
+row engine verifies every block it reads against the stored CRC before it
+decodes — the same guarantee the stripe path gives — and a row rebuild
+publishes CRCs for the chunk it writes before writing it.  A row
+whose CRCs disagree is handed to the stripe cache, which re-reads, warns and
+heals, exactly as an unverified bypass read is; `rk_row_stats` counts those as
+`dread_csum_bad` and `rebuild_csum_bad`.  So integrity and chunk-unit I/O are
+no longer an either/or.
 
 **`rk_row_rebuild` — rebuild a whole row at a time (opt-in).**  Writing 1 to
 `/sys/block/mdX/md/rk_row_rebuild` (or `default_row_rebuild=1` at module load)
@@ -615,10 +645,11 @@ rebuild never blocks foreground I/O.  Measured on the rig (8+2, 128 KiB chunk,
 | stripe path | 5.2 KiB | 7.4 KiB | 743 MiB/s | 7.6 |
 | `rk_row_rebuild=1` | **128 KiB** | **128 KiB** | **1284 MiB/s** | **1.8** |
 
-It covers classic layouts only: a declustered population, native checksum, an
-attached log or PPL, a live reshape, a second missing member and
-replacement-device rebuilds all keep the stripe path.  `rk_row_stats` reports
-`rebuild_done` and `rebuild_declined`.
+It covers classic layouts only: a declustered population, an attached log or
+PPL, a live reshape, a second missing member and replacement-device rebuilds
+all keep the stripe path.  A `--checksum` array is rebuilt here too (see
+above).  `rk_row_stats` reports `rebuild_done`, `rebuild_declined` and
+`rebuild_csum_bad`.
 
 **`rk_bio_sort` — order the resync/recovery submissions (opt-in).**  raid5 can
 collect a handled stripe's member bios and submit them in stripe-sector order,
@@ -630,7 +661,23 @@ notably **declustered population** (survivor reads ~6 → 25 KiB, spare-column
 writes ~8 → 49 KiB, +11% rate), with foreground I/O unchanged.  Mode 1 costs
 ~35% of healthy sequential write throughput, because those writes already reach
 the members at 127 KiB and only pay the added latency — do not use it on flash.
+
 `default_bio_sort` sets it for new arrays.
+
+> **Fixed — declustered population could fail to complete on large, fast arrays.**
+> `raidkm_dcl_pop_done()` recorded finished population addresses in a fixed 64 MiB
+> window above the oldest unfinished one; one population stripe delayed while md
+> ran more than 64 MiB ahead (~0.1 s at 600 MiB/s) dropped an address, the mark
+> stopped advancing and md re-scanned forever (data stayed correct).  md's sync
+> is now held back instead: before issuing a stripe beyond the window it waits
+> for the window to advance (`backpressure waits` in `rk_dcl_populate`; window
+> size `raidkm_dcl_pop_window`, default 16384 granules).  A stripe that cannot be
+> reconstructed — more members failed there than parity covers — pauses
+> population with an error naming the sector instead of re-scanning; a repair
+> retries it.  Validated on real NVMe (`rk_bio_sort` 0 and 2 both complete) and
+> under KASAN + lockdep (`tools/raidkm-test-declustered-populate-window.sh`).  The
+> mode-2 population numbers above were measured before the fix and need
+> re-measuring before `rk_bio_sort` is recommended on declustered arrays again.
 
 **`rk_batch_mparity` — batch full-row writes at m ≥ 3 (opt-in).**  Above m=2,
 `stripe_can_batch()` refuses to batch, so a full-row write reaches the members
@@ -666,6 +713,10 @@ On large-IU flash:
   boundary (mdadm already rounds its data offset to 1 MiB);
 - **check, don't assume**: `raidkm-ab-benchmark.sh` and
   `raidkm-standard-benchmark.sh` report the member request size per workload.
+  On flash, compare write numbers only from runs that start from the same drive
+  state: the A/B wrapper runs a discarded warm-up pass by default (the first
+  run on fresh drives reads high) and `--precondition=steady` brings every
+  member to steady state first.
 
 #### Worker threads
 
@@ -876,16 +927,22 @@ md-kmec/
 │   ├── raidkm-test-reshape-crash.sh    # power-loss/torn-write recovery of the COW reshape (fault-inject build)
 │   ├── raidkm-test-selfheal.sh        # checksum-driven self-heal (NATIVE=1 or dm-integrity)
 │   ├── raidkm-test-csum-thrash.sh     # native-checksum region-cache eviction round-trip
+│   ├── raidkm-test-row-dread-wide.sh  # degraded span read once per row (unaligned, races, dcl)
+│   ├── raidkm-test-row-csum.sh        # native checksum through the row paths (poisoned survivors refused)
+│   ├── raidkm-test-declustered-populate-window.sh  # population backpressure window, pause + retry
 │   ├── raidkm-standard-benchmark.sh   # fio harness (7 workloads incl. 1 MiB
 │   │                                    # sequential) + member request size,
 │   │                                    # Test-7 rebuild/populate wall-clock
 │   │                                    # (--rebuild-victim=DEV)
 │   ├── raidkm-ab-benchmark.sh         # A/B vs stock md on the same disks:
-│   │                                    # raw / raid6 / raid6-intree / raidkm<M>,
-│   │                                    # ABBA order, ratio tables
+│   │                                    # raw / raid6 / raid6-intree / raidkm<M> / dcl<M>,
+│   │                                    # ABBA order + discarded warm-up pass,
+│   │                                    # --precondition=steady, ratio tables and
+│   │                                    # every run in execution order
 │   ├── raidkm-bench-iosize.sh         # request size + merge share at the members
 │   │                                    # per I/O state (healthy, degraded, rebuild,
 │   │                                    # declustered populate/copyback); null_blk rig
+│   │                                    # or --devs; --checksum prices native CRC
 │   ├── raidkm-member-stats.sh         # sourced helper: member request counters
 │   └── raidkm-create.sh               # sysfs array creation; needs adapting
 │                                    # to "raidkm" name / level 71

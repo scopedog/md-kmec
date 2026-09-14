@@ -211,7 +211,8 @@ rk_create() {
 	# region can't leave stale CRCs behind (mdadm zeroing the reserved region at
 	# create is the product-side follow-up); otherwise just wipe the head.
 	for d in "$@"; do
-		if [[ "${RK_CREATE_EXTRA:-}" == *integrity* ]]; then
+		if [[ "${RK_CREATE_EXTRA:-}" == *integrity* || \
+		      "${RK_CREATE_EXTRA:-}" == *checksum* ]]; then
 			sudo dd if=/dev/zero of="$d" bs=1M status=none 2>/dev/null || true
 		else
 			sudo dd if=/dev/zero of="$d" bs=1M count=4 status=none 2>/dev/null
