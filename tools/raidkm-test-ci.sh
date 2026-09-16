@@ -57,7 +57,8 @@ set -u
 PATH="$PATH:/usr/sbin:/sbin"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window declustered-degraded replace)
+SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window declustered-degraded replace
+       scrub-badblocks degraded-trust-disk row-rebuild-load)
 # <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.

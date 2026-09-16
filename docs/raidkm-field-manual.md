@@ -864,7 +864,11 @@ Rebuild onto a spare no longer is:
   Classic layouts only; anything else keeps the stripe path, and a row with
   foreground I/O in flight is skipped rather than blocked.
   `echo 0 > /sys/block/mdX/md/rk_row_rebuild` (or `default_row_rebuild=0`)
-  returns an array to 4 KiB stripe rebuild.
+  returns an array to 4 KiB stripe rebuild. Every whole chunk of a pass is
+  accounted — `rebuild_done + rebuild_stripe_chunks` in `rk_row_stats` equals
+  the member's chunks, so a chunk that leaves the row path is never unseen —
+  and the rebuild buffers are built once per pass, falling back to order-0
+  pages when no folio is available.
 - ~~`rk_bio_sort=2` for declustered population~~ — **withdrawn** until
   re-measured: its gain was measured while a bug (now fixed) could stop
   declustered population from completing on large, fast arrays. Population
@@ -989,6 +993,9 @@ NATIVE=1 tools/raidkm-test-selfheal.sh # checksum-driven heal (or dm-integrity b
 NATIVE=1 tools/raidkm-test-csum-thrash.sh  # CRC-region cache eviction round-trip
 tools/raidkm-test-row-dread-wide.sh    # degraded span read once per row: unaligned, two failures, races, dcl
 NATIVE=1 tools/raidkm-test-row-csum.sh # checksum verified/published through the row paths
+tools/raidkm-test-scrub-badblocks.sh   # check/repair over a live member's recorded bad blocks
+tools/raidkm-test-degraded-trust-disk.sh # a readable block is read from disk, never decoded from parity
+tools/raidkm-test-row-rebuild-load.sh  # row rebuild under a degraded read: every chunk accounted, data intact
 tools/raidkm-test-declustered-*.sh     # ~30 declustered gates: map, io, populate, populate-window, rebalance, reshape…
 
 # benchmark harness: 7 fio workloads (member request size recorded per workload)

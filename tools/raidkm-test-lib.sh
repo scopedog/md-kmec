@@ -58,10 +58,14 @@ rk_resolve_mdadm() {
 	local c home cand
 	home=$(getent passwd "${SUDO_USER:-$USER}" 2>/dev/null | cut -d: -f6)
 	[ -n "$home" ] || home="$HOME"
+	# The checkout's own sibling mdadm (the mdraid-super layout) comes right
+	# after an explicit MDADM: an older fork build elsewhere in $home also
+	# contains "raidkm" but can predate options the suites need (declustered
+	# and --checksum creates failed that way against a June build).
 	cand=( "$MDADM"
+	       "$RK_TREE/../mdadm/mdadm"
 	       "$home/projects/mdraid/mdadm/mdadm"
 	       "$home/mdadm/mdadm"
-	       "$RK_TREE/../mdadm/mdadm"
 	       "$(command -v mdadm 2>/dev/null)" )
 	for c in "${cand[@]}"; do
 		[ -n "$c" ] && [ -x "$c" ] && grep -qa raidkm "$c" && { MDADM="$c"; return 0; }
@@ -158,6 +162,17 @@ rk_setup_brd() {
 		return 1
 	fi
 	have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
+	# Enough ram devices, but brd loaded at another size (an earlier caller
+	# or a hand run) changes every size-derived address a test computes;
+	# reload it at BRD_SIZE_KB below unless something still holds a device.
+	if [ "$have" -ge "$need" ] &&
+	   [ "$(cat /sys/module/brd/parameters/rd_size 2>/dev/null)" != "$BRD_SIZE_KB" ]; then
+		want=$need; [ "${BRD_NR:-0}" -gt "$want" ] && want=$BRD_NR
+		if sudo rmmod brd 2>/dev/null; then
+			sudo modprobe brd rd_nr="$want" rd_size="$BRD_SIZE_KB" 2>/dev/null || true
+			have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
+		fi
+	fi
 	[ "$have" -ge "$need" ] && return 0
 	# Too few ram devices.  brd may already be loaded at a smaller rd_nr from a
 	# prior (smaller-NDISK) test -- a plain modprobe is then a no-op, the count

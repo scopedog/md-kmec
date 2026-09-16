@@ -229,11 +229,22 @@ if create_dcl; then
 	write_pattern
 	sudo dmesg -C
 	BADS=${2:-$((cs * 32))}				# chunk-aligned bad-block sector
-	if [ "$BADS" = end ]; then			# two chunks before the device end
-		BADS=$(( ($(cat "$(mdsys component_size)") * 2 / cs - 2) * cs ))
+	BADLEN=$cs
+	if [ "$BADS" = end ]; then
+		# The last rows before the device end, the last one two chunks
+		# short of it.  One row is not enough: population skips a row
+		# where the victim holds a spare column (nothing of it lives
+		# there), and which row that is depends on the member size — at
+		# 256 MiB members the single row two chunks from the end is such
+		# a row.  In this suite's geometry (12 disks, g=10, s=2, mdadm's
+		# seed search) no disk holds a spare column more than 2 rows in a
+		# row (tools/declustered-sim.c --rowmap), so population meets the
+		# failure in one of these eight.
+		BADLEN=$((cs * 8))
+		BADS=$(( ($(cat "$(mdsys component_size)") * 2 / cs - 9) * cs ))
 	fi
 	for d in "${MEMBERS[@]:0:$((N - 1))}"; do		# every member but the victim
-		echo "$BADS $cs" | sudo tee "$(mdsys "dev-$(basename "$d")/bad_blocks")" >/dev/null 2>&1
+		echo "$BADS $BADLEN" | sudo tee "$(mdsys "dev-$(basename "$d")/bad_blocks")" >/dev/null 2>&1
 	done
 	rk_log "bad block '$(cat "$(mdsys "dev-$(basename "${MEMBERS[0]}")/bad_blocks")" 2>&1 | head -1)' on $((N - 1)) members"
 	if arm_population; then

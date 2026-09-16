@@ -656,7 +656,17 @@ It covers classic layouts only: a declustered population, an attached log or
 PPL, a live reshape, a second missing member and replacement-device rebuilds
 all keep the stripe path.  A `--checksum` array is rebuilt here too (see
 above).  `rk_row_stats` reports `rebuild_done`, `rebuild_declined` and
-`rebuild_csum_bad`.
+`rebuild_csum_bad`, and accounts for the whole chunks a pass rebuilds:
+`rebuild_done + rebuild_stripe_chunks` is the member's chunk count, where
+`rebuild_stripe_chunks` counts chunks md rebuilt through the stripe cache after
+the row path claimed nothing at a chunk boundary.  The rebuild buffers are
+built once per pass — a folio each, or order-0 pages mapped contiguously when
+the page allocator has no folio — so a buffer shortage cannot take the row
+rebuild away; `rebuild_set_workers` and `rebuild_set_page_bufs` describe
+the last set built, `rebuild_band_nomem` counts bands that found none (a failed
+build is retried a second later), and `rebuild_unclaimed` counts rows finished
+past a declined row in their band, which are rebuilt again.  The
+module parameter `debug_row_rebuild_pages=Y` forces the page form (testing).
 
 **`rk_bio_sort` — order the resync/recovery submissions (opt-in).**  raid5 can
 collect a handled stripe's member bios and submit them in stripe-sector order,
@@ -951,6 +961,9 @@ md-kmec/
 │   ├── raidkm-test-row-dread-wide.sh  # degraded span read once per row (unaligned, races, dcl)
 │   ├── raidkm-test-row-csum.sh        # native checksum through the row paths (poisoned survivors refused)
 │   ├── raidkm-test-declustered-populate-window.sh  # population backpressure window, pause + retry
+│   ├── raidkm-test-scrub-badblocks.sh # check/repair over a live member's bad-block log (no WARN, data intact)
+│   ├── raidkm-test-degraded-trust-disk.sh # a readable block is read, never decoded (parity wrong: data intact)
+│   ├── raidkm-test-row-rebuild-load.sh # row rebuild under a degraded sequential read: every chunk accounted, data intact
 │   ├── raidkm-test-ci.sh              # CI entry point: --tier=smoke|quick|full, JUnit XML,
 │   │                                    # kernel-log scan, refuses hosts with other md arrays
 │   ├── raidkm-standard-benchmark.sh   # fio harness (7 workloads incl. 1 MiB

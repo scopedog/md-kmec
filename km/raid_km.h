@@ -911,6 +911,18 @@ struct r5conf {
 	atomic64_t		row_rebuild_done;	/* rows rebuilt as one chunk */
 	atomic64_t		row_rebuild_declined;	/* rows left to the stripe cache */
 	atomic64_t		row_rebuild_csum_bad;	/* native csum rejected it: stripe cache */
+	atomic64_t		row_rebuild_band_nomem;	/* a band could not set up its workers */
+	atomic64_t		row_rebuild_unclaimed;	/* rebuilt past a declined row in its band:
+							 * not claimed, rebuilt again */
+	atomic64_t		row_rebuild_stripe_chunks; /* chunks md then rebuilt through the
+							    * stripe cache: nothing claimed at a
+							    * chunk boundary */
+	/* row rebuild buffers, built on a recovery pass's first band and
+	 * freed when the pass finishes (raid_km.c raidkm_row_rb_set_get) */
+	struct raidkm_row_rb_set *row_rb;
+	unsigned long		row_rb_retry;	/* jiffies: build failed, no set before then */
+	int			row_rb_nwk;	/* workers in the last set built (rk_row_stats) */
+	int			row_rb_page_bufs; /* of its buffers, built from order-0 pages */
 	atomic_t		pending_full_writes; /* full write backlog */
 	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */
