@@ -964,7 +964,12 @@ md-kmec/
 │   ├── raidkm-test-scrub-badblocks.sh # check/repair over a live member's bad-block log (no WARN, data intact)
 │   ├── raidkm-test-degraded-trust-disk.sh # a readable block is read, never decoded (parity wrong: data intact)
 │   ├── raidkm-test-row-rebuild-load.sh # row rebuild under a degraded sequential read: every chunk accounted, data intact
-│   ├── raidkm-test-ci.sh              # CI entry point: --tier=smoke|quick|full, JUnit XML,
+│   ├── raidkm-test-faultinject.sh     # kernel fault injection (fail_make_request/page_alloc/io_timeout)
+│   │                                    # under fsx + fsstress on ext4 (debug kernel, nightly)
+│   ├── raidkm-test-xfstests.sh        # xfstests on ext4 over raidkm, healthy + degraded (nightly)
+│   ├── raidkm-test-mdadm-suite.sh     # mdadm's own raid6 tests adapted to raidkm (nightly;
+│   │                                    # stops every array, detaches every loop device)
+│   ├── raidkm-test-ci.sh              # CI entry point: --tier=smoke|quick|full|nightly, JUnit XML,
 │   │                                    # kernel-log scan, refuses hosts with other md arrays
 │   ├── raidkm-standard-benchmark.sh   # fio harness (7 workloads incl. 1 MiB
 │   │                                    # sequential) + member request size,

@@ -982,6 +982,17 @@ sudo MDADM=../mdadm/mdadm bash tools/raidkm-test.sh          # core regression s
 # It refuses a host with other active md arrays; the list per tier: --list.
 sudo MDADM=../mdadm/mdadm bash tools/raidkm-test-ci.sh --tier=smoke
 
+# nightly: quick + three suites built on independent tools — the kernel's own
+# fault injection under fsx/fsstress, xfstests on ext4 healthy and degraded,
+# and mdadm's own raid6 tests adapted to raidkm.  Needs a debug kernel
+# (KASAN, lockdep, CONFIG_FAULT_INJECTION, CONFIG_FAIL_MAKE_REQUEST), a built
+# xfstests (XFSTESTS_DIR), ~16 GiB of memory and a disposable machine; a suite
+# whose kernel or host lacks something reports "skip" with the reason.  The
+# dma-debug "cacheline tracking EEXIST" warning is a known x86 false positive
+# and is counted, not failed.
+sudo MDADM=../mdadm/mdadm XFSTESTS_DIR=~/xfstests-dev \
+     bash tools/raidkm-test-ci.sh --tier=nightly --allow-stop-all
+
 # individual gates
 tools/raidkm-test-functional.sh        # create/write/read/scrub × both layouts × m=2/3/4
 tools/raidkm-test-degraded.sh          # max-degraded reconstruction, read + write

@@ -42,6 +42,12 @@ rk_log()  { echo "    $*"; }
 rk_pass() { RK_PASS=$((RK_PASS + 1)); echo "  PASS: $*"; }
 rk_fail() { RK_FAIL=$((RK_FAIL + 1)); echo "  FAIL: $*" >&2; }
 
+# The kernel or host lacks something the whole suite needs (a config option, a
+# tool): say why and exit 77, which raidkm-test-ci.sh reports as skipped rather
+# than passed or failed.
+RK_SKIP=77
+rk_skip() { echo "SKIP: $*"; exit "$RK_SKIP"; }
+
 # Print a summary and return non-zero if anything failed (use as the exit code).
 rk_summary() {
 	echo
@@ -367,11 +373,48 @@ rk_grow_parity() { sudo "$MDADM" --grow "$MD" --add-parity --backup-file="$RK_BA
 # Current [active/total] geometry from /proc/mdstat, for reporting.
 rk_geom() { grep -A1 "$MDNAME" /proc/mdstat | tail -1 | grep -o '\[[0-9]*/[0-9]*\]'; }
 
-# No-WARN/BUG check on the kernel ring buffer since the last rk_dmesg_clear.
+# Kernel reports that are known platform artifacts, not md defects.  Each is a
+# whole WARN block ("cut here" .. "end trace") recognised by its WARNING line:
+#   add_dma_entry  dma-debug "cacheline tracking EEXIST, overlapping mappings
+#                  aren't supported" (CONFIG_DMA_API_DEBUG).  A false positive
+#                  on cache-coherent architectures such as x86_64: stock raid6
+#                  under the same fault-injection load reproduces it, and
+#                  upstream suppresses it there; RHEL 10.2 kernels predate that.
+RK_DMESG_KNOWN='at kernel/dma/debug[.]c:[0-9]+ add_dma_entry'
+
+# Kernel reports that fail a suite (raidkm-test-ci.sh scans each suite's log
+# with this; suites that judge their own dmesg windows use rk_dmesg_splats).
+RK_SPLAT='BUG: KASAN|KASAN:|possible circular locking|inconsistent lock state|WARNING: possible|BUG: sleeping function|ODEBUG:|suspicious RCU usage|BUG: spinlock|bad unlock balance|held lock freed|WARNING: CPU|BUG: unable|Oops|kernel BUG|task .* blocked for more than'
+
+# Filter a kernel log on stdin: drop every WARN block matching RK_DMESG_KNOWN.
+# The number of blocks dropped goes to the file named by $1, if given.
+rk_dmesg_filter_known() {
+	awk -v known="$RK_DMESG_KNOWN" -v countfile="${1:-}" '
+		function flush(keep) { if (keep) printf "%s", blk; blk = ""; inblk = 0; hit = 0 }
+		/-+\[ cut here \]-+/ { if (inblk) flush(1); inblk = 1; blk = $0 "\n"; next }
+		inblk {
+			blk = blk $0 "\n"
+			if ($0 ~ known) hit = 1
+			if ($0 ~ /---\[ end trace/) { if (hit) n++; flush(!hit) }
+			next
+		}
+		{ print }
+		END { if (inblk) { if (hit) n++; flush(!hit) } if (countfile != "") print n + 0 > countfile }'
+}
+
+# Count the RK_SPLAT lines of a kernel log file, known artifacts excluded; the
+# number of known reports dropped goes to the file named by $2, if given.
+rk_dmesg_splats() {	# rk_dmesg_splats <dmesg-file> [known-count-file]
+	rk_dmesg_filter_known "${2:-}" < "$1" | grep -c -E "$RK_SPLAT"
+}
+
+# No-WARN/BUG check on the kernel ring buffer since the last rk_dmesg_clear
+# (known artifacts, above, excluded).
 rk_dmesg_clear() { sudo dmesg -C >/dev/null 2>&1 || true; }
 rk_dmesg_clean() {
 	local hits
-	hits=$(sudo dmesg 2>/dev/null | grep -iE 'WARN|BUG|map not correct|call trace|gf_invert' |
+	hits=$(sudo dmesg 2>/dev/null | rk_dmesg_filter_known |
+		grep -iE 'WARN|BUG|map not correct|call trace|gf_invert' |
 		grep -civ 'appears to be on the same physical disk')
 	[ "${hits:-0}" -eq 0 ]
 }

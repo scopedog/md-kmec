@@ -10,7 +10,7 @@
 # picks up new gates by updating the checkout — no job change.
 #
 # Usage:
-#   sudo bash tools/raidkm-test-ci.sh [--tier=smoke|quick|full] [options]
+#   sudo bash tools/raidkm-test-ci.sh [--tier=smoke|quick|full|nightly] [options]
 #   bash tools/raidkm-test-ci.sh --list [--tier=...]
 #
 # Tiers:
@@ -25,13 +25,24 @@
 #           crash / multi-assignment suites.  Several of those stop EVERY md array
 #           on the host (mdadm --stop --scan): refused without --allow-stop-all.
 #           Run it only on a disposable machine.
+#   nightly quick + three suites built on independent mechanisms: the kernel's
+#           own fault injection under fsx/fsstress (faultinject), xfstests on
+#           ext4 over raidkm healthy and degraded (xfstests), and mdadm's own
+#           regression tests adapted to raidkm (mdadm-suite).  Meant for a
+#           debug kernel (KASAN, lockdep, CONFIG_FAULT_INJECTION,
+#           CONFIG_DMA_API_DEBUG) on a disposable machine with ~16 GiB of
+#           memory; several hours.  mdadm's harness stops every md array, so
+#           it needs --allow-stop-all.  A suite whose kernel or host lacks what
+#           it needs (fault injection, ext4, a built xfstests) is reported as
+#           skipped, with the reason, instead of passing.
 #
 # Options:
-#   --tier=NAME            smoke (default), quick or full
+#   --tier=NAME            smoke (default), quick, full or nightly
 #   --suites=LIST          run exactly these suites instead (comma-separated
 #                          names as in tools/raidkm-test-<name>.sh)
 #   --output=DIR           results directory (default /var/tmp/raidkm-test-ci-<timestamp>)
-#   --suite-timeout=SEC    per-suite wall-clock limit (default 2400)
+#   --suite-timeout=SEC    per-suite wall-clock limit (default 2400; the nightly
+#                          suites default to their own, longer limits)
 #   --allow-stop-all       permit suites that stop every md array (tier full)
 #   --allow-existing-arrays  run even though other md arrays are active.  The
 #                          smoke/quick suites only use $MD (/dev/md70) and their
@@ -49,8 +60,12 @@
 # the brd module, and about 2 GiB of free memory for the ramdisks.
 #
 # Output (DIR): <suite>.log and <suite>.dmesg per suite, summary.txt, results.xml
-# (JUnit), env.txt.  Exit status: 0 only when every suite passed with a clean
-# kernel log; 1 on any failure; 2 on a pre-flight refusal.
+# (JUnit), env.txt.  Exit status: 0 only when every suite passed or was skipped
+# with a clean kernel log; 1 on any failure; 2 on a pre-flight refusal.
+#
+# Kernel log: known platform artifacts (RK_DMESG_KNOWN in raidkm-test-lib.sh,
+# today the dma-debug cacheline EEXIST false positive) are left out of the
+# verdict and counted in the suite's note instead.
 #
 
 set -u
@@ -65,13 +80,17 @@ SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window d
 QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate)
 FULL=("${QUICK[@]}" grow grow-traditional reshape-concurrent declustered-create declustered-io
       declustered-rebalance declustered-csum declustered-autoarm declustered-multi declustered-crash)
-# suites in FULL that run `mdadm --stop --scan` (directly or via rk_udev_quiesce)
-STOP_ALL=(declustered-multi declustered-crash)
+NIGHTLY=("${QUICK[@]}" faultinject xfstests mdadm-suite)
+# suites that run `mdadm --stop --scan` (directly, via rk_udev_quiesce, or in
+# mdadm's own test harness)
+STOP_ALL=(declustered-multi declustered-crash mdadm-suite)
+# per-suite wall-clock limits for suites longer than --suite-timeout's default
+declare -A SUITE_TIMEOUTS=([faultinject]=7200 [xfstests]=10800 [mdadm-suite]=7200)
 
 TIER=smoke
 SUITES_ARG=
 OUTPUT=
-SUITE_TIMEOUT=2400
+SUITE_TIMEOUT=
 ALLOW_STOP_ALL=0
 ALLOW_EXISTING=0
 KEEP_BRD=0
@@ -99,10 +118,11 @@ case "$TIER" in
 smoke) SUITES=("${SMOKE[@]}") ;;
 quick) SUITES=("${QUICK[@]}") ;;
 full)  SUITES=("${FULL[@]}") ;;
-*)     die "--tier must be smoke, quick or full" ;;
+nightly) SUITES=("${NIGHTLY[@]}") ;;
+*)     die "--tier must be smoke, quick, full or nightly" ;;
 esac
 [ -n "$SUITES_ARG" ] && IFS=, read -r -a SUITES <<< "$SUITES_ARG"
-[[ "$SUITE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--suite-timeout must be a positive integer"
+[ -z "$SUITE_TIMEOUT" ] || [[ "$SUITE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--suite-timeout must be a positive integer"
 
 for s in "${SUITES[@]}"; do
 	[ -f "$DIR/raidkm-test-${s%%@*}.sh" ] || die "no such suite: tools/raidkm-test-${s%%@*}.sh"
@@ -180,7 +200,7 @@ echo
 
 # ---- run -----------------------------------------------------------------------
 
-SPLAT='BUG: KASAN|KASAN:|possible circular locking|inconsistent lock state|WARNING: possible|BUG: sleeping function|ODEBUG:|suspicious RCU usage|BUG: spinlock|bad unlock balance|held lock freed|WARNING: CPU|BUG: unable|Oops|kernel BUG|task .* blocked for more than'
+SPLAT="$RK_SPLAT"			# raidkm-test-lib.sh
 
 xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 
@@ -188,6 +208,7 @@ declare -a R_NAME R_STATUS R_PASSED R_FAILED R_SECS R_NOTE
 dmesg -C 2>/dev/null
 total_start=$(date +%s)
 nfail=0
+nskip=0
 
 for s in "${SUITES[@]}"; do
 	echo "==== $s ===="
@@ -198,8 +219,9 @@ for s in "${SUITES[@]}"; do
 		pold=$(cat "$pfile" 2>/dev/null) || die "$s: raidkm has no module parameter ${pfile##*/}"
 		echo "${s##*=}" > "$pfile" || die "$s: cannot set ${pfile##*/}=${s##*=}"
 	fi
+	limit=${SUITE_TIMEOUT:-${SUITE_TIMEOUTS[${s%%@*}]:-2400}}
 	start=$(date +%s)
-	timeout --foreground --kill-after=60 "$SUITE_TIMEOUT" \
+	timeout --foreground --kill-after=60 "$limit" \
 		bash "$DIR/raidkm-test-${s%%@*}.sh" > "$OUTPUT/$f.log" 2>&1
 	rc=$?
 	secs=$(( $(date +%s) - start ))
@@ -209,11 +231,15 @@ for s in "${SUITES[@]}"; do
 	line=$(grep -E "==== .*: [0-9]+ passed, [0-9]+ failed ====" "$OUTPUT/$f.log" | tail -1)
 	passed=$(sed -n 's/.*: \([0-9]*\) passed.*/\1/p' <<< "$line")
 	failed=$(sed -n 's/.* \([0-9]*\) failed.*/\1/p' <<< "$line")
-	splats=$(grep -c -E "$SPLAT" "$OUTPUT/$f.dmesg" 2>/dev/null)
+	splats=$(rk_dmesg_splats "$OUTPUT/$f.dmesg" "$OUTPUT/$f.known")
+	known=$(cat "$OUTPUT/$f.known" 2>/dev/null); rm -f "$OUTPUT/$f.known"
 	note=""
 	status=pass
 	if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-		status=fail; note="timed out after ${SUITE_TIMEOUT}s"
+		status=fail; note="timed out after ${limit}s"
+	elif [ "$rc" = "$RK_SKIP" ]; then
+		status=skip; note=$(sed -n 's/^SKIP: //p' "$OUTPUT/$f.log" | head -1)
+		note=${note:-skipped}
 	elif [ "$rc" != 0 ]; then
 		status=fail; note="exit $rc"
 	elif [ -z "$line" ]; then
@@ -224,7 +250,9 @@ for s in "${SUITES[@]}"; do
 	if [ "${splats:-0}" != 0 ]; then
 		status=fail; note="${note:+$note; }$splats kernel warning line(s) in $f.dmesg"
 	fi
+	[ "${known:-0}" != 0 ] && note="${note:+$note; }$known known artifact report(s) ignored"
 	[ "$status" = fail ] && nfail=$((nfail + 1))
+	[ "$status" = skip ] && nskip=$((nskip + 1))
 	R_NAME+=("$s"); R_STATUS+=("$status"); R_PASSED+=("${passed:-0}")
 	R_FAILED+=("${failed:-0}"); R_SECS+=("$secs"); R_NOTE+=("$note")
 	printf '  %s  %s passed, %s failed, %ss%s\n' "${status^^}" "${passed:-?}" "${failed:-?}" "$secs" "${note:+  ($note)}"
@@ -241,7 +269,7 @@ fi
 # ---- report --------------------------------------------------------------------
 
 {
-	echo "raidkm-test-ci: tier $TIER, ${#SUITES[@]} suites, $nfail failed, ${total_secs}s"
+	echo "raidkm-test-ci: tier $TIER, ${#SUITES[@]} suites, $nfail failed, $nskip skipped, ${total_secs}s"
 	printf '%-36s %-5s %7s %7s %7s  %s\n' suite status passed failed seconds note
 	for i in "${!R_NAME[@]}"; do
 		printf '%-36s %-5s %7s %7s %7s  %s\n' "${R_NAME[$i]}" "${R_STATUS[$i]}" \
@@ -252,17 +280,20 @@ fi
 {
 	echo '<?xml version="1.0" encoding="UTF-8"?>'
 	echo "<testsuites name=\"raidkm-test-ci\" tests=\"${#SUITES[@]}\" failures=\"$nfail\" time=\"$total_secs\">"
-	echo "  <testsuite name=\"raidkm-$TIER\" tests=\"${#SUITES[@]}\" failures=\"$nfail\" time=\"$total_secs\" hostname=\"$(hostname | xml_escape)\">"
+	echo "  <testsuite name=\"raidkm-$TIER\" tests=\"${#SUITES[@]}\" failures=\"$nfail\" skipped=\"$nskip\" time=\"$total_secs\" hostname=\"$(hostname | xml_escape)\">"
 	for i in "${!R_NAME[@]}"; do
 		n="${R_NAME[$i]//[@=]/_}"
 		echo "    <testcase classname=\"raidkm.$TIER\" name=\"$(printf '%s' "${R_NAME[$i]}" | xml_escape)\" time=\"${R_SECS[$i]}\">"
+		if [ "${R_STATUS[$i]}" = skip ]; then
+			echo "      <skipped message=\"$(printf '%s' "${R_NOTE[$i]}" | xml_escape)\"/>"
+		fi
 		if [ "${R_STATUS[$i]}" = fail ]; then
 			echo "      <failure message=\"$(printf '%s' "${R_NOTE[$i]}" | xml_escape)\">"
 			{ grep -E "FAIL|ERROR" "$OUTPUT/$n.log" | head -20
 			  echo "---- last 40 lines of $n.log ----"
 			  tail -40 "$OUTPUT/$n.log"
 			  echo "---- kernel warnings ----"
-			  grep -E "$SPLAT" "$OUTPUT/$n.dmesg" | head -20; } | xml_escape
+			  rk_dmesg_filter_known < "$OUTPUT/$n.dmesg" | grep -E "$SPLAT" | head -20; } | xml_escape
 			echo "      </failure>"
 		fi
 		echo "      <system-out>${R_PASSED[$i]} passed, ${R_FAILED[$i]} failed; log $OUTPUT/$n.log</system-out>"

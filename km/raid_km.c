@@ -13751,7 +13751,8 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 		if (!wk[i].pg)
 			break;
 		wk[i].band = &band;
-		INIT_WORK(&wk[i].work, raidkm_dcl_copy_worker);
+		/* the workers live on this stack: flushed below before return */
+		INIT_WORK_ONSTACK(&wk[i].work, raidkm_dcl_copy_worker);
 		nwk++;
 	}
 	if (!nwk) {
@@ -13771,8 +13772,10 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 	raid5_quiesce(mddev, 1);
 	for (i = 0; i < nwk; i++)
 		queue_work(system_unbound_wq, &wk[i].work);
-	for (i = 0; i < nwk; i++)
+	for (i = 0; i < nwk; i++) {
 		flush_work(&wk[i].work);
+		destroy_work_on_stack(&wk[i].work);
+	}
 	/* partial tail row (dev_sectors not chunk-aligned): clamped copy */
 	if (!atomic_read(&band.error) &&
 	    band.row_end * conf->chunk_sectors < (u64)band_end) {
