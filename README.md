@@ -209,10 +209,15 @@ sequential read of the degraded array (Test 7L):
 | Under a read: rebuild MiB/s | 107 | **196** | 148 | 45 | 197 | **421** |
 | Under a read: foreground read, MiB/s | 758 | 3,636 | **4,982** | 1,027 | 7,663 | **10,402** |
 
-On an idle array tuned stock rebuilds fastest: its stripe cache keeps far more
-I/O in flight than raidkm's row rebuild, which runs 4 rows at a time.  On
-null_blk raidkm gets 86% of that rate on half the cores; on GCP's local SSDs,
-where each row waits on the members, 68%.  Under a foreground read raidkm
+On an idle array tuned stock rebuilt fastest in this run: its stripe cache
+keeps far more I/O in flight than the row rebuild did at 4 rows at a time
+(null_blk 86% of the rate on half the cores; GCP's local SSDs, where each row
+waits on the members, 68%).  The row rebuild now runs 8 rows at a time by
+default: on the same instance an idle rebuild went from 279 to 386 MiB/s on
+the NVMe members (385 with 16 rows, the rate one local SSD writes) and from
+459 to 757 MiB/s on null_blk (+5% more with 16 rows, on twice the cores);
+under a foreground read, 8 rows rebuild as fast as 4 on NVMe and 1.3× faster
+on null_blk, for 5% less read.  The table above predates that change.  Under a foreground read raidkm
 serves 1.37× (NVMe) and 1.36× (null_blk) the read of tuned stock, and on
 null_blk also rebuilds 2.1× faster; on the NVMe it rebuilds at 0.75× of tuned
 stock while doing so.

@@ -10380,7 +10380,14 @@ out_sources:
  * row that was not rebuilt.
  */
 #define RK_ROW_REBUILD_BAND	16	/* rows per sync step */
-#define RK_ROW_REBUILD_WORKERS	4
+/*
+ * Rows rebuilt in parallel within a band.  Each worker waits on its row's k
+ * survivor reads and one member write, so at flash latency the rebuild rate
+ * follows this count until the member being rebuilt is the limit: 8+2 on GCP
+ * local NVMe, 279 MiB/s with 4, 387 with 8, 385 with 16 (one member's write
+ * rate).  RK_ROW_RB_BUDGET still trims it on wide or large-chunk arrays.
+ */
+#define RK_ROW_REBUILD_WORKERS	8
 /* ceiling on one pass's rebuild buffers: nwk x (k + 1) chunks */
 #define RK_ROW_RB_BUDGET	(64UL << 20)
 
