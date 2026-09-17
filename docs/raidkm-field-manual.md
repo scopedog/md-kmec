@@ -868,7 +868,10 @@ Rebuild onto a spare no longer is:
   accounted — `rebuild_done + rebuild_stripe_chunks` in `rk_row_stats` equals
   the member's chunks, so a chunk that leaves the row path is never unseen —
   and the rebuild buffers are built once per pass, falling back to order-0
-  pages when no folio is available.
+  pages when no folio is available. A chunk that does leave the row path
+  under foreground I/O costs that one chunk only: the next chunk boundary
+  tries the row path again (on earlier builds the first such chunk
+  could keep the rest of the pass on the 4 KiB stripe path).
 - ~~`rk_bio_sort=2` for declustered population~~ — **withdrawn** until
   re-measured: its gain was measured while a bug (now fixed) could stop
   declustered population from completing on large, fast arrays. Population
@@ -1009,14 +1012,21 @@ tools/raidkm-test-degraded-trust-disk.sh # a readable block is read from disk, n
 tools/raidkm-test-row-rebuild-load.sh  # row rebuild under a degraded read: every chunk accounted, data intact
 tools/raidkm-test-declustered-*.sh     # ~30 declustered gates: map, io, populate, populate-window, rebalance, reshape…
 
-# benchmark harness: 7 fio workloads (member request size recorded per workload)
-# + a rebuild/populate wall-clock item
+# benchmark harness: 8 fio workloads (member request size and busy cores
+# recorded per workload) + a rebuild/populate wall-clock item
 tools/raidkm-standard-benchmark.sh --runs=3 --rebuild-victim=/dev/ram2
 
 # A/B against stock md on the same disks; on flash keep the default warm-up pass
 # and add --precondition=steady so no arm gets the fresh-drive first run
 tools/raidkm-ab-benchmark.sh --devs="/dev/nvme0n1 ... /dev/nvme0n10" \
     --arms=raid6,raidkm2 --chunk=128 --rounds=4 --precondition=steady
+
+# stock out of the box vs stock tuned by hand (raidkm's own knobs: worker
+# groups, 1024-stripe cache, skip_copy) vs raidkm, healthy and degraded, with
+# the rebuild idle and under a degraded sequential read
+tools/raidkm-ab-benchmark.sh --devs="/dev/nvme0n1 ... /dev/nvme0n10" \
+    --arms=raid6,raid6+tuned,raidkm2 --chunk=128 --rounds=4 --precondition=steady \
+    --degraded --rebuild --rebuild-load=seqread --rebuild-floor=200000
 
 # request size at the members per I/O state (healthy, degraded, rebuild,
 # declustered populate/copyback) on a null_blk rig

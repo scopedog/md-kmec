@@ -13859,6 +13859,52 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 	return band_end - sector_nr;
 }
 
+/*
+ * Row rebuild (sysfs rk_row_rebuild): the member this recovery pass rebuilds
+ * one chunk-aligned row at a time, or NULL when the pass must stay on the
+ * stripe cache.  Only a genuine single-member recovery on a classic layout
+ * qualifies; a resync, a check/repair, a replacement, a second missing member,
+ * a declustered array, a log or PPL, a reshape, or a pass resumed below the
+ * member's recovery_offset does not.  Whether a given chunk goes through a
+ * band is decided at the chunk boundary (raid5_sync_request).
+ */
+static struct md_rdev *raidkm_row_rebuild_target(struct mddev *mddev,
+						 sector_t sector_nr, int *tslot)
+{
+	struct r5conf *conf = mddev->private;
+	struct md_rdev *target = NULL;
+	int i, live = 0;
+
+	if (!READ_ONCE(conf->row_rebuild) || conf->dcl ||
+	    raid5_has_log(conf) || raid5_has_ppl(conf) ||
+	    conf->reshape_progress != MaxSector || !conf->chunk_sectors ||
+	    !test_bit(MD_RECOVERY_RECOVER, &mddev->recovery) ||
+	    test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) ||
+	    test_bit(MD_RECOVERY_SYNC, &mddev->recovery))
+		return NULL;
+
+	for (i = 0; i < conf->raid_disks; i++) {
+		struct md_rdev *rdev = conf->disks[i].rdev;
+
+		if (conf->disks[i].replacement)
+			return NULL;		/* v1: spares only */
+		if (!rdev || test_bit(Faulty, &rdev->flags))
+			continue;
+		if (test_bit(In_sync, &rdev->flags)) {
+			live++;
+			continue;
+		}
+		if (target)
+			return NULL;		/* one target only */
+		target = rdev;
+		*tslot = i;
+	}
+	if (!target || live != conf->raid_disks - 1 ||
+	    target->recovery_offset > sector_nr)
+		return NULL;
+	return target;
+}
+
 static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 				   sector_t max_sector, int *skipped)
 {
@@ -13867,7 +13913,9 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	sector_t sync_blocks;
 	bool still_degraded = false;
 	int i, submitted;
-	sector_t win_sector;
+	sector_t win_sector, win_end;
+	struct md_rdev *row_target;
+	int tslot = -1;
 
 	/*
 	 * raid_km redesign: m > 2 resync/scrub goes through the synchronous
@@ -14074,73 +14122,41 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		mddev->bitmap_ops->cond_end_sync(mddev, sector_nr, false);
 
 	/*
-	 * Row rebuild (sysfs rk_row_rebuild): one chunk-aligned row at a time,
-	 * k chunk-sized survivor reads, one decode, one chunk-sized write to
-	 * the member being rebuilt, instead of 32 stripe heads of 4 KiB.  Only
-	 * a genuine single-member recovery on a classic layout qualifies; a
-	 * resync, a check/repair, a second missing member, a declustered
-	 * array, a log or PPL, or a row with I/O already in flight all fall
-	 * through to the stripe cache below.  Native checksum rides along:
-	 * the row engine verifies the survivors and publishes the CRCs for
-	 * the chunk it writes itself.
+	 * Row rebuild: one chunk-aligned row at a time, k chunk-sized survivor
+	 * reads, one decode, one chunk-sized write to the member being rebuilt,
+	 * instead of 32 stripe heads of 4 KiB.  A row with I/O already in
+	 * flight falls through to the stripe cache below.  Native checksum
+	 * rides along: the row engine verifies the survivors and publishes the
+	 * CRCs for the chunk it writes itself.
 	 */
-	if (READ_ONCE(conf->row_rebuild) && !conf->dcl &&
-	    !raid5_has_log(conf) && !raid5_has_ppl(conf) &&
-	    conf->reshape_progress == MaxSector &&
-	    test_bit(MD_RECOVERY_RECOVER, &mddev->recovery) &&
-	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
-	    !test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
-	    conf->chunk_sectors && !(sector_nr % conf->chunk_sectors) &&
+	row_target = raidkm_row_rebuild_target(mddev, sector_nr, &tslot);
+	if (row_target && !(sector_nr % conf->chunk_sectors) &&
 	    sector_nr + conf->chunk_sectors <= max_sector) {
-		struct md_rdev *target = NULL;
-		int tslot = -1, live = 0;
+		sector_t did = raidkm_row_rebuild_band(mddev, sector_nr,
+						       max_sector, row_target,
+						       tslot);
 
-		for (i = 0; i < conf->raid_disks; i++) {
-			struct md_rdev *rdev = conf->disks[i].rdev;
-
-			if (conf->disks[i].replacement)
-				goto no_row_rebuild;	/* v1: spares only */
-			if (!rdev || test_bit(Faulty, &rdev->flags))
-				continue;
-			if (test_bit(In_sync, &rdev->flags)) {
-				live++;
-				continue;
-			}
-			if (target)
-				goto no_row_rebuild;	/* one target only */
-			target = rdev;
-			tslot = i;
-		}
-		if (target && live == conf->raid_disks - 1 &&
-		    target->recovery_offset <= sector_nr) {
-			sector_t did = raidkm_row_rebuild_band(mddev, sector_nr,
-							       max_sector,
-							       target, tslot);
-
-			if (did) {
-				/*
-				 * Real progress, like the reshape bands:
-				 * md_do_sync adds our return to
-				 * recovery_active after we return and nothing
-				 * else would take it back off.
-				 */
-				md_done_sync(mddev, did, 1);
-				return did;
-			}
+		if (did) {
 			/*
-			 * Nothing claimed at a chunk boundary: the stripe cache
-			 * takes this stripe, md's cursor is then off the chunk
-			 * grid, and the rest of the chunk follows 4 KiB at a time
-			 * until the next boundary.  Count the chunk, so that
-			 * rebuild_done + rebuild_stripe_chunks covers every chunk
-			 * that reached a band.  (Chunks that fail the entry checks
-			 * above -- a replacement, a pass resumed below
-			 * recovery_offset -- or that a bitmap skips are not counted.)
+			 * Real progress, like the reshape bands: md_do_sync
+			 * adds our return to recovery_active after we return
+			 * and nothing else would take it back off.
 			 */
-			atomic64_inc(&conf->row_rebuild_stripe_chunks);
+			md_done_sync(mddev, did, 1);
+			return did;
 		}
+		/*
+		 * Nothing claimed at a chunk boundary: the stripe cache takes
+		 * this chunk, and the window below stops at the next boundary,
+		 * so md's next call is back on the chunk grid and tries a band
+		 * again.  Count the chunk, so that rebuild_done +
+		 * rebuild_stripe_chunks covers every chunk that reached a
+		 * band.  (A pass raidkm_row_rebuild_target() turns away -- a
+		 * replacement, a pass resumed below recovery_offset -- and
+		 * chunks a bitmap skips are not counted.)
+		 */
+		atomic64_inc(&conf->row_rebuild_stripe_chunks);
 	}
-no_row_rebuild:
 
 	/* First stripe: block if stripe cache is full, then throttle. */
 	sh = raid5_get_active_stripe(conf, NULL, sector_nr, 0, R5_GAS_NOBLOCK);
@@ -14193,11 +14209,29 @@ no_row_rebuild:
 
 	/* Submit remaining stripes in the window non-blocking.  Stop early
 	 * if the stripe cache is full — the disk queue is already saturated.
+	 *
+	 * While the row rebuild can take this pass (row_target), the window
+	 * ends at the next chunk boundary.  The row path is only tried with md's cursor on
+	 * a boundary, and our return value is what moves the cursor: a window
+	 * cut short by competing I/O (below) returns an arbitrary number of
+	 * stripes, and without this bound the cursor then steps over every
+	 * later boundary, so the rest of the pass went through the stripe
+	 * cache with no counter moving (8+2 QLC over NVMe-oF, rebuilding under
+	 * a 37 GB/s degraded read: 128 KiB spare writes until the first
+	 * declined row, then 6-12 KiB for the rest of the pass, with
+	 * rebuild_stripe_chunks at 1).
 	 */
+	win_end = max_sector;
+	if (row_target) {
+		sector_t next = sector_nr - (sector_nr % conf->chunk_sectors) +
+				conf->chunk_sectors;
+
+		win_end = min(win_end, next);
+	}
 	win_sector = sector_nr + RAID5_STRIPE_SECTORS(conf);
 	for (submitted = 1;
 	     !conf->dcl &&	/* declustered: groups above replace the window */
-	     submitted < RAID5_SYNC_WINDOW && win_sector < max_sector;
+	     submitted < RAID5_SYNC_WINDOW && win_sector < win_end;
 	     submitted++, win_sector += RAID5_STRIPE_SECTORS(conf)) {
 		if (waitqueue_active(&conf->wait_for_stripe))
 			break;

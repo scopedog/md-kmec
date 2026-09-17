@@ -33,6 +33,11 @@
 #                  columns — same disks, same usable capacity, one ABBA run.
 #                  Every run still wipes all of --devs, so a narrow arm never
 #                  inherits a wider arm's superblocks.
+#   <arm>+<profile>  the arm with a tuning profile applied after create
+#                  (--tune).  The built-in profile "tuned" sets on stock md the
+#                  knobs raidkm defaults to, so one run compares
+#                  raid6,raid6+tuned,raidkm2: stock out of the box, stock tuned
+#                  by hand, and ours.  Combines with @<n>: raid6@10+tuned
 #   dcl<M>         raidkm declustered with M parity: stripes of width
 #                  --group-width scattered over the whole member pool with
 #                  --spare-columns distributed spare columns.  The layout we
@@ -100,8 +105,27 @@
 #                       --md-attr=rk_row_rebuild=1 --md-attr=rk_bio_sort=2
 #   --group-width=G     dcl<M> arms: stripe width g = k + M (required for dcl)
 #   --spare-columns=S   dcl<M> arms: distributed spare columns (default 2)
+#   --tune=NAME:ATTR=V[,ATTR=V...]
+#                       define tuning profile NAME for <arm>+NAME arms (md sysfs
+#                       attributes, applied in order after --gtc/--stripe-cache/
+#                       --md-attr; a write that fails stops the run).  Built in:
+#                       tuned = group_thread_cnt=max(nproc/(2*numa_nodes),2),
+#                       stripe_cache_size=auto (1024, capped near raidkm's
+#                       128 MiB budget on very wide arms), skip_copy=1 — raidkm's
+#                       own defaults.  --tune=tuned:... replaces it
+#   --degraded          per md run, after the healthy workloads: fail the arm's
+#                       last member and run --degraded-workloads (default 9,10:
+#                       1 MiB sequential read, 4 KiB random read); the summary
+#                       adds throughput as % of the same arm's healthy run
+#   --degraded-workloads=LIST  workloads for --degraded
 #   --rebuild           also time a rebuild of the last member (Test 7) per md run
+#                       (from the degraded state when --degraded is given)
+#   --rebuild-load=LIST also rebuild it again under each foreground load
+#                       (seqread, randread; classic layouts), recording the
+#                       rebuild rate and the foreground throughput (Test 7L)
+#   --rebuild-floor=KBPS md speed_limit_min during rebuilds (default 500000)
 #   --workloads=LIST    workloads passed to raidkm-standard-benchmark.sh
+#                       (default 1,2,3,4,5,8,9,10)
 #                       (default 1,2,3,4,5,8,9; 8/9 = sequential 1 MiB write/read)
 #   --precondition[=seq|steady]
 #                       before anything else.  seq (the bare flag): a sequential
@@ -147,6 +171,10 @@ BITMAP=none
 GTC=
 SCS=
 REBUILD=0
+REBUILD_LOAD=
+REBUILD_FLOOR=
+DEGRADED=0
+DEG_WORKLOADS=
 WORKLOADS=
 PRECOND=0
 PRECOND_TIME=600
@@ -179,6 +207,7 @@ preflight_fail() {
 
 MD_ATTRS=()
 MD_ATTRS_SET=()
+declare -A PROFILES=()
 for arg in "$@"; do
 	case "$arg" in
 	--devs=*)         DEVS="${arg#*=}" ;;
@@ -195,6 +224,13 @@ for arg in "$@"; do
 	--group-width=*)  DCL_G="${arg#*=}" ;;
 	--spare-columns=*) DCL_S="${arg#*=}" ;;
 	--rebuild)        REBUILD=1 ;;
+	--rebuild-load=*) REBUILD_LOAD="${arg#*=}" ;;
+	--rebuild-floor=*) REBUILD_FLOOR="${arg#*=}" ;;
+	--degraded)       DEGRADED=1 ;;
+	--degraded-workloads=*) DEG_WORKLOADS="${arg#*=}" ;;
+	--tune=*)         t="${arg#*=}"
+	                  [[ "$t" == *:*=* ]] || die "--tune wants NAME:ATTR=V[,ATTR=V...], got '$t'"
+	                  PROFILES["${t%%:*}"]="${t#*:}" ;;
 	--precondition|--precondition=seq) PRECOND=1 ;;
 	--precondition=steady) PRECOND=2 ;;
 	--precondition-time=*) PRECOND_TIME="${arg#*=}" ;;
@@ -238,9 +274,12 @@ N=${#MEMBERS[@]}
 [ "$N" -ge 4 ] || die "need at least 4 member devices, got $N"
 LAST_MEMBER="${MEMBERS[$((N - 1))]}"
 
-# Per-arm member subsets: "<arm>@<n>" builds the arm on the first n of --devs.
-arm_type() { echo "${1%@*}"; }				# the arm without @<n>
-arm_n() { case "$1" in *@*) echo "${1##*@}" ;; *) echo "$N" ;; esac; }
+# Arm spec: <type>[@<n>][+<profile>].  "@<n>" builds the arm on the first n of
+# --devs; "+<profile>" applies a --tune profile after create.
+arm_base() { echo "${1%%+*}"; }				# the arm without +<profile>
+arm_type() { local a="${1%%+*}"; echo "${a%@*}"; }	# ... and without @<n>
+arm_n() { local a="${1%%+*}"; case "$a" in *@*) echo "${a##*@}" ;; *) echo "$N" ;; esac; }
+arm_profile() { case "$1" in *+*) echo "${1#*+}" ;; esac; }
 arm_select() {					# -> AM (members), AN, ALAST
 	AN=$(arm_n "$1")
 	AM=("${MEMBERS[@]:0:$AN}")
@@ -260,12 +299,32 @@ else
 	[[ ",$ARMS," == *",$WARMUP,"* ]] || die "--warmup=$WARMUP is not one of --arms"
 fi
 [[ "$PRECOND_TIME" =~ ^[1-9][0-9]*$ ]] || die "--precondition-time must be a positive integer"
+[ -z "$REBUILD_LOAD" ] || [ "$REBUILD" = 1 ] || die "--rebuild-load needs --rebuild"
+[ -z "$REBUILD_FLOOR" ] || [[ "$REBUILD_FLOOR" =~ ^[1-9][0-9]*$ ]] || die "--rebuild-floor must be a positive integer (KB/s)"
+[ -z "$DEG_WORKLOADS" ] || [ "$DEGRADED" = 1 ] || die "--degraded-workloads needs --degraded"
+
+# Built-in "tuned": raidkm's own defaults, for a stock arm tuned by hand.
+# group_thread_cnt is per NUMA group, as raidkm's auto-default counts it.
+NUMA_NODES=$(python3 -c '
+n = 0
+for part in open("/sys/devices/system/node/possible").read().strip().split(","):
+    a, _, b = part.partition("-")
+    n += int(b or a) - int(a) + 1
+print(n)' 2>/dev/null || echo 1)
+TUNED_GTC=$(( $(nproc) / (2 * NUMA_NODES) ))
+[ "$TUNED_GTC" -ge 2 ] || TUNED_GTC=2
+[ -n "${PROFILES[tuned]:-}" ] ||
+	PROFILES[tuned]="group_thread_cnt=$TUNED_GTC,stripe_cache_size=auto,skip_copy=1"
 
 NEED_RAIDKM=0
 NEED_INTREE=0
 for arm in "${ARM_LIST[@]}"; do
-	t=$(arm_type "$arm"); n=$(arm_n "$arm")
-	if [[ "$arm" == *@* ]]; then
+	t=$(arm_type "$arm"); n=$(arm_n "$arm"); prof=$(arm_profile "$arm")
+	if [ -n "$prof" ]; then
+		[ "$t" != raw ] || die "$arm: the raw arm takes no +<profile>"
+		[ -n "${PROFILES[$prof]:-}" ] || die "$arm: no tuning profile '$prof' (built in: tuned; define one with --tune=$prof:ATTR=V,...)"
+	fi
+	if [[ "$(arm_base "$arm")" == *@* ]]; then
 		[ "$t" != raw ] || die "$arm: the raw arm takes no @<n>"
 		[[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 3 ] && [ "$n" -le "$N" ] ||
 			die "$arm: @<n> must be 3..$N (the number of --devs)"
@@ -288,7 +347,7 @@ for arm in "${ARM_LIST[@]}"; do
 		[ $((DCL_G - m)) -ge 2 ] || die "$arm: group width $DCL_G leaves k=$((DCL_G - m)), need >= 2"
 		[ "$n" -gt "$DCL_G" ] || die "$arm: pool ($n) must be WIDER than the group ($DCL_G); equal scatters nothing"
 		NEED_RAIDKM=1 ;;
-	*) die "unknown arm '$arm' (raw, raid5, raid6, raid5-intree, raid6-intree, raidkm<M>, dcl<M>, each optionally @<n>)" ;;
+	*) die "unknown arm '$arm' (raw, raid5, raid6, raid5-intree, raid6-intree, raidkm<M>, dcl<M>, each optionally @<n> and +<profile>)" ;;
 	esac
 	[[ "$t" == *-intree ]] && NEED_INTREE=1
 done
@@ -479,10 +538,50 @@ arm_create_cmd() {
 arm_bench_args() {
 	BENCH_ARGS=(--target="$3" --runs=1 --runtime="$RUNTIME" --output="$2" --no-check)
 	[ -n "$WORKLOADS" ] && BENCH_ARGS+=(--workloads="$WORKLOADS")
-	if [ "$REBUILD" = 1 ] && [ "$(arm_type "$1")" != raw ]; then
-		arm_select "$1"	# the last member OF THIS ARM, not of --devs
-		BENCH_ARGS+=(--rebuild-victim="$ALAST" --mdadm="$MDADM")
+	[ "$(arm_type "$1")" = raw ] && return 0
+	arm_select "$1"	# the last member OF THIS ARM, not of --devs
+	if [ "$DEGRADED" = 1 ]; then
+		BENCH_ARGS+=(--degraded-victim="$ALAST" --mdadm="$MDADM")
+		[ -n "$DEG_WORKLOADS" ] && BENCH_ARGS+=(--degraded-workloads="$DEG_WORKLOADS")
 	fi
+	if [ "$REBUILD" = 1 ]; then
+		BENCH_ARGS+=(--rebuild-victim="$ALAST")
+		[ "$DEGRADED" = 1 ] || BENCH_ARGS+=(--mdadm="$MDADM")
+		[ -n "$REBUILD_LOAD" ] && BENCH_ARGS+=(--rebuild-load="$REBUILD_LOAD")
+		[ -n "$REBUILD_FLOOR" ] && BENCH_ARGS+=(--rebuild-floor="$REBUILD_FLOOR")
+	fi
+	return 0
+}
+
+# profile_value <arm> <attr> <value>: resolve "auto" for the arm's geometry.
+# stripe_cache_size=auto follows raidkm's start: 1024 stripes, capped by a
+# 128 MiB cache (about 4.2 KiB per member per stripe), never below 256.
+profile_value() {
+	if [ "$2" = stripe_cache_size ] && [ "$3" = auto ]; then
+		arm_select "$1"
+		local v=$(( 131072 * 10 / (AN * 42 + 10) ))
+		[ "$v" -gt 1024 ] && v=1024
+		[ "$v" -lt 256 ] && v=256
+		echo "$v"
+	else
+		echo "$3"
+	fi
+}
+
+# apply_profile <arm> <md sysfs dir>: the arm's +<profile> settings, in order
+PROFILE_SET=
+apply_profile() {
+	local prof a name val pa
+	PROFILE_SET=
+	prof=$(arm_profile "$1")
+	[ -n "$prof" ] || return 0
+	IFS=, read -r -a pa <<< "${PROFILES[$prof]}"
+	for a in "${pa[@]}"; do
+		name="${a%%=*}"; val=$(profile_value "$1" "$name" "${a#*=}")
+		echo "$val" > "$2/$name" 2>/dev/null ||
+			die "$1: profile $prof cannot set $name=$val"
+		PROFILE_SET+="${PROFILE_SET:+ }$name=$(cat "$2/$name" 2>/dev/null)"
+	done
 }
 
 # create_arm <arm> : build the arm; sets TARGET
@@ -520,6 +619,7 @@ create_arm() {
 			MD_ATTRS_SET+=("$name=n/a")
 		fi
 	done
+	apply_profile "$arm" "$mdd"
 	TARGET="$MD"
 }
 
@@ -553,6 +653,8 @@ record_arm() {
 			echo "skip_copy=$(md_attr skip_copy)"
 			[ ${#MD_ATTRS_SET[@]} -gt 0 ] &&
 				echo "md_attrs=${MD_ATTRS_SET[*]}"
+			[ -n "$(arm_profile "$arm")" ] &&
+				echo "profile=$(arm_profile "$arm") ($PROFILE_SET)"
 			echo "preread_bypass_threshold=$(md_attr preread_bypass_threshold)"
 			echo "mdadm=$MDADM ($("$MDADM" --version 2>&1 | head -1))"
 		fi
@@ -590,8 +692,14 @@ esac
 echo "  prepare:   precondition=$PRECOND_DESC  warm-up=${WARMUP:-none}${WARMUP:+ (one pass, discarded)}"
 echo "  chunk:     ${CHUNK}K  bitmap=$BITMAP  gtc=${GTC:-default}  stripe_cache=${SCS:-default}"
 [ ${#MD_ATTRS[@]} -gt 0 ] && echo "  md-attr:   ${MD_ATTRS[*]}  (best-effort per arm)"
+for arm in "${ARM_LIST[@]}"; do
+	p=$(arm_profile "$arm")
+	[ -n "$p" ] && echo "  profile:   $arm -> ${PROFILES[$p]}"
+done
+[ "$DEGRADED" = 1 ] && echo "  degraded:  last member of each md arm failed, workloads ${DEG_WORKLOADS:-9,10}"
+[ "$REBUILD" = 1 ] && echo "  rebuild:   last member, floor ${REBUILD_FLOOR:-500000} KB/s${REBUILD_LOAD:+, then under $REBUILD_LOAD}"
 [[ ",$ARMS," == *",dcl"* ]] && echo "  dcl:       group-width=$DCL_G spare-columns=$DCL_S"
-NWL=$(echo "${WORKLOADS:-1,2,3,4,5,8,9}" | tr ',' ' ' | wc -w)
+NWL=$(echo "${WORKLOADS:-1,2,3,4,5,8,9,10}" | tr ',' ' ' | wc -w)
 echo "  runtime:   ${RUNTIME}s x $NWL workloads per arm run  (~$(( ${#ORDER[@]} * NWL * (RUNTIME + 3) / 60 )) min of fio)"
 echo "  raid456:   modprobe -> ${DEFAULT_456:-none}${INTREE_456:+;  in-tree -> $INTREE_456}"
 echo "  output:    $OUTPUT"
@@ -653,6 +761,12 @@ if [ "$DRYRUN" = 1 ]; then
 			for a in ${MD_ATTRS[@]+"${MD_ATTRS[@]}"}; do
 				echo "  echo ${a#*=} > $mdsys/${a%%=*}   # skipped, recorded n/a, if this arm has no such attribute"
 			done
+			if [ -n "$(arm_profile "$arm")" ]; then
+				IFS=, read -r -a pa <<< "${PROFILES[$(arm_profile "$arm")]}"
+				for a in "${pa[@]}"; do
+					echo "  echo $(profile_value "$arm" "${a%%=*}" "${a#*=}") > $mdsys/${a%%=*}   # profile $(arm_profile "$arm")"
+				done
+			fi
 			arm_bench_args "$arm" "$OUTPUT/$arm/round<R>" "$MD"
 		else
 			arm_bench_args "$arm" "$OUTPUT/$arm/round<R>" "${MEMBERS[0]}"
@@ -691,16 +805,17 @@ if [ "$PRECOND" != 0 ]; then
 fi
 
 # The warm-up pass takes the first-run-on-the-drives slot so no measured arm
-# does.  Same workloads and runtime; no rebuild (it would only cost time).
+# does.  Same workloads and runtime; no degraded phase or rebuild (they would
+# only cost time).
 if [ -n "$WARMUP" ]; then
 	dir="$OUTPUT/warmup/$WARMUP"
 	mkdir -p "$dir"
 	echo "=== warm-up (discarded): $WARMUP ==="
 	create_arm "$WARMUP"
 	record_arm "$WARMUP" "$dir"
-	saved_rebuild=$REBUILD; REBUILD=0
+	saved_rebuild=$REBUILD saved_degraded=$DEGRADED; REBUILD=0 DEGRADED=0
 	arm_bench_args "$WARMUP" "$dir" "$TARGET"
-	REBUILD=$saved_rebuild
+	REBUILD=$saved_rebuild DEGRADED=$saved_degraded
 	bash "$BENCH" "${BENCH_ARGS[@]}" > "$dir/bench.log" 2>&1 ||
 		echo "  NOTE: the warm-up run reported a failure (see $dir/bench.log); measured runs continue" >&2
 	teardown_arm
@@ -743,7 +858,10 @@ DESC = {
     "test5_partial_stripe": "partial-stripe 8K write",
     "test8_seqwrite1m": "sequential 1 MiB write",
     "test9_seqread1m": "sequential 1 MiB read",
+    "test10_randread4k": "random 4K read",
 }
+for t in list(DESC):     # the degraded phase runs the same workloads as deg_<test>
+    DESC["deg_" + t] = "degraded: " + DESC[t]
 tests = list(DESC)
 
 def load(path):
@@ -762,6 +880,8 @@ def load(path):
 data = {}       # (arm, test) -> {"iops": [...], "bw": [...], "p99": [...]}
 perrun = {}     # (arm, "round<R>", test) -> IOPS of that one run
 rebuild = {}    # arm -> [secs]
+rebuild_x = {}  # arm -> [test7_rebuild.json]
+loaded = {}     # (arm, load) -> [test7L_<load>_rebuild.json]
 env = {}
 for arm in arms:
     for rdir in sorted(glob.glob(os.path.join(out, arm, "round*"))):
@@ -770,10 +890,13 @@ for arm in arms:
             if not os.path.exists(f):
                 continue
             iops, bw, p99 = load(f)
-            d = data.setdefault((arm, t), {"iops": [], "bw": [], "p99": [],
+            d = data.setdefault((arm, t), {"iops": [], "bw": [], "p99": [], "cpu": [],
                                            "mw": [], "mwp": [], "mr": [], "mrp": []})
             d["iops"].append(iops); d["bw"].append(bw); d["p99"].append(p99)
             perrun[(arm, os.path.basename(rdir), t)] = iops
+            cf = os.path.join(rdir, f"{t}_run1.cpu.json")
+            if os.path.exists(cf):
+                d["cpu"].append(json.load(open(cf))["busy_cores"])
             mf = os.path.join(rdir, f"{t}_run1.members.json")
             if os.path.exists(mf):
                 mj = json.load(open(mf))
@@ -781,11 +904,19 @@ for arm in arms:
                     if mj[side]["requests"]:
                         d[k].append(mj[side]["avg_kib"])
                         d[k + "p"].append(mj[side]["merged_pct"])
+        rj = os.path.join(rdir, "test7_rebuild.json")
         log = os.path.join(rdir, "bench.log")
-        if os.path.exists(log):
+        if os.path.exists(rj):
+            j = json.load(open(rj))
+            rebuild.setdefault(arm, []).append(j["secs"])
+            rebuild_x.setdefault(arm, []).append(j)
+        elif os.path.exists(log):     # results from before test7_rebuild.json
             m = re.search(r"^\s+7: ([0-9.]+)s", open(log).read(), re.M)
             if m:
                 rebuild.setdefault(arm, []).append(float(m.group(1)))
+        for lj in sorted(glob.glob(os.path.join(rdir, "test7L_*_rebuild.json"))):
+            j = json.load(open(lj))
+            loaded.setdefault((arm, j["load"]), []).append(j)
         e = os.path.join(rdir, "arm.env")
         if os.path.exists(e) and arm not in env:
             env[arm] = dict(l.rstrip("\n").split("=", 1) for l in open(e) if "=" in l)
@@ -803,12 +934,13 @@ def emit(s=""):
 
 emit(f"# raidkm A/B benchmark — baseline `{baseline}`")
 emit()
-emit("| arm | level | disks | chunk | group_thread_cnt | stripe_cache_size | module |")
-emit("|---|---|---|---|---|---|---|")
+emit("| arm | level | disks | chunk | group_thread_cnt | stripe_cache_size | skip_copy | profile | module |")
+emit("|---|---|---|---|---|---|---|---|---|")
 for arm in arms:
     e = env.get(arm, {})
     emit(f"| {arm} | {e.get('level','-')} | {e.get('raid_disks','-')} | {e.get('chunk_size','-')} "
-         f"| {e.get('group_thread_cnt','-')} | {e.get('stripe_cache_size','-')} | {e.get('module','-')} |")
+         f"| {e.get('group_thread_cnt','-')} | {e.get('stripe_cache_size','-')} | {e.get('skip_copy','-')} "
+         f"| {e.get('profile','-')} | {e.get('module','-')} |")
 
 noisy = []
 rows = []
@@ -844,6 +976,61 @@ for metric, label, fmt, higher in (("iops", "IOPS", "{:.0f}", True),
                          "ratio_vs_baseline": round(m / base_m, 4) if base_m else ""})
         emit(f"| {t} ({DESC[t]}) | " + " | ".join(cells) + " | " + " | ".join(ratios) + " |")
 
+# Degraded throughput as a share of the same arm's healthy run of that workload.
+deg = [t for t in tests if t.startswith("deg_") and any((a, t) in data for a in arms)]
+if deg:
+    emit()
+    emit("## Degraded (one member failed): throughput and % of the same arm healthy")
+    emit()
+    emit("MiB/s for sequential workloads, IOPS otherwise.")
+    emit()
+    emit("| workload | " + " | ".join(arms) + " | " +
+         " | ".join(f"{a}/{baseline}" for a in arms if a != baseline) + " |")
+    emit("|" + "---|" * (1 + len(arms) + len(arms) - 1))
+    for t in deg:
+        metric = "bw" if "seq" in t else "iops"
+        base = mean_cv(data.get((baseline, t), {}).get(metric, []))[0]
+        cells, ratios = [], []
+        for arm in arms:
+            m = mean_cv(data.get((arm, t), {}).get(metric, []))[0]
+            h = mean_cv(data.get((arm, t[4:]), {}).get(metric, []))[0]
+            if m is None:
+                cells.append("-")
+            else:
+                cells.append(f"{m:.0f}" + (f" ({100 * m / h:.0f}%)" if h else ""))
+                rows.append({"arm": arm, "workload": t, "metric": "pct_of_healthy",
+                             "mean": round(100 * m / h, 2) if h else "", "cv_pct": "",
+                             "ratio_vs_baseline": ""})
+            if arm != baseline:
+                ratios.append(f"{m / base:.2f}x" if m is not None and base else "-")
+        emit(f"| {t} ({DESC[t]}) | " + " | ".join(cells) + " | " + " | ".join(ratios) + " |")
+
+# CPU: busy cores over each workload's window, and per GiB/s moved.
+if any(data[k]["cpu"] for k in data):
+    emit()
+    emit("## Host busy cores during each workload (cores per GiB/s in brackets)")
+    emit()
+    emit("Busy = user + nice + system + irq + softirq + steal over the whole host, "
+         "load generator included.")
+    emit()
+    emit("| workload | " + " | ".join(arms) + " |")
+    emit("|" + "---|" * (1 + len(arms)))
+    for t in tests:
+        if not any(data.get((a, t), {}).get("cpu") for a in arms):
+            continue
+        cells = []
+        for arm in arms:
+            d = data.get((arm, t), {})
+            if not d.get("cpu"):
+                cells.append("-")
+                continue
+            c = statistics.mean(d["cpu"])
+            bw = statistics.mean(d["bw"]) if d["bw"] else 0
+            cells.append(f"{c:.1f}" + (f" ({c / (bw / 1024):.2f})" if bw >= 64 else ""))
+            rows.append({"arm": arm, "workload": t, "metric": "busy_cores",
+                         "mean": round(c, 3), "cv_pct": "", "ratio_vs_baseline": ""})
+        emit(f"| {t} ({DESC[t]}) | " + " | ".join(cells) + " |")
+
 # Request size at the members: what the devices under each arm received.
 if any(data[k]["mw"] or data[k]["mr"] for k in data):
     emit()
@@ -872,6 +1059,21 @@ if rebuild:
     emit()
     emit("## Rebuild wall-clock, seconds (lower is better)")
     emit()
+    if rebuild_x:
+        emit("| arm | kind | seconds | MiB/s | busy cores | cores per GiB/s |")
+        emit("|---|---|---|---|---|---|")
+        for arm in arms:
+            js = rebuild_x.get(arm)
+            if not js:
+                continue
+            mb = [j["mibps"] for j in js if j["mibps"] is not None]
+            cores = statistics.mean(j["busy_cores"] for j in js)
+            mbm = statistics.mean(mb) if mb else None
+            emit(f"| {arm} | {js[0]['kind']} | {statistics.mean(j['secs'] for j in js):.1f} "
+                 f"| {mbm:.0f} | {cores:.1f} | " + (f"{cores / (mbm / 1024):.2f}" if mbm else "-") + " |"
+                 if mbm is not None else
+                 f"| {arm} | {js[0]['kind']} | {statistics.mean(j['secs'] for j in js):.1f} | - | {cores:.1f} | - |")
+        emit()
     b, _ = mean_cv(rebuild.get(baseline, []))
     for arm in arms:
         m, cv = mean_cv(rebuild.get(arm, []))
@@ -884,6 +1086,28 @@ if rebuild:
         emit(f"- {arm}: {m:.1f}s{ratio}")
         rows.append({"arm": arm, "workload": "rebuild", "metric": "seconds", "mean": round(m, 3),
                      "cv_pct": round(cv, 2), "ratio_vs_baseline": round(m / b, 4) if b else ""})
+
+if loaded:
+    emit()
+    emit("## Rebuild under a foreground load (classic layouts)")
+    emit()
+    emit("| arm | load | rebuild MiB/s | rebuild seconds | foreground MiB/s | foreground IOPS | busy cores |")
+    emit("|---|---|---|---|---|---|---|")
+    for arm in arms:
+        for (a, load), js in sorted(loaded.items()):
+            if a != arm:
+                continue
+            def avg(k):
+                v = [j[k] for j in js if j.get(k) is not None]
+                return statistics.mean(v) if v else None
+            f = lambda v, fmt: fmt.format(v) if v is not None else "-"
+            emit(f"| {arm} | {load} | {f(avg('mibps'), '{:.0f}')} | {f(avg('secs'), '{:.1f}')} "
+                 f"| {f(avg('load_mibps'), '{:.0f}')} | {f(avg('load_iops'), '{:.0f}')} "
+                 f"| {f(avg('busy_cores'), '{:.1f}')} |")
+            for k in ("mibps", "load_mibps", "busy_cores"):
+                if avg(k) is not None:
+                    rows.append({"arm": arm, "workload": f"rebuild_under_{load}", "metric": k,
+                                 "mean": round(avg(k), 3), "cv_pct": "", "ratio_vs_baseline": ""})
 
 # Every run in the order it ran.  A mean hides a position effect (the first run
 # on fresh flash, a GC stall); this table shows it.

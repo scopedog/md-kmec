@@ -22,6 +22,15 @@
 #   T4  T1-T3 again with the rebuild buffers forced into page form
 #       (debug_row_rebuild_pages=Y), and the set really used page buffers
 #   T5  no kernel report in either pass
+#   T6  a third pass turns rk_row_rebuild off for a second at a quarter of a
+#       throttled rebuild while the foreground reads through the stripe cache
+#       (rk_row_dread=0), so the stripe path's windows are cut short and md's
+#       cursor leaves the chunk grid.  Once the knob is back, at least half of
+#       the chunks still to go must be rebuilt as rows.  Before the stripe
+#       window stopped at the chunk boundary, a cursor off the grid stayed off
+#       and no row was rebuilt for the rest of the pass (0 rows after the
+#       toggle; the same one-way switch an 8+2 QLC array showed after its
+#       first declined row under a 37 GB/s degraded read)
 #
 # Usage: bash <this>     (MDADM etc. via raidkm-test-lib.sh)
 set -u
@@ -52,8 +61,9 @@ command -v fio >/dev/null || { echo "ERROR: fio not installed" >&2; exit 1; }
 stat_of() { awk -v k="$1" '$1 == k {print $2}' "/sys/block/$MDNAME/md/rk_row_stats"; }
 
 # one pass: fail member 3, rebuild onto the spare under a sequential read
-run_pass() {	# tag pages(Y|N)
-	local tag=$1 pages=$2 spare victim=${MEMBERS[3]} done0 sc0 d sc chunks secs max_pb=0 pb
+run_pass() {	# tag pages(Y|N) toggle(0|1)
+	local tag=$1 pages=$2 toggle=${3:-0} spare victim=${MEMBERS[3]} done0 sc0 d sc chunks secs max_pb=0 pb
+	local tog_done= tog_pct= pct
 	spare=${MEMBERS[$N]}
 
 	[ -w $P/debug_row_rebuild_pages ] || { rk_fail "$tag: raidkm lacks debug_row_rebuild_pages"; return; }
@@ -62,22 +72,47 @@ run_pass() {	# tag pages(Y|N)
 	echo "$(cat "/sys/block/$MDNAME/md/rk_row_rebuild")" | grep -q 1 || { rk_fail "$tag: rk_row_rebuild is off"; return; }
 	rk_write "$DATAMB"
 	rk_fail_disks "$victim"; rk_remove_disks "$victim"
-	echo 2000000 > "/sys/block/$MDNAME/md/sync_speed_min"
+	if [ "$toggle" = 1 ]; then
+		# slow enough to switch the knob mid-pass; reads through the stripe
+		# cache, so the stripe path's windows are cut short
+		echo 1000 > "/sys/block/$MDNAME/md/sync_speed_min"
+		echo 10000 > "/sys/block/$MDNAME/md/sync_speed_max"
+		echo 0 > "/sys/block/$MDNAME/md/rk_row_dread"
+	else
+		echo 2000000 > "/sys/block/$MDNAME/md/sync_speed_min"
+	fi
 	done0=$(stat_of rebuild_done); sc0=$(stat_of rebuild_stripe_chunks); nm0=$(stat_of rebuild_band_nomem)
 
 	# the foreground: sequential 1 MiB reads over the written region, looping
 	fio --name=fg --filename="$MD" --rw=read --bs=1M --direct=1 --ioengine=libaio \
 		--iodepth=8 --numjobs=2 --size="${DATAMB}M" --time_based --runtime=3600 \
-		>/dev/null 2>&1 &
+		$([ "$toggle" = 1 ] && echo --rate=40m) >/dev/null 2>&1 &
 	FIOPID=$!
 	sleep 2
 	rk_dmesg_clear
 	sudo dd if=/dev/zero of="$spare" bs=1M count=4 status=none 2>/dev/null
 	rk_add_disks "$spare"
-	sleep 1
+	# wait for the recovery to start, then for the array to be whole: a
+	# "no recovery line yet" read as "finished" let T3 fail a member into a
+	# rebuild that had not begun
+	for secs in $(seq 100); do
+		grep -q recovery /proc/mdstat && break
+		[ "$(cat "/sys/block/$MDNAME/md/degraded")" = 0 ] && break
+		sleep 0.1
+	done
 	secs=0
-	while grep -q recovery /proc/mdstat; do
+	while [ "$(cat "/sys/block/$MDNAME/md/degraded")" != 0 ]; do
 		pb=$(stat_of rebuild_set_page_bufs); [ "${pb:-0}" -gt "$max_pb" ] && max_pb=$pb
+		if [ "$toggle" = 1 ] && [ -z "$tog_done" ]; then
+			pct=$(grep -o 'recovery = *[0-9]*' /proc/mdstat | grep -o '[0-9]*$')
+			if [ "${pct:-0}" -ge 25 ]; then
+				echo 0 > "/sys/block/$MDNAME/md/rk_row_rebuild"
+				sleep 1
+				echo 1 > "/sys/block/$MDNAME/md/rk_row_rebuild"
+				tog_done=$(stat_of rebuild_done)
+				tog_pct=$(grep -o 'recovery = *[0-9]*' /proc/mdstat | grep -o '[0-9]*$')
+			fi
+		fi
 		sleep 0.2; secs=$((secs + 1))
 		[ "$secs" -gt 6000 ] && break
 	done
@@ -92,6 +127,9 @@ run_pass() {	# tag pages(Y|N)
 	chunks=$(( $(cat "/sys/block/$MDNAME/md/component_size") / CHUNK_KB ))
 	if grep -q "recovery" /proc/mdstat || [ "$(rk_geom)" != "[$N/$N]" ]; then
 		rk_fail "$tag T1: rebuild did not complete ($(rk_geom))"
+	elif [ "$toggle" = 1 ]; then
+		# chunks rebuilt while the knob was off are counted nowhere, by design
+		rk_log "$tag T1: not applicable (rk_row_rebuild was off for part of the pass): rebuild_done $d + stripe_chunks $sc of $chunks"
 	elif [ $((d + sc)) -eq "$chunks" ]; then
 		rk_pass "$tag T1: counters cover the member: rebuild_done $d + stripe_chunks $sc of $chunks chunks"
 	else
@@ -100,7 +138,18 @@ run_pass() {	# tag pages(Y|N)
 	nm=$(( $(stat_of rebuild_band_nomem) - nm0 ))
 	[ "$nm" = 0 ] && rk_pass "$tag T2: no band went without buffers" \
 		|| rk_fail "$tag T2: $nm band(s) found no buffer set"
-	if [ "$chunks" -gt 0 ] && [ $((d * 100 / chunks)) -ge 75 ]; then
+	if [ "$toggle" = 1 ]; then
+		local after left
+		after=$(( $(stat_of rebuild_done) - ${tog_done:-0} ))
+		left=$(( chunks * (100 - ${tog_pct:-100}) / 100 ))
+		if [ -z "$tog_done" ]; then
+			rk_fail "$tag T6: the rebuild finished before the knob could be switched"
+		elif [ $((after * 2)) -ge "$left" ]; then
+			rk_pass "$tag T6: $after of ~$left remaining chunks rebuilt as rows after rk_row_rebuild came back (switched at ${tog_pct}%)"
+		else
+			rk_fail "$tag T6: only $after of ~$left remaining chunks rebuilt as rows after rk_row_rebuild came back (switched at ${tog_pct}%)"
+		fi
+	elif [ "$chunks" -gt 0 ] && [ $((d * 100 / chunks)) -ge 75 ]; then
 		rk_pass "$tag T2: $((d * 100 / chunks))% of chunks rebuilt as whole rows"
 	else
 		rk_fail "$tag T2: only $d of $chunks chunks rebuilt as whole rows"
@@ -136,7 +185,8 @@ DISKS=$(rk_pick_disks $((N + 1))) || { echo "ERROR: need $((N + 1)) devices" >&2
 read -r -a MEMBERS <<< "$DISKS"
 
 echo "== row rebuild under a degraded sequential read (8+2 rotating, ${CHUNK_KB}K chunk)"
-run_pass "folio" N
-run_pass "pages" Y
+run_pass "folio" N 0
+run_pass "pages" Y 0
+run_pass "toggle" N 1
 
 rk_summary
