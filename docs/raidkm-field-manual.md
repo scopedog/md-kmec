@@ -872,6 +872,44 @@ Rebuild onto a spare no longer is:
   under foreground I/O costs that one chunk only: the next chunk boundary
   tries the row path again (on earlier builds the first such chunk
   could keep the rest of the pass on the 4 KiB stripe path).
+- `rk_row_rebuild_workers` (**8**, 1..64, live) is how many rows rebuild at
+  once, and it is the dial for rebuild against foreground bandwidth: a row
+  waits on its k survivor reads and its member write, so the rebuild's share
+  follows the rows in flight. On 8+2 over 10 GCP local NVMe namespaces
+  (128 KiB chunk, paired runs both directions): idle 196 / 272 / 364 MiB/s at
+  4 / 8 / 32 rows; under a light 4 KiB random write 123 / 207 / 327 MiB/s for
+  37.7k / 32.6k / 29.7k foreground IOPS — 2.7x the rebuild for 20% of the
+  IOPS. **It buys nothing once the foreground alone saturates the device**: at
+  ~120k IOPS (~2.9 GB/s of member I/O against a ~3.5 GB/s controller) the
+  rebuild stayed at 34 MiB/s from 4 rows to 32. Raise it when the array has
+  headroom and the rebuild window matters; leave it alone when the array is
+  already at its limit. Raise `stripe_cache_size` with it: a worker holds its
+  row's stripe heads (chunk / 4 KiB, so 32 at a 128 KiB chunk) for the whole
+  round trip, so 32 rows want 1,024 against a default 256, and a row that
+  cannot claim its stripes goes to the stripe cache instead (watch
+  `rebuild_declined`; it was 0.5% of chunks at 32 rows with a 256-stripe cache
+  on the rig). `rebuild_set_workers` in `rk_row_stats` reports what the pass
+  actually got, which the 64 MiB per-pass buffer budget can trim below the
+  knob on wide or large-chunk arrays; a store it cannot meet keeps the workers
+  the pass already has rather than falling back to the stripe path.
+- `rk_row_rebuild_pace` (**0**, off) is a ceiling in KB/s on the row rebuild
+  while the array carries foreground I/O -- our own rate, not md's. md's
+  cannot reach this path: it throttles a sync by waiting for
+  `recovery_active` to drain, and a band reports its progress before
+  `sync_request()` returns, so nothing is ever in flight for md to wait on.
+  Back-to-back arms on 8+2 NVMe: 65,436 chunks rebuilt at a 20 MB/s
+  `sync_speed_min` against 65,440 at 200 MB/s. (`sync_speed_max` still works,
+  being rate-based.) The knob deliberately does NOT read `sync_speed_min`,
+  which means the opposite -- a guaranteed minimum an admin may have raised to
+  ask for a *faster* rebuild. Measured on that rig (8 rows, light 4 KiB random
+  write): off 207 MiB/s / 30k IOPS, then 100000 -> 95 MiB/s / 35.9k,
+  50000 -> 49 / 37.1k, 20000 -> 19 / 40.3k, each within 2% of the rate asked
+  for, and a rate the array cannot reach costs nothing (207.0 / 208.6 off vs
+  207.9 / 208.4 set). An idle array may outrun the ceiling, which the array's
+  I/O counters reveal -- except with queue `iostats` off or on dm-raid, where
+  md accounts no foreground bios and the ceiling always applies; the knob's
+  read-back says which. Leave it off unless foreground latency matters more
+  than rebuild time.
 - ~~`rk_bio_sort=2` for declustered population~~ — **withdrawn** until
   re-measured: its gain was measured while a bug (now fixed) could stop
   declustered population from completing on large, fast arrays. Population

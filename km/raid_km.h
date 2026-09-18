@@ -923,6 +923,15 @@ struct r5conf {
 	unsigned long		row_rb_retry;	/* jiffies: build failed, no set before then */
 	int			row_rb_nwk;	/* workers in the last set built (rk_row_stats) */
 	int			row_rb_page_bufs; /* of its buffers, built from order-0 pages */
+	int			row_rb_workers;	/* sysfs rk_row_rebuild_workers: rows
+						 * rebuilt concurrently (the budget
+						 * still trims it) */
+	int			row_rb_pace;	/* sysfs rk_row_rebuild_pace: KB/s
+						 * ceiling while the array carries
+						 * foreground I/O (0 = off) */
+	/* pacing state, touched only by md's sync thread */
+	unsigned long		row_rb_pace_due; /* jiffies: next band may start */
+	u64			row_rb_pace_fg;	/* array sectors seen at the last band */
 	atomic_t		pending_full_writes; /* full write backlog */
 	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */

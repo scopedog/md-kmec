@@ -22,6 +22,21 @@
 #   T4  T1-T3 again with the rebuild buffers forced into page form
 #       (debug_row_rebuild_pages=Y), and the set really used page buffers
 #   T5  no kernel report in either pass
+#   T7  rk_row_rebuild_workers is live: a pass at 16 rebuild rows in flight
+#       reports 16 in rk_row_stats (rebuild_set_workers) and rebuilds the
+#       member correctly; out-of-range values are refused
+#   T8  rk_row_rebuild_pace caps the rebuild at its own KB/s rate while the
+#       array carries foreground I/O.  md's rate control cannot: it slows a
+#       sync down by waiting for recovery_active to drain, and a band reports
+#       its progress before sync_request returns, so there is never anything
+#       in flight for md to wait on.  With the knob set, a rebuild under a
+#       foreground load stays near that rate; with it 0 the same pass runs
+#       several times faster
+#   T9  pacing to a rate the array cannot reach does not slow it down: the
+#       budget runs from when a band started, not from when it finished, so a
+#       band already slower than the cap sleeps not at all (adding the budget
+#       to the completion time instead cut a 34 MiB/s rebuild to 22.6 under an
+#       unreachable 50 MB/s cap on 8+2 NVMe)
 #   T6  a third pass turns rk_row_rebuild off for a second at a quarter of a
 #       throttled rebuild while the foreground reads through the stripe cache
 #       (rk_row_dread=0), so the stripe path's windows are cut short and md's
@@ -48,6 +63,10 @@ P=/sys/module/raidkm/parameters
 cleanup() {
 	[ -n "$FIOPID" ] && kill "$FIOPID" 2>/dev/null
 	[ -w $P/debug_row_rebuild_pages ] && echo N > $P/debug_row_rebuild_pages
+	[ -w "/sys/block/$MDNAME/md/rk_row_rebuild_pace" ] &&
+		echo 0 > "/sys/block/$MDNAME/md/rk_row_rebuild_pace"
+	[ -w "/sys/block/$MDNAME/md/rk_row_rebuild_workers" ] &&
+		echo 8 > "/sys/block/$MDNAME/md/rk_row_rebuild_workers"
 	sudo "$MDADM" --stop "$MD" 2>/dev/null
 	local d
 	for d in "${MEMBERS[@]:-}"; do
@@ -178,6 +197,95 @@ run_pass() {	# tag pages(Y|N) toggle(0|1)
 	MEMBERS=("${MEMBERS[@]:0:3}" "$spare" "${MEMBERS[@]:4:$((N - 4))}" "$victim")
 }
 
+
+# T7/T8: the rebuild-concurrency knob and our own sync_speed_min pacing.
+# One pass each, timed, under the same sequential read load.  PACE_RATE carries
+# the measured MiB/s out to the caller.
+PACE_RATE=
+run_knob_pass() {	# tag workers pace_kb
+	local tag=$1 workers=$2 pace=$3
+	local spare victim=${MEMBERS[3]} secs elapsed chunks kib rate setw
+	spare=${MEMBERS[$N]}
+
+	rk_create 2r "${MEMBERS[@]:0:$N}" || { rk_fail "$tag: create"; return; }
+	local knob="/sys/block/$MDNAME/md/rk_row_rebuild_workers"
+	local pknob="/sys/block/$MDNAME/md/rk_row_rebuild_pace"
+	[ -w "$knob" ] && [ -w "$pknob" ] || { rk_fail "$tag: raidkm lacks the rebuild knobs"; rk_stop; return; }
+	if [ "$pace" != 0 ]; then
+		# only what a store refuses proves the range check, so test it once
+		if echo 0 > "$knob" 2>/dev/null || echo 65 > "$knob" 2>/dev/null; then
+			rk_fail "$tag T7: rk_row_rebuild_workers accepted an out-of-range value"
+		else
+			rk_pass "$tag T7: rk_row_rebuild_workers refuses 0 and 65"
+		fi
+	fi
+	echo "$workers" > "$knob" || { rk_fail "$tag: cannot set $workers workers"; rk_stop; return; }
+	echo "$pace" > "$pknob"
+	rk_write "$DATAMB"
+	rk_fail_disks "$victim"; rk_remove_disks "$victim"
+	# md's own limits stay out of the way: this tests our own rate
+	echo 2000000 > "/sys/block/$MDNAME/md/sync_speed_min"
+	echo 2000000 > "/sys/block/$MDNAME/md/sync_speed_max"
+
+	fio --name=fg --filename="$MD" --rw=read --bs=1M --direct=1 --ioengine=libaio \
+		--iodepth=8 --numjobs=2 --size="${DATAMB}M" --time_based --runtime=3600 \
+		>/dev/null 2>&1 &
+	FIOPID=$!
+	sleep 2
+	rk_dmesg_clear
+	sudo dd if=/dev/zero of="$spare" bs=1M count=4 status=none 2>/dev/null
+	rk_add_disks "$spare"
+	for secs in $(seq 100); do
+		grep -q recovery /proc/mdstat && break
+		[ "$(cat "/sys/block/$MDNAME/md/degraded")" = 0 ] && break
+		sleep 0.1
+	done
+	local t0=$(date +%s%N)
+	secs=0
+	setw=0
+	while [ "$(cat "/sys/block/$MDNAME/md/degraded")" != 0 ]; do
+		[ "$setw" = 0 ] && setw=$(stat_of rebuild_set_workers)
+		sleep 0.2; secs=$((secs + 1))
+		[ "$secs" -gt 6000 ] && break
+	done
+	elapsed=$(( ($(date +%s%N) - t0) / 1000000 ))	# ms
+	[ "$elapsed" -lt 1 ] && elapsed=1
+	kill "$FIOPID" 2>/dev/null; wait "$FIOPID" 2>/dev/null; FIOPID=
+	[ "${setw:-0}" = 0 ] && setw=$(stat_of rebuild_set_workers)
+
+	kib=$(cat "/sys/block/$MDNAME/md/component_size")
+	chunks=$((kib / CHUNK_KB))
+	# MiB/s from milliseconds, so a sub-second pass is still measured
+	rate=$(awk -v k="$kib" -v ms="$elapsed" 'BEGIN{printf "%d", k * 1000 / 1024 / ms}')
+	PACE_RATE=$rate
+	if grep -q recovery /proc/mdstat || [ "$(rk_geom)" != "[$N/$N]" ]; then
+		rk_fail "$tag T7: rebuild did not complete ($(rk_geom))"
+	elif [ "$pace" != 0 ]; then
+		[ "${setw:-0}" = "$workers" ] &&
+			rk_pass "$tag T7: rebuild_set_workers $setw with rk_row_rebuild_workers $workers ($chunks chunks in ${elapsed}ms)" ||
+			rk_fail "$tag T7: rebuild_set_workers $setw with rk_row_rebuild_workers $workers"
+	fi
+
+	# the rebuilt member must hold the data at this worker count too
+	rk_fail_disks "${MEMBERS[5]}"
+	rk_readback "$DATAMB" && rk_pass "$tag T7: data reads back through the rebuilt member" \
+		|| rk_fail "$tag T7: data differs with the rebuilt member serving"
+	rk_remove_disks "${MEMBERS[5]}"
+	sudo dd if=/dev/zero of="${MEMBERS[5]}" bs=1M count=4 status=none 2>/dev/null
+	rk_add_disks "${MEMBERS[5]}"
+	sleep 1; rk_wait_idle
+	local mm
+	mm=$(rk_scrub)
+	[ "$mm" = 0 ] && rk_pass "$tag T7: scrub mismatch_cnt 0" || rk_fail "$tag T7: scrub mismatch_cnt $mm"
+	rk_dmesg_clean && rk_pass "$tag T7: no kernel report" || rk_fail "$tag T7: kernel report"
+	echo 0 > "$pknob"
+	echo 8 > "$knob"
+	rk_stop
+	local x
+	for x in "${MEMBERS[@]}"; do sudo "$MDADM" --zero-superblock "$x" 2>/dev/null; done
+	MEMBERS=("${MEMBERS[@]:0:3}" "$spare" "${MEMBERS[@]:4:$((N - 4))}" "$victim")
+}
+
 mkdir -p "$RK_TMP"
 rk_load_modules || exit 1
 rk_setup_brd $((N + 1)) || exit 1
@@ -188,5 +296,31 @@ echo "== row rebuild under a degraded sequential read (8+2 rotating, ${CHUNK_KB}
 run_pass "folio" N 0
 run_pass "pages" Y 0
 run_pass "toggle" N 1
+
+# T7/T8: 16 rebuild rows in flight, capped at 8 MiB/s, then the same pass
+# uncapped.  This rate is what md's own knobs cannot enforce here.
+PACE_KB=8000
+run_knob_pass "paced" 16 "$PACE_KB"
+paced=$PACE_RATE
+run_knob_pass "unpaced" 16 0
+unpaced=$PACE_RATE
+# a rate far above what the array can do must cost nothing
+run_knob_pass "pace-highrate" 16 2000000
+highfloor=$PACE_RATE
+floor_mb=$((PACE_KB / 1024))
+if [ -z "$highfloor" ] || [ -z "$unpaced" ]; then
+	rk_fail "T9: a pass did not report a rate (unpaced '${unpaced:-}', high rate '${highfloor:-}')"
+elif [ "$highfloor" -ge $((unpaced * 3 / 4)) ]; then
+	rk_pass "T9: pacing to an unreachable rate left it alone: $highfloor vs $unpaced MiB/s uncapped"
+else
+	rk_fail "T9: pacing to an unreachable rate slowed the rebuild: $highfloor vs $unpaced MiB/s uncapped"
+fi
+if [ -z "$paced" ] || [ -z "$unpaced" ]; then
+	rk_fail "T8: a pass did not report a rate (paced '${paced:-}', unpaced '${unpaced:-}')"
+elif [ "$paced" -le $((floor_mb * 3)) ] && [ "$unpaced" -ge $((paced * 2)) ]; then
+	rk_pass "T8: paced $paced MiB/s against a ${floor_mb} MiB/s cap, uncapped $unpaced MiB/s"
+else
+	rk_fail "T8: pacing did not hold the cap: paced $paced MiB/s, uncapped $unpaced MiB/s, cap ${floor_mb} MiB/s"
+fi
 
 rk_summary

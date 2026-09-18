@@ -43,6 +43,7 @@
 #include <linux/module.h>
 #include <linux/async.h>
 #include <linux/seq_file.h>
+#include <linux/part_stat.h>
 #include <linux/cpu.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -905,8 +906,21 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh,
 	}
 
 	if (test_bit(STRIPE_HANDLE, &sh->state)) {
+		/*
+		 * A stripe the sync thread is waiting on must not wait for the
+		 * preread throttle.  delayed_list is only activated once
+		 * preread_active_stripes falls below IO_THRESHOLD, which a
+		 * saturating small-write load can keep from happening for
+		 * minutes; md_do_sync() meanwhile waits for recovery_active to
+		 * drain, so one DELAYED stripe that also carries a sync request
+		 * stops the whole resync/recovery (measured: recovery_active
+		 * pinned at one stripe for 15-160 s under 4 KiB random writes,
+		 * stripe state HANDLE|SYNC_REQUESTED|DELAYED, never handled).
+		 */
 		if (test_bit(STRIPE_DELAYED, &sh->state) &&
-		    !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+		    !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state) &&
+		    !test_bit(STRIPE_SYNC_REQUESTED, &sh->state) &&
+		    !test_bit(STRIPE_SYNCING, &sh->state))
 			list_add_tail(&sh->lru, &conf->delayed_list);
 		else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
 			   sh->bm_seq - conf->seq_write > 0)
@@ -10368,6 +10382,95 @@ out_sources:
 }
 
 /*
+ * rk_row_rebuild_pace: a ceiling, in KB/s, on the row rebuild while the array
+ * carries foreground I/O.  0 (the default) is off.
+ *
+ * md's own rate control cannot reach this path.  md_do_sync() slows a sync
+ * down by waiting for mddev->recovery_active to drain (sync_speed_min is the
+ * threshold above which it starts inserting that barrier, not a rate), and a
+ * band reports its progress with md_done_sync() *before*
+ * raid5_sync_request() returns, so recovery_active is zero at every point md
+ * can look at it and the barrier is satisfied the instant it is evaluated.
+ * Measured on 8+2 NVMe under a saturating 4 KiB random write: the same load
+ * rebuilt 65,436 chunks at a 20 MB/s floor and 65,440 at 200 MB/s.
+ * sync_speed_max still works, being rate-based (msleep).
+ *
+ * This knob carries its own rate rather than reading sync_speed_min, whose
+ * documented sense is the opposite -- a guaranteed minimum, which an admin or
+ * a distro may well have raised to mean "rebuild at least this fast".  Taking
+ * it as a ceiling would then slow the rebuild by turning a knob whose name
+ * promises the reverse.
+ *
+ * Off by default: every rebuild rate raidkm reports is an unpaced one.
+ */
+static void raidkm_row_rb_pace(struct mddev *mddev, sector_t did,
+			       unsigned long started)
+{
+	struct r5conf *conf = mddev->private;
+	int kb_per_sec = min(READ_ONCE(conf->row_rb_pace), INT_MAX / 2);
+	unsigned long now = jiffies, due;
+	bool busy = true;
+
+	if (kb_per_sec <= 0 || !did)
+		return;
+
+	/*
+	 * What this band should have taken at the ceiling: did/2 KiB at
+	 * kb_per_sec, in jiffies -- counted from when the band STARTED, so a
+	 * band that already took longer than that sleeps not at all.  (Adding
+	 * the budget to the completion time instead paces to well under the
+	 * rate asked for, and throttles even an array that cannot reach it:
+	 * measured on 8+2 NVMe under run G, a 50 MB/s ceiling cut a 34 MiB/s
+	 * rebuild to 22.6.)  The deadline also carries a remainder no single
+	 * sleep paid off, so the rate converges across bands.
+	 */
+	due = conf->row_rb_pace_due;
+	if (time_before(due, started))
+		due = started;
+	due += (unsigned long)min_t(u64,
+				    div_u64((u64)did * HZ, 2U * (u32)kb_per_sec),
+				    5ULL * HZ);
+	/*
+	 * Nothing owed.  The usual case is a rate the array cannot reach at
+	 * all, and leaving here without even reading the array's I/O counters
+	 * is what makes the knob free when it has nothing to do (reading them
+	 * per band cost 3-11% of the rebuild rate on 8+2 NVMe).
+	 */
+	if (!time_after(due, now)) {
+		conf->row_rb_pace_due = due;
+		return;
+	}
+	/*
+	 * Foreground I/O enters through the array's gendisk; the engine's own
+	 * reads and writes go straight to the members, so the array's sector
+	 * counter moves for user I/O only, and an idle array is free to outrun
+	 * the ceiling.  md only accounts those bios while the array's queue
+	 * has iostats enabled (md_account_bio -> bio_start_io_acct), and a
+	 * dm-raid array has no gendisk at all; in both cases we cannot tell an
+	 * idle array from a busy one, so the ceiling simply always applies --
+	 * which is the safe reading of a knob someone turned on.
+	 */
+	if (mddev->gendisk && blk_queue_io_stat(mddev->gendisk->queue)) {
+		u64 fg = part_stat_read_accum(mddev->gendisk->part0, sectors);
+
+		busy = fg != conf->row_rb_pace_fg;
+		conf->row_rb_pace_fg = fg;
+	}
+	if (!busy) {
+		conf->row_rb_pace_due = now;
+		return;
+	}
+	conf->row_rb_pace_due = due;
+
+	/* Sleep in slices: a stop, a failure or a quiesce must not be left
+	 * waiting on a band that already finished its I/O. */
+	while (time_before(jiffies, due) && !conf->quiesce &&
+	       !test_bit(MD_RECOVERY_INTR, &mddev->recovery))
+		schedule_timeout_uninterruptible(
+			min_t(unsigned long, due - jiffies, HZ / 5));
+}
+
+/*
  * A band of consecutive rows, rebuilt in parallel.  One row at a time is
  * latency-bound (submit k reads, wait, decode, write, wait) and leaves the
  * CPU idle, so a sync step takes a band and hands its rows to a few workers,
@@ -10379,15 +10482,24 @@ out_sources:
  * is retried by the stripe path on the next call — md's cursor never passes a
  * row that was not rebuilt.
  */
-#define RK_ROW_REBUILD_BAND	16	/* rows per sync step */
+#define RK_ROW_REBUILD_BAND_MIN	16	/* rows per sync step, floor */
+#define RK_ROW_REBUILD_BAND_MAX	128	/* ... and ceiling */
+#define RK_ROW_REBUILD_BAND_PER_WK 2	/* ... and how many rows each worker takes */
 /*
  * Rows rebuilt in parallel within a band.  Each worker waits on its row's k
  * survivor reads and one member write, so at flash latency the rebuild rate
  * follows this count until the member being rebuilt is the limit: 8+2 on GCP
  * local NVMe, 279 MiB/s with 4, 387 with 8, 385 with 16 (one member's write
  * rate).  RK_ROW_RB_BUDGET still trims it on wide or large-chunk arrays.
+ *
+ * This is the default for sysfs rk_row_rebuild_workers.  Raising it is the
+ * dial for rebuild against foreground bandwidth: under a saturating foreground
+ * load a row's round trip is what limits the rebuild (2.6 ms idle on GCP local
+ * NVMe against 36-40 ms under a 4 KiB random write at 100k IOPS), so the share
+ * of the device the rebuild wins follows the number of rows in flight.
  */
 #define RK_ROW_REBUILD_WORKERS	8
+#define RK_ROW_REBUILD_WORKERS_MAX 64
 /* ceiling on one pass's rebuild buffers: nwk x (k + 1) chunks */
 #define RK_ROW_RB_BUDGET	(64UL << 20)
 
@@ -10443,17 +10555,12 @@ struct raidkm_row_rb_set {
 };
 
 /* drop the pass's rebuild buffers; md's sync thread, or conf teardown */
-static void raidkm_row_rb_set_free(struct r5conf *conf)
+static void raidkm_row_rb_set_put(struct raidkm_row_rb_set *set)
 {
-	struct raidkm_row_rb_set *set = conf->row_rb;
 	unsigned int i;
 
-	/* row_rb_nwk / row_rb_page_bufs keep describing the last set built,
-	 * so the shape of a finished pass can still be read */
-	conf->row_rb_retry = 0;
 	if (!set)
 		return;
-	conf->row_rb = NULL;
 	if (set->bufs)
 		for (i = 0; i < set->nwk * (set->k + 1); i++)
 			raidkm_row_buf_free(&set->bufs[i]);
@@ -10467,6 +10574,17 @@ static void raidkm_row_rb_set_free(struct r5conf *conf)
 	kfree(set);
 }
 
+static void raidkm_row_rb_set_free(struct r5conf *conf)
+{
+	struct raidkm_row_rb_set *set = conf->row_rb;
+
+	/* row_rb_nwk / row_rb_page_bufs keep describing the last set built,
+	 * so the shape of a finished pass can still be read */
+	conf->row_rb_retry = 0;
+	conf->row_rb = NULL;
+	raidkm_row_rb_set_put(set);
+}
+
 /*
  * The rebuild buffers for this recovery pass, built on its first band and
  * reused by every band after it.  Allocating them per band — 36 chunk-sized
@@ -10476,50 +10594,37 @@ static void raidkm_row_rb_set_free(struct r5conf *conf)
  * (counted by the caller); a failed build is retried a second later.
  * Only md's sync thread calls this, one band at a time.
  */
-static struct raidkm_row_rb_set *raidkm_row_rb_set_get(struct r5conf *conf,
-							 int k)
+static struct raidkm_row_rb_set *raidkm_row_rb_set_alloc(struct r5conf *conf,
+							 int k, unsigned int nwk,
+							 int *page_bufs_out)
 {
-	struct raidkm_row_rb_set *set = conf->row_rb;
 	unsigned int len = conf->chunk_sectors << 9;
 	unsigned int nsh = conf->chunk_sectors / RAID5_STRIPE_SECTORS(conf);
-	unsigned long per_wk = (unsigned long)(k + 1) * len;
-	unsigned int nwk, i, j, page_bufs = 0;
+	struct raidkm_row_rb_set *set;
+	unsigned int i, j, page_bufs = 0;
 
-	if (set && set->k == k && set->chunk_sectors == conf->chunk_sectors)
-		return set;
-	if (set)
-		raidkm_row_rb_set_free(conf);	/* geometry changed */
-	if (conf->row_rb_retry && time_before(jiffies, conf->row_rb_retry))
-		return NULL;
-	conf->row_rb_retry = 0;
-
-	/* the budget trims workers, never below one: a wide or large-chunk
-	 * array still rebuilds by rows, one row at a time */
-	nwk = (unsigned int)clamp_t(unsigned long, RK_ROW_RB_BUDGET / per_wk,
-				    1, RK_ROW_REBUILD_WORKERS);
 	set = kzalloc(sizeof(*set), GFP_NOIO);
 	if (!set)
-		goto fail;
-	conf->row_rb = set;		/* from here the free path owns it */
+		return NULL;
 	set->k = k;
 	set->chunk_sectors = conf->chunk_sectors;
 	set->nwk = nwk;
 	set->wk = kcalloc(nwk, sizeof(*set->wk), GFP_NOIO);
 	set->bufs = kcalloc(nwk * (k + 1), sizeof(*set->bufs), GFP_NOIO);
 	if (!set->wk || !set->bufs)
-		goto fail_set;
+		goto fail;
 	for (i = 0; i < nwk; i++) {
 		struct raidkm_row_rb_ctx *c = &set->wk[i].ctx;
 
 		c->shs = kcalloc(nsh, sizeof(*c->shs), GFP_NOIO);
 		c->rr = kzalloc(struct_size(c->rr, src, k), GFP_NOIO);
 		if (!c->shs || !c->rr)
-			goto fail_set;
+			goto fail;
 		c->rr->k = k;
 		c->buf = &set->bufs[i * (k + 1)];
 		for (j = 0; j <= (unsigned int)k; j++) {
 			if (raidkm_row_buf_alloc(&c->buf[j], len))
-				goto fail_set;
+				goto fail;
 			if (!c->buf[j].folio)
 				page_bufs++;
 		}
@@ -10527,19 +10632,77 @@ static struct raidkm_row_rb_set *raidkm_row_rb_set_get(struct r5conf *conf,
 			c->rr->src[j].addr = c->buf[j].addr;
 		c->rr->out_addr = c->buf[k].addr;
 	}
-	WRITE_ONCE(conf->row_rb_nwk, nwk);
-	WRITE_ONCE(conf->row_rb_page_bufs, page_bufs);
+	*page_bufs_out = page_bufs;
 	return set;
 
-fail_set:
-	raidkm_row_rb_set_free(conf);
 fail:
-	/* a shortage now need not last: the stripe cache rebuilds what comes
-	 * in the meantime, and the set is built again a second later */
-	conf->row_rb_retry = (jiffies + HZ) ?: 1;
-	pr_info_ratelimited("md/raid:%s: row rebuild: no buffers, stripe cache for now, retrying\n",
-			    mdname(conf->mddev));
+	raidkm_row_rb_set_put(set);
 	return NULL;
+}
+
+static struct raidkm_row_rb_set *raidkm_row_rb_set_get(struct r5conf *conf,
+							 int k)
+{
+	struct raidkm_row_rb_set *set = conf->row_rb;
+	unsigned long per_wk = (unsigned long)(k + 1) * (conf->chunk_sectors << 9);
+	struct raidkm_row_rb_set *nset = NULL;
+	unsigned int nwk, try_nwk;
+	int page_bufs = 0;
+	bool usable;
+
+	/* the budget trims workers, never below one: a wide or large-chunk
+	 * array still rebuilds by rows, one row at a time */
+	nwk = (unsigned int)clamp_t(unsigned long, RK_ROW_RB_BUDGET / per_wk, 1,
+				    clamp_t(int, READ_ONCE(conf->row_rb_workers),
+					    1, RK_ROW_REBUILD_WORKERS_MAX));
+	/* a set for this geometry rebuilds rows whatever its worker count */
+	usable = set && set->k == k && set->chunk_sectors == conf->chunk_sectors;
+	if (usable && set->nwk == nwk)
+		return set;
+	if (set && !usable) {
+		raidkm_row_rb_set_free(conf);	/* geometry changed */
+		set = NULL;
+	}
+	if (conf->row_rb_retry && time_before(jiffies, conf->row_rb_retry))
+		return usable ? set : NULL;
+	conf->row_rb_retry = 0;
+
+	/*
+	 * Build the new set BEFORE dropping the old one, and settle for fewer
+	 * workers rather than none: rk_row_rebuild_workers is live, so a store
+	 * during a pass asks for a bigger set (36 MiB of chunk-sized folios at
+	 * 32 workers on 8+2/128K) from GFP_NOIO with no reclaim.  Freeing
+	 * first and failing would hand the rest of the pass to the 4 KiB
+	 * stripe path -- the very fallback the row engine exists to avoid.
+	 */
+	for (try_nwk = nwk; try_nwk >= 1; try_nwk /= 2) {
+		nset = raidkm_row_rb_set_alloc(conf, k, try_nwk, &page_bufs);
+		if (nset)
+			break;
+	}
+	if (!nset) {
+		/* a shortage now need not last: the stripe cache rebuilds what
+		 * comes in the meantime, and the set is built again a second
+		 * later.  An old set that still fits the geometry keeps
+		 * working in the meantime. */
+		conf->row_rb_retry = (jiffies + HZ) ?: 1;
+		pr_info_ratelimited("md/raid:%s: row rebuild: no buffers, %s for now, retrying\n",
+				    mdname(conf->mddev),
+				    usable ? "keeping the current workers" :
+					     "stripe cache");
+		return usable ? set : NULL;
+	}
+	if (try_nwk != nwk)
+		pr_info_ratelimited("md/raid:%s: row rebuild: %u workers, not %u: no buffers for more\n",
+				    mdname(conf->mddev), try_nwk, nwk);
+	raidkm_row_rb_set_free(conf);	/* drops the old set, clears the retry */
+	conf->row_rb = nset;
+	WRITE_ONCE(conf->row_rb_nwk, nset->nwk);
+	WRITE_ONCE(conf->row_rb_page_bufs, page_bufs);
+	conf->row_rb_pace_due = jiffies;
+	conf->row_rb_pace_fg = conf->mddev->gendisk ?
+		part_stat_read_accum(conf->mddev->gendisk->part0, sectors) : 0;
+	return nset;
 }
 
 /* rebuild a band; returns the sectors of progress to claim (0 = none) */
@@ -10553,17 +10716,33 @@ static sector_t raidkm_row_rebuild_band(struct mddev *mddev, sector_t sector_nr,
 	sector_t avail = max_sector - sector_nr;
 	int k = conf->raid_disks - conf->m;
 	unsigned int nrows, i, done = 0, unclaimed = 0, nwk;
-	u8 ok[RK_ROW_REBUILD_BAND] = {};
+	u8 ok[RK_ROW_REBUILD_BAND_MAX] = {};
 
-	nrows = (unsigned int)min_t(sector_t, RK_ROW_REBUILD_BAND,
-				    avail / conf->chunk_sectors);
-	if (!nrows)
+	if (avail < conf->chunk_sectors)
 		return 0;
 	set = raidkm_row_rb_set_get(conf, k);
 	if (!set) {
 		atomic64_inc(&conf->row_rebuild_band_nomem);
 		return 0;
 	}
+	/*
+	 * Two rows per worker, so raising rk_row_rebuild_workers raises the
+	 * rows actually in flight rather than just the queue behind them, and
+	 * every worker still has a spare row to steal when one finishes
+	 * early.  The floor keeps the band a sync step's worth of work on
+	 * arrays whose worker count the buffer budget trims to one or two (a
+	 * wide array, or a large chunk): those used to get 16 rows a step and
+	 * would otherwise now pay 8x the sync_request round trips.  At the
+	 * default 8 workers this is the 16-row band the engine has always
+	 * used.
+	 */
+	nrows = (unsigned int)min3((sector_t)max_t(unsigned int,
+						   RK_ROW_REBUILD_BAND_MIN,
+						   set->nwk * RK_ROW_REBUILD_BAND_PER_WK),
+				   (sector_t)RK_ROW_REBUILD_BAND_MAX,
+				   avail / conf->chunk_sectors);
+	if (!nrows)
+		return 0;
 	nwk = min_t(unsigned int, set->nwk, nrows);
 
 	band.mddev = mddev;
@@ -14139,6 +14318,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	row_target = raidkm_row_rebuild_target(mddev, sector_nr, &tslot);
 	if (row_target && !(sector_nr % conf->chunk_sectors) &&
 	    sector_nr + conf->chunk_sectors <= max_sector) {
+		unsigned long band_started = jiffies;
 		sector_t did = raidkm_row_rebuild_band(mddev, sector_nr,
 						       max_sector, row_target,
 						       tslot);
@@ -14150,6 +14330,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 			 * and nothing else would take it back off.
 			 */
 			md_done_sync(mddev, did, 1);
+			raidkm_row_rb_pace(mddev, did, band_started);
 			return did;
 		}
 		/*
@@ -16102,6 +16283,110 @@ raidkm_row_rebuild_entry = __ATTR(rk_row_rebuild, S_IRUGO | S_IWUSR,
 				  raidkm_row_rebuild_store);
 
 static ssize_t
+raidkm_row_rebuild_workers_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	int ret = 0;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf)
+		ret = sprintf(page, "%d\n", READ_ONCE(conf->row_rb_workers));
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+static ssize_t
+raidkm_row_rebuild_workers_store(struct mddev *mddev, const char *page,
+				 size_t len)
+{
+	struct r5conf *conf;
+	unsigned long new;
+	int err;
+
+	if (len >= PAGE_SIZE || kstrtoul(page, 10, &new) ||
+	    new < 1 || new > RK_ROW_REBUILD_WORKERS_MAX)
+		return -EINVAL;
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf)
+		err = -ENODEV;
+	else
+		/* the sync thread rebuilds its buffer set on the next band;
+		 * RK_ROW_RB_BUDGET can still trim what it gets, which
+		 * rk_row_stats reports as rebuild_set_workers */
+		WRITE_ONCE(conf->row_rb_workers, (int)new);
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_row_rebuild_workers_entry = __ATTR(rk_row_rebuild_workers,
+					  S_IRUGO | S_IWUSR,
+					  raidkm_row_rebuild_workers_show,
+					  raidkm_row_rebuild_workers_store);
+
+static ssize_t
+raidkm_row_rebuild_pace_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	int ret = 0, rate;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (!conf) {
+		spin_unlock(&mddev->lock);
+		return 0;
+	}
+	rate = READ_ONCE(conf->row_rb_pace);
+	if (!rate)
+		ret = sprintf(page, "0\n");
+	else if (mddev->gendisk && !blk_queue_io_stat(mddev->gendisk->queue))
+		/*
+		 * Without iostats md accounts no foreground bios, so we cannot
+		 * see an idle array and the ceiling applies at all times: say
+		 * so rather than let the number imply otherwise.
+		 */
+		ret = sprintf(page, "%d (iostats off: paced even when idle)\n",
+			      rate);
+	else
+		ret = sprintf(page, "%d\n", rate);
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+static ssize_t
+raidkm_row_rebuild_pace_store(struct mddev *mddev, const char *page, size_t len)
+{
+	struct r5conf *conf;
+	unsigned long new;
+	int err;
+
+	/* KB/s, like md's own speed limits; 0 is off */
+	if (len >= PAGE_SIZE || kstrtoul(page, 10, &new) ||
+	    new > (unsigned long)INT_MAX / 2)
+		return -EINVAL;
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf)
+		err = -ENODEV;
+	else
+		/* read once per band */
+		WRITE_ONCE(conf->row_rb_pace, (int)new);
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_row_rebuild_pace_entry = __ATTR(rk_row_rebuild_pace, S_IRUGO | S_IWUSR,
+				       raidkm_row_rebuild_pace_show,
+				       raidkm_row_rebuild_pace_store);
+
+static ssize_t
 raidkm_batch_mparity_show(struct mddev *mddev, char *page)
 {
 	struct r5conf *conf;
@@ -16227,6 +16512,8 @@ static struct attribute *raid5_attrs[] =  {
 	&raid5_skip_copy.attr,
 	&raidkm_row_dread_entry.attr,
 	&raidkm_row_rebuild_entry.attr,
+	&raidkm_row_rebuild_workers_entry.attr,
+	&raidkm_row_rebuild_pace_entry.attr,
 	&raidkm_batch_mparity_entry.attr,
 	&raidkm_row_stats_entry.attr,
 	&raidkm_bio_sort_entry.attr,
@@ -16695,6 +16982,8 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		goto abort;
 	conf->row_dread = default_row_dread;
 	conf->row_rebuild = default_row_rebuild;
+	conf->row_rb_workers = RK_ROW_REBUILD_WORKERS;
+	conf->row_rb_pace = 0;
 	conf->batch_mparity = default_batch_mparity;
 	/*
 	 * Multi-threaded handle_stripe via worker groups. Stock kernel ships

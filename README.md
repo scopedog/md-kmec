@@ -580,6 +580,66 @@ build is retried a second later), and `rebuild_unclaimed` counts rows finished
 past a declined row in their band, which are rebuilt again.  The
 module parameter `debug_row_rebuild_pages=Y` forces the page form (testing).
 
+**`rk_row_rebuild_workers` — how many rows rebuild at once (default 8).**  A
+row is latency-bound: k survivor reads, a decode, one member write, each phase
+waited on.  What the rebuild is worth therefore follows how many rows are in
+flight, not how large its requests are.  Measured on 8+2 over 10 GCP local
+NVMe namespaces, 128 KiB chunk, 32 GiB members, paired runs in both
+directions (2026-09-18):
+
+| rows in flight | idle rebuild | rebuild under a light load | its foreground (4 KiB randwrite) |
+|---|---|---|---|
+| 4 | 196 MiB/s | 123 MiB/s | 37.7k IOPS |
+| 8 (default) | 272 MiB/s | 207-209 MiB/s | 32.4-32.9k IOPS |
+| 32 | 364 MiB/s | 327 MiB/s | 29.3-30.0k IOPS |
+
+So on an array with headroom the knob buys 2.7x the rebuild rate for 20% of
+the foreground IOPS, and the two directions agreed within 1%.  It buys
+**nothing** once the foreground alone saturates the device: at 16 jobs x QD32
+(~120k IOPS, ~2.9 GB/s of member I/O against this controller's ~3.5 GB/s) the
+rebuild sat at 34 MiB/s from 4 rows to 32, because the extra requests only
+queue deeper.  Range 1..64, live; the band grows with it, and the 64 MiB
+per-pass buffer budget still trims what a wide or large-chunk array gets —
+`rebuild_set_workers` in `rk_row_stats` reports what it actually got, and a
+store that cannot be met keeps the workers the pass already has rather than
+dropping to the stripe path.  **Raise `stripe_cache_size` with it**: a worker
+holds its row's stripe heads (chunk ÷ 4 KiB, so 32 at a 128 KiB chunk) for the
+whole round trip, so 32 rows want 1,024 of them against a default cache of
+256, and a row that cannot claim its stripes is left to the stripe cache
+instead — `rebuild_declined` climbing with the knob is that.  On the rig at
+`stripe_cache_size=256` declines stayed at 0.5% of chunks even at 32 rows, so
+the effect is real but its size is not yet established.
+
+**`rk_row_rebuild_pace` — a ceiling in KB/s on the rebuild while the array
+carries foreground I/O (default 0, off).**  md's own rate control cannot reach
+this path.  md slows a sync down by waiting for `recovery_active` to drain, and
+a band reports its progress before `sync_request()` returns, so there is never
+anything in flight for md to wait on: back-to-back arms on the NVMe rig make
+the no-op exact, with the same load rebuilding 65,436 chunks at a 20 MB/s
+`sync_speed_min` and 65,440 at 200 MB/s.  (`sync_speed_max` still works — it is
+rate-based.)  This knob therefore carries its own rate rather than reading
+`sync_speed_min`, whose documented sense is the opposite: a *minimum* an admin
+may well have raised to mean "rebuild at least this fast", which it would be
+perverse to read as a cap.  A band that beat the rate sleeps for the
+difference, so the array's foreground gets the bandwidth back (same rig, 8
+rows, a light 4 KiB random write):
+
+| `rk_row_rebuild_pace` | rebuild | foreground |
+|---|---|---|
+| 0 (off) | 207-208 MiB/s | 29.7-30.5k IOPS |
+| 100000 | 95 MiB/s | 35.9k IOPS |
+| 50000 | 49 MiB/s | 37.1k IOPS |
+| 20000 | 19 MiB/s | 40.3k IOPS |
+
+Each rate is met within 2%, and the foreground gains 36% across the range.  A
+rate the array cannot reach costs nothing at all (paired arms: 207.0 and 208.6
+MiB/s off, 207.9 and 208.4 with it set to 2 GB/s).  An idle array is free to
+outrun the ceiling, which the array's own I/O counters tell us — except with
+`iostats` off on the array queue, or on dm-raid, where md accounts no
+foreground bios and the ceiling then applies at all times; the knob's
+read-back says so.  Leave it off unless foreground latency matters more than
+rebuild time: every rebuild rate quoted here is an unpaced one.
+
 **`rk_bio_sort` — order the resync/recovery submissions (opt-in).**  raid5 can
 collect a handled stripe's member bios and submit them in stripe-sector order,
 but upstream only does so when every member is rotational, which switches it
