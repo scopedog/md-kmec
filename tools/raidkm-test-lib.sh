@@ -37,6 +37,7 @@ RK_TMP="${RK_TMP:-/tmp/raidkm-test}"
 
 RK_PASS=0
 RK_FAIL=0
+RK_SKIPPED=0
 
 rk_log()  { echo "    $*"; }
 rk_pass() { RK_PASS=$((RK_PASS + 1)); echo "  PASS: $*"; }
@@ -48,10 +49,21 @@ rk_fail() { RK_FAIL=$((RK_FAIL + 1)); echo "  FAIL: $*" >&2; }
 RK_SKIP=77
 rk_skip() { echo "SKIP: $*"; exit "$RK_SKIP"; }
 
+# One CHECK the environment cannot express, in a suite whose other checks still
+# mean something -- e.g. a sub-block read on a device whose logical block is
+# already the block size.  Counted and printed, never a pass and never a fail:
+# a premise the hardware denies is not a result either way.
+rk_skip_check() { RK_SKIPPED=$((RK_SKIPPED + 1)); echo "  SKIP: $*"; }
+
 # Print a summary and return non-zero if anything failed (use as the exit code).
+# raidkm-test-ci.sh parses this line, so keep the wording in step with it.
 rk_summary() {
 	echo
-	echo "==== $(basename "$0"): $RK_PASS passed, $RK_FAIL failed ===="
+	if [ "$RK_SKIPPED" -gt 0 ]; then
+		echo "==== $(basename "$0"): $RK_PASS passed, $RK_FAIL failed, $RK_SKIPPED skipped ===="
+	else
+		echo "==== $(basename "$0"): $RK_PASS passed, $RK_FAIL failed ===="
+	fi
 	[ "$RK_FAIL" -eq 0 ]
 }
 
@@ -162,10 +174,16 @@ RK_DEVS="${RK_DEVS:-}"
 rk_setup_brd() {
 	local need="${1:-$BRD_NR}" have want
 	if [ -n "$RK_DEVS" ]; then
-		have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
+		# rk_pick_disks is all-or-nothing -- it prints nothing when it
+		# cannot fill the request -- so count separately, or the skip
+		# note below says "0 devices" on a rig that has eleven.
+		have=$(rk_count_disks)
 		[ "$have" -ge "$need" ] && return 0
-		echo "ERROR: RK_DEVS has $have devices, need $need" >&2
-		return 1
+		# Real devices cannot be conjured the way ram disks can, so a
+		# short RK_DEVS is the rig being smaller than this suite, not a
+		# defect: skip, or the widest suites turn a 12-disk rig into a
+		# tier with failures in it that nobody can act on.
+		rk_skip "RK_DEVS has $have usable device(s), this suite needs $need"
 	fi
 	have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
 	# Enough ram devices, but brd loaded at another size (an earlier caller
@@ -192,6 +210,17 @@ rk_setup_brd() {
 	sudo modprobe brd rd_nr="$want" rd_size="$BRD_SIZE_KB" 2>/dev/null || true
 	have=$(rk_pick_disks "$need" 2>/dev/null | wc -w)
 	[ "$have" -ge "$need" ]
+}
+
+# How many of the candidate devices are actually usable (RK_DEVS, else ram*).
+rk_count_disks() {
+	local d n=0
+	for d in ${RK_DEVS:-/dev/ram*}; do
+		[ -b "$d" ] || continue
+		sudo blockdev --getsize64 "$d" >/dev/null 2>&1 || continue
+		n=$((n + 1))
+	done
+	echo "$n"
 }
 
 # Echo the first <n> working /dev/ram* block devices (skips broken nodes).

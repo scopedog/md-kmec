@@ -866,6 +866,39 @@ check fails.  Individual stages can be run directly (`raidkm-test-{functional,
 degraded,grow,grow-traditional,reshape-concurrent}.sh`); see
 `raidkm-test-lib.sh` for the env knobs.
 
+**Running the suites on real disks.** Set `RK_DEVS` to a list of block devices
+and the suites use those instead of building ramdisks — the point of a real-HW
+gate is the device timing that a ramdisk's microsecond latency hides. Two
+properties of the devices decide whether a run means anything:
+
+* **Size.** The suites are calibrated for `BRD_NR` × `BRD_SIZE_KB` (12 × 256 MiB).
+  Nothing bounds the array to that on a real disk: a create resyncs the whole
+  member, and every rebuild and scrub walks it again. Handing `replace` 2 GiB
+  members is what pushed it past its 900 s budget on the first real-NVMe tier
+  run — the suite was fine, the rig was eight times bigger than the suite
+  expects.
+* **Logical block size.** On 4 KiB-logical drives the smallest read md will
+  accept is already a whole CRC block, so checks built on a sub-block read
+  (`row-csum` T5) cannot be expressed at all. They are reported as skipped
+  checks, not failures, and the tier summary says how many.
+
+`tools/raidkm-rig-nvme.sh` carves a rig of the right shape and prints the
+`RK_DEVS` line for it — one member per namespace (arrays sharing a physical
+device serialise their resync, so a leftover array on a sibling partition makes
+every arm report `resync=DELAYED`), stale superblocks zeroed, udev's
+re-assembly held off while it works:
+
+```sh
+sudo bash tools/raidkm-rig-nvme.sh --yes /dev/nvme0n{1..14}
+sudo RK_DEVS="$(cat /var/tmp/raidkm-rig.devs)" MDADM=../mdadm/mdadm \
+     bash tools/raidkm-test-ci.sh --tier=smoke
+```
+
+A suite that needs more devices than the rig has (the declustered suites want
+14) is **skipped** with the count in the note, not failed. `env.txt` in the
+results directory records each member's size and logical/physical block size,
+so a result says what it ran on.
+
 **Reshape crash/fault suite** (`tools/raidkm-test-reshape-crash.sh`, needs a
 `CONFIG_RAIDKM_FAULT_INJECT` kernel build): power-loss and torn-write recovery of
 the COW-staged online reshape, driven by the `raidkm_reshape_inject` debug knob.
@@ -941,6 +974,8 @@ md-kmec/
 │   ├── raidkm-test-xfstests.sh        # xfstests on ext4 over raidkm, healthy + degraded (nightly)
 │   ├── raidkm-test-mdadm-suite.sh     # mdadm's own raid6 tests adapted to raidkm (nightly;
 │   │                                    # stops every array, detaches every loop device)
+│   ├── raidkm-rig-nvme.sh             # carve a real-disk rig (right-sized members, one per
+│   │                                    # namespace) and print its RK_DEVS line
 │   ├── raidkm-test-ci.sh              # CI entry point: --tier=smoke|quick|full|nightly, JUnit XML,
 │   │                                    # kernel-log scan, refuses hosts with other md arrays
 │   ├── raidkm-standard-benchmark.sh   # fio harness (8 workloads incl. 1 MiB

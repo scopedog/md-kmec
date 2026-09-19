@@ -260,14 +260,26 @@ poison_needle
 # is held by the member we just poisoned -- a HEALTHY one, so this read takes
 # the aligned-read bypass rather than the decode path.
 NOFF=$(( CHUNK_KB * 1024 / 2 ))
-dd if="$RK_TMP/pat" of="$RK_TMP/t5-want" bs=512 count=1 skip=$(( NOFF / 512 )) status=none
-echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
-sudo dd if="$MD" of="$RK_TMP/t5-got" bs=512 count=1 skip=$(( NOFF / 512 )) \
-	iflag=direct status=none 2>/dev/null
-if cmp -s "$RK_TMP/t5-want" "$RK_TMP/t5-got"; then
-	rk_pass "T5: sub-block read returned the original bytes (verified, then healed)"
+# The read has to be SMALLER than one CRC block, and O_DIRECT cannot go below
+# the array's logical block -- which is the widest logical block among the
+# members.  On 4 KiB-logical drives the smallest read md will accept is already
+# a whole CRC block, so the hole this test covers cannot be reached from
+# userspace there at all.  Say so rather than fail: the premise is denied by
+# the hardware, which is not the same as the guard being gone.
+SUB=$(cat "/sys/block/$MDNAME/queue/logical_block_size" 2>/dev/null || echo 512)
+BLK=$(cat "/sys/block/$MDNAME/md/stripe_size" 2>/dev/null || echo 4096)
+if [ "$SUB" -ge "$BLK" ]; then
+	rk_skip_check "T5: logical block $SUB >= CRC block $BLK, a sub-block read cannot be issued on these members"
 else
-	rk_fail "T5: SUB-BLOCK READ SERVED UNVERIFIED DATA from a poisoned member"
+	dd if="$RK_TMP/pat" of="$RK_TMP/t5-want" bs="$SUB" count=1 skip=$(( NOFF / SUB )) status=none
+	echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+	sudo dd if="$MD" of="$RK_TMP/t5-got" bs="$SUB" count=1 skip=$(( NOFF / SUB )) \
+		iflag=direct status=none 2>/dev/null
+	if cmp -s "$RK_TMP/t5-want" "$RK_TMP/t5-got"; then
+		rk_pass "T5: sub-block read ($SUB B) returned the original bytes (verified, then healed)"
+	else
+		rk_fail "T5: SUB-BLOCK READ SERVED UNVERIFIED DATA from a poisoned member"
+	fi
 fi
 
 rk_summary

@@ -41,8 +41,9 @@
 #   --suites=LIST          run exactly these suites instead (comma-separated
 #                          names as in tools/raidkm-test-<name>.sh)
 #   --output=DIR           results directory (default /var/tmp/raidkm-test-ci-<timestamp>)
-#   --suite-timeout=SEC    per-suite wall-clock limit (default 2400; the nightly
-#                          suites default to their own, longer limits)
+#   --suite-timeout=SEC    per-suite wall-clock limit (default 2400).  The
+#                          nightly suites declare their own, longer limits and
+#                          keep them when they exceed this.
 #   --allow-stop-all       permit suites that stop every md array (tier full)
 #   --allow-existing-arrays  run even though other md arrays are active.  The
 #                          smoke/quick suites only use $MD (/dev/md70) and their
@@ -194,6 +195,16 @@ mkdir -p "$OUTPUT" || die "cannot create $OUTPUT"
 	echo "tree=$(git -C "$RK_TREE" describe --always --dirty 2>/dev/null || echo "not a git checkout")"
 	command -v rpm >/dev/null && echo "packages=$(rpm -qa 'kmod-tlc-*' 'mdadm-tlc-*' 2>/dev/null | sort | tr '\n' ' ')"
 	echo "env=BRD_NR=$BRD_NR BRD_SIZE_KB=$BRD_SIZE_KB NATIVE=$NATIVE RK_RELOAD=$RK_RELOAD MD=$MD"
+	# On real disks the members decide how long the tier takes and which
+	# premises hold (a 4 KiB-logical member cannot serve a sub-block read),
+	# so a result has to say what it ran on.
+	if [ -n "${RK_DEVS:-}" ]; then
+		echo "rk_devs=$RK_DEVS"
+		for d in $RK_DEVS; do
+			[ -b "$d" ] || continue
+			echo "member=$d size_mb=$(( $(blockdev --getsize64 "$d" 2>/dev/null || echo 0) / 1048576 )) logical=$(blockdev --getss "$d" 2>/dev/null) physical=$(blockdev --getpbsz "$d" 2>/dev/null)"
+		done
+	fi
 } > "$OUTPUT/env.txt"
 sed 's/^/  /' "$OUTPUT/env.txt"
 echo
@@ -219,7 +230,14 @@ for s in "${SUITES[@]}"; do
 		pold=$(cat "$pfile" 2>/dev/null) || die "$s: raidkm has no module parameter ${pfile##*/}"
 		echo "${s##*=}" > "$pfile" || die "$s: cannot set ${pfile##*/}=${s##*=}"
 	fi
-	limit=${SUITE_TIMEOUT:-${SUITE_TIMEOUTS[${s%%@*}]:-2400}}
+	# --suite-timeout sets the budget for suites that do not declare one.  A
+	# suite that DOES declare one keeps it when it is longer: the entries in
+	# SUITE_TIMEOUTS exist because those suites genuinely need hours, and a
+	# flag meant to bound the smoke tier silently cutting xfstests to the
+	# same number just turns a long suite into a timed-out one.
+	limit=${SUITE_TIMEOUT:-2400}
+	declared=${SUITE_TIMEOUTS[${s%%@*}]:-0}
+	[ "$declared" -gt "$limit" ] && limit=$declared
 	start=$(date +%s)
 	timeout --foreground --kill-after=60 "$limit" \
 		bash "$DIR/raidkm-test-${s%%@*}.sh" > "$OUTPUT/$f.log" 2>&1
@@ -228,9 +246,12 @@ for s in "${SUITES[@]}"; do
 	[ -n "$pfile" ] && echo "$pold" > "$pfile"
 	dmesg > "$OUTPUT/$f.dmesg" 2>/dev/null
 	dmesg -C 2>/dev/null
-	line=$(grep -E "==== .*: [0-9]+ passed, [0-9]+ failed ====" "$OUTPUT/$f.log" | tail -1)
+	line=$(grep -E "==== .*: [0-9]+ passed, [0-9]+ failed(, [0-9]+ skipped)? ====" "$OUTPUT/$f.log" | tail -1)
 	passed=$(sed -n 's/.*: \([0-9]*\) passed.*/\1/p' <<< "$line")
-	failed=$(sed -n 's/.* \([0-9]*\) failed.*/\1/p' <<< "$line")
+	failed=$(sed -n 's/.*[^0-9]\([0-9]*\) failed.*/\1/p' <<< "$line")
+	# checks the environment could not express (rk_skip_check): reported so a
+	# green tier still says what it did not get to try
+	cskip=$(sed -n 's/.*[^0-9]\([0-9]*\) skipped.*/\1/p' <<< "$line")
 	splats=$(rk_dmesg_splats "$OUTPUT/$f.dmesg" "$OUTPUT/$f.known")
 	known=$(cat "$OUTPUT/$f.known" 2>/dev/null); rm -f "$OUTPUT/$f.known"
 	note=""
@@ -251,6 +272,7 @@ for s in "${SUITES[@]}"; do
 		status=fail; note="${note:+$note; }$splats kernel warning line(s) in $f.dmesg"
 	fi
 	[ "${known:-0}" != 0 ] && note="${note:+$note; }$known known artifact report(s) ignored"
+	[ "${cskip:-0}" != 0 ] && note="${note:+$note; }${cskip} check(s) skipped"
 	[ "$status" = fail ] && nfail=$((nfail + 1))
 	[ "$status" = skip ] && nskip=$((nskip + 1))
 	R_NAME+=("$s"); R_STATUS+=("$status"); R_PASSED+=("${passed:-0}")
@@ -306,4 +328,11 @@ fi
 echo
 cat "$OUTPUT/summary.txt"
 echo "Results: $OUTPUT (summary.txt, results.xml, <suite>.log, <suite>.dmesg)"
+# A tier where every suite skipped exits 0 on the letter of "nothing failed",
+# which is exactly how a mis-specified rig (too few RK_DEVS, a module that will
+# not load) passes CI without running a line of raidkm.  Say so and fail.
+if [ "$nskip" = "${#SUITES[@]}" ]; then
+	echo "raidkm-test-ci: every suite skipped -- nothing was tested" >&2
+	exit 1
+fi
 [ "$nfail" = 0 ]
