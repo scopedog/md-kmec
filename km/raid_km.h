@@ -923,15 +923,6 @@ struct r5conf {
 	unsigned long		row_rb_retry;	/* jiffies: build failed, no set before then */
 	int			row_rb_nwk;	/* workers in the last set built (rk_row_stats) */
 	int			row_rb_page_bufs; /* of its buffers, built from order-0 pages */
-	int			row_rb_workers;	/* sysfs rk_row_rebuild_workers: rows
-						 * rebuilt concurrently (the budget
-						 * still trims it) */
-	int			row_rb_pace;	/* sysfs rk_row_rebuild_pace: KB/s
-						 * ceiling while the array carries
-						 * foreground I/O (0 = off) */
-	/* pacing state, touched only by md's sync thread */
-	unsigned long		row_rb_pace_due; /* jiffies: next band may start */
-	u64			row_rb_pace_fg;	/* array sectors seen at the last band */
 	atomic_t		pending_full_writes; /* full write backlog */
 	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */
@@ -1151,6 +1142,38 @@ struct r5conf {
 	struct list_head	pending_list;
 	int			pending_data_cnt;
 	struct r5pending_data	*next_pending_data;
+
+	/*
+	 * Row-rebuild balance knobs.  Two placement rules, both learned the
+	 * expensive way, both measured:
+	 *
+	 *   - They live at the END of r5conf, because everything they would
+	 *     otherwise push along -- pending_full_writes, bypass_count,
+	 *     bypass_threshold, active_stripes, device_lock -- is touched per
+	 *     stripe by every CPU.  Inserting them mid-struct moved those
+	 *     across cacheline boundaries and cost 4-18% on healthy
+	 *     small-I/O workloads.
+	 *   - They get their OWN cacheline, because the sync thread writes
+	 *     row_rb_pace_{due,fg} once per band while pacing is on.  Sharing
+	 *     a line with the pending_data group (next_pending_data and
+	 *     friends, written on the bio submission path) false-shares the
+	 *     two: an unreachable pace ceiling, which should cost nothing,
+	 *     cost 27% of the rebuild rate (409 -> 300 MiB/s) until this
+	 *     alignment went in.  raidkm-test-row-rebuild-load.sh T9 is the
+	 *     regression test for exactly that.
+	 *
+	 * Put new COLD fields after these; put nothing hot in this line.
+	 */
+	int			row_rb_workers ____cacheline_aligned_in_smp;
+						/* sysfs rk_row_rebuild_workers: rows
+						 * rebuilt concurrently (the budget
+						 * still trims it) */
+	int			row_rb_pace;	/* sysfs rk_row_rebuild_pace: KB/s
+						 * ceiling while the array carries
+						 * foreground I/O (0 = off) */
+	/* pacing state, touched only by md's sync thread */
+	unsigned long		row_rb_pace_due; /* jiffies: next band may start */
+	u64			row_rb_pace_fg;	/* array sectors seen at the last band */
 };
 
 /*

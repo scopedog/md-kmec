@@ -966,6 +966,9 @@ md-kmec/
 │   ├── raidkm-test-row-dread-wide.sh  # degraded span read once per row (unaligned, races, dcl)
 │   ├── raidkm-test-row-csum.sh        # native checksum through the row paths (poisoned survivors refused)
 │   ├── raidkm-test-declustered-populate-window.sh  # population backpressure window, pause + retry
+│   ├── raidkm-test-declustered-row-transitions.sh  # the row layer across spare-assignment
+│   │                                    # transitions: off while POPULATING/COPYING, live while
+│   │                                    # steady + degraded, data intact across a rebalance
 │   ├── raidkm-test-scrub-badblocks.sh # check/repair over a live member's bad-block log (no WARN, data intact)
 │   ├── raidkm-test-degraded-trust-disk.sh # a readable block is read, never decoded (parity wrong: data intact)
 │   ├── raidkm-test-row-rebuild-load.sh # row rebuild under a degraded sequential read: every chunk accounted, data intact

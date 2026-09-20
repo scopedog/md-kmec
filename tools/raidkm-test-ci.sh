@@ -80,7 +80,8 @@ SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window d
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.
 QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate)
 FULL=("${QUICK[@]}" grow grow-traditional reshape-concurrent declustered-create declustered-io
-      declustered-rebalance declustered-csum declustered-autoarm declustered-multi declustered-crash)
+      declustered-rebalance declustered-csum declustered-autoarm declustered-multi declustered-crash
+      declustered-row-transitions)
 NIGHTLY=("${QUICK[@]}" faultinject xfstests mdadm-suite)
 # suites that run `mdadm --stop --scan` (directly, via rk_udev_quiesce, or in
 # mdadm's own test harness)

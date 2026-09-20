@@ -9758,6 +9758,33 @@ static int raidkm_row_member_idx(struct r5conf *conf, sector_t logical,
  * under us while the member reads are in flight, so those sessions stay on
  * the stripe path (the population/copy-back paths themselves are phases 3-4
  * of the IU plan).
+ *
+ * Checked ONCE, on entry (raidkm_row_read), and that is enough -- worth
+ * writing down, because the two obvious ways to doubt it both fail.  The
+ * retry this read already carries is read_seqcount_retry(&conf->gen_lock),
+ * and NO assignment transition writes that seqcount (only the reshape paths
+ * do), so the doubt is reasonable:
+ *
+ *   - "a transition moves the map under an admitted read."  The only
+ *     transition that changes a READ's map is the copy-from-spare rebalance
+ *     (POPULATED -> COPYING), and it runs inside raid5_quiesce().  A row read
+ *     in flight holds an active_aligned_reads reference
+ *     (raidkm_row_aligned_get), which that quiesce waits for, so the arm
+ *     cannot happen under it -- measured: mdadm --add blocked 25 s behind one
+ *     deliberately stalled read.
+ *   - "a read is admitted as steady, parks in raidkm_row_aligned_get() for
+ *     the quiesce, and comes out into COPYING."  Probed directly, with a
+ *     debug knob holding the arm's quiesce open for 8 s and a counter on
+ *     exactly that condition: 0 hits in 6 runs, with and without a re-check
+ *     after the get.  Not reachable.
+ *
+ * Arming a population (NONE -> POPULATING) takes no quiesce at all, and does
+ * not need one: reb_mark is 0 there, and at mark 0 the POPULATING redirect
+ * hands a read the same disk NONE does.
+ *
+ * tools/raidkm-test-declustered-row-transitions.sh gates the resulting
+ * behaviour: off while POPULATING, live while steady and degraded, and data
+ * intact across a rebalance.
  */
 static bool raidkm_row_dcl_steady(struct r5conf *conf)
 {
