@@ -428,13 +428,22 @@ item is expanded in the sections that follow.
 8. **After a grow that changes `k`, refresh them with `tune2fs`** — `mdadm
    --grow` prints the exact command.
 
-**md tunables — verify, don't tune:**
+**md tunables — verify, and tune only where noted:**
 
 9. `skip_copy` and worker groups are **already on by default**.  On many-core
    hosts, raising `worker_thread_cnt` toward `nproc` may help concurrent writes
    — measure rather than assume.
-10. `stripe_cache_size` (default fine) and `preread_bypass_threshold`
-    (irrelevant to full-row writes) are not worth sweeping.
+10. `stripe_cache_size` **auto-sizes to 1024** at creation — leave it there,
+    and do not pin it to stock's 256.  Raise it to `4096` if a rebuild runs
+    (a row in flight holds every stripe head of its chunk, 32 at a 128 KiB
+    chunk, so the default 16 rows want 512) or if the write load keeps many
+    full rows in flight.  About 42 KiB per head on ten members, so 4096 is
+    ~170 MiB.  It is not a throughput dial: md grows the cache past the sysfs
+    floor on demand (`R5_ALLOC_MORE`), and 256 / 1024 / 4096 measured the same
+    sequential write (2026-09-22).  What it buys is the rebuild's rows in
+    flight and no growth-window stalls.
+11. `preread_bypass_threshold` (irrelevant to full-row writes) is not worth
+    sweeping.
 
 **One-line version:** get `k`, the journal, and the partition offset right at
 build time; everything else is already the default or automatic.
@@ -590,7 +599,7 @@ so the rebuild never asks for more rows than the stripe cache holds: at
 `stripe_cache_size=256` that is 8 rows however many are asked for, and the log
 says what would lift it (`row rebuild limited to 8 rows in flight (of 16 asked
 for) by stripe_cache_size=256; 512 would lift it`).  Leave the cache at its
-auto-sized default or raise it (4096 is ~160 MiB on ten members); do not pin it
+auto-sized default or raise it (4096 is ~170 MiB on ten members); do not pin it
 small on an array that rebuilds through the row layer.  A
 row is latency-bound: k survivor reads, a decode, one member write, each phase
 waited on.  What the rebuild is worth therefore follows how many rows are in

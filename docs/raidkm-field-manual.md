@@ -769,7 +769,7 @@ then available, which is the usual reason to convert.
 | `worker_thread_cnt` | **Recommended knob.** Total worker threads for the array — the natural "I want N parallel workers" model | `nproc/2`, floor 2 |
 | `group_thread_cnt` | Same state, stock-compatible view: threads *per* worker group. Either knob updates the other | auto |
 | `skip_copy` | Zero-copy full-stripe writes (needs stable pages — free for O_DIRECT workloads) | `1` |
-| `stripe_cache_size` | Leave alone. 256 → 8192 *lost* 15–25% on ramdisk | `256` |
+| `stripe_cache_size` | Auto-sized when the array is created. Raise to `4096` when a rebuild runs or the write load keeps many full stripes in flight; do not pin it to stock's 256 | **1024** (128 MiB cache budget, floor 256) |
 | `preread_bypass_threshold` | Irrelevant to full-row writes | stock |
 | `rmw_level` | Inherited raid5 RMW policy | stock |
 | `sync_action` | `check` / `repair` / `idle` — scrub control | `idle` |
@@ -838,13 +838,24 @@ everything else is already default or automatic.
 8. **After a grow that changes k, refresh them with `tune2fs`** — `mdadm --grow`
    prints the exact command.
 
-**md tunables — verify, don't tune:**
+**md tunables — verify, and tune only where noted:**
 
 9. `skip_copy` and worker groups are already on by default. On many-core hosts,
    raising `worker_thread_cnt` toward `nproc` may help concurrent writes —
    measure rather than assume.
-10. `stripe_cache_size` (default fine) and `preread_bypass_threshold`
-    (irrelevant to full-row writes) are not worth sweeping.
+10. `stripe_cache_size` auto-sizes to **1024** at creation — leave it there,
+    and do not pin it to stock's 256. Raise it to `4096` if a rebuild runs
+    (a row in flight holds every stripe head of its chunk, 32 at 128 KiB, so
+    the default 16 rows want 512) or if the write load keeps many full rows
+    in flight. It costs about 42 KiB per head on ten members, so 4096 is
+    ~170 MiB. It is not a throughput dial: md grows the cache past the sysfs
+    floor on demand, and 256 / 1024 / 4096 measured the same sequential write
+    (2026-09-22). What it buys is the rebuild's rows and no growth-window
+    stalls. An early brd-ramdisk sweep lost 15–25% going 256 →
+    8192; that is a memcpy-bound artifact with no device latency to hide the
+    cache churn, and it does not carry over to real devices.
+11. `preread_bypass_threshold` (irrelevant to full-row writes) is not worth
+    sweeping.
 
 **Flash with a large indirection unit (QLC).** A write below the drive's IU
 (16, 32 or 64 KiB) makes the drive rewrite the whole unit, so check the request
