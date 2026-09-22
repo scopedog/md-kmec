@@ -79,9 +79,16 @@ SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window d
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.
 QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate)
+# declustered-populate@default_dcl_row_rebuild=1 runs the SAME gate (raw
+# spare-column oracle, resume from a journaled mark, scrub) with population
+# driven by the row engine: one chunk-sized write to the spare column instead
+# of a stripe write per granule.
 FULL=("${QUICK[@]}" grow grow-traditional reshape-concurrent declustered-create declustered-io
       declustered-rebalance declustered-csum declustered-autoarm declustered-multi declustered-crash
-      declustered-row-transitions)
+      declustered-row-transitions
+      declustered-populate@default_dcl_row_rebuild=1
+      declustered-populate-window@default_dcl_row_rebuild=1
+      declustered-csum@default_dcl_row_rebuild=1)
 NIGHTLY=("${QUICK[@]}" faultinject xfstests mdadm-suite)
 # suites that run `mdadm --stop --scan` (directly, via rk_udev_quiesce, or in
 # mdadm's own test harness)

@@ -872,8 +872,11 @@ Rebuild onto a spare no longer is:
   under foreground I/O costs that one chunk only: the next chunk boundary
   tries the row path again (on earlier builds the first such chunk
   could keep the rest of the pass on the 4 KiB stripe path).
-- `rk_row_rebuild_workers` (**8**, 1..64, live) is how many rows rebuild at
-  once, and it is the dial for rebuild against foreground bandwidth: a row
+- `rk_row_rebuild_workers` (**16**, 1..64, live; 8 until 2026-09, when 16 rebuilt
+  a third faster on an X4000 at no foreground cost) is how many rows rebuild at
+  once — never more than the stripe cache holds, since a row in flight takes all
+  32 stripe heads of a 128 KiB chunk (`stripe_cache_size=256` allows 8 rows, and
+  the log names the size that would lift the limit), and it is the dial for rebuild against foreground bandwidth: a row
   waits on its k survivor reads and its member write, so the rebuild's share
   follows the rows in flight. On 8+2 over 10 GCP local NVMe namespaces
   (128 KiB chunk, paired runs both directions): idle 196 / 272 / 364 MiB/s at
@@ -892,6 +895,46 @@ Rebuild onto a spare no longer is:
   actually got, which the 64 MiB per-pass buffer budget can trim below the
   knob on wide or large-chunk arrays; a store it cannot meet keeps the workers
   the pass already has rather than falling back to the stripe path.
+- `rk_row_rebuild_window` (**64** chunks, 0..1024, live) is how far the engine
+  rebuilds ahead of md's cursor. md's sync loop asks for one step and waits for
+  the answer, so an engine that answers in whole chunks used to stand idle for
+  every round trip; now its workers take chunks in order up to a window ahead
+  and a sync step returns the contiguous finished prefix, waiting only on the
+  head chunk. md's cursor still moves in whole chunks and never past one that
+  is not on the member, so `recovery_offset` trails the report and an
+  interrupted pass simply drains the window and rebuilds those chunks again
+  (`rebuild_unclaimed`). It bounds how far past md's rate a burst can run (64
+  chunks = 8 MiB at a 128 KiB chunk), not memory — what is in flight is
+  `rk_row_rebuild_workers` rows whatever the window. A row that is merely
+  busy is retried rather than given up on (`rebuild_retries`): by the worker
+  that met it, up to eight times a quarter-millisecond apart, and once more
+  when md's cursor reaches the chunk — together, what the synchronous bands
+  did implicitly by ending a band at a declined row and starting the next one
+  on it. Without the first, 16 rows in flight on NVMe ran 8% slower than the
+  bands; without the second, a window under a degraded read served through the
+  stripe cache rebuilt 26% of the member as rows against 100%. `rebuild_head_wait_ms` is the time md spent waiting on the
+  head chunk, and `rebuild_head_timeouts` should stay 0 outside a quiesce or an
+  interrupted pass. On 8+2 local NVMe it is not a throughput feature — idle
+  388 vs 387 MiB/s, under a saturating degraded read level to ahead at 8 rows
+  (256/273 vs 235/231) and level at 16 and 32 — because the member's write
+  bandwidth is the ceiling; on ram disks, where the round trip is most of the
+  pass, 498 vs 719 ms per rebuild. Set **0** to restore the synchronous bands — the control arm for
+  measuring the window, and the setting to try if a rebuild behaves oddly under
+  load; `default_row_rebuild_window` sets what new arrays start with.
+- `rk_dcl_row_rebuild` (**0**, off, live) drives a DECLUSTERED population
+  through the row engine instead of the 4 KiB stripe path. Filling a spare
+  column has always run on the stripe path (`raidkm_row_rebuild_target()`
+  disqualifies `conf->dcl`), which on real NVMe writes the members at 6.4 KiB
+  against the classic row rebuild's 128.0 KiB; with this on, a band of rows
+  goes to the row-rebuild workers and each writes its row's spare column whole
+  — 115.7 KiB average, 18x fewer requests (128.0 KiB writes diluted by the
+  journal checkpoints). It costs wall-clock at the default worker count and
+  scales with `rk_row_rebuild_workers`: on 4 GiB members, 14.0 s at 8, 10.6 s
+  at 16, 8.6 s at 32, against the stripe path's 7.3 s. A row the band cannot
+  take falls through to the stripe path, which still carries backpressure, the
+  unreconstructable-address pause and the resume fast-forward. `rk_dcl_populate`
+  gains a `row rows N declined M` line; `default_dcl_row_rebuild` sets what new
+  arrays start with.
 - `rk_row_rebuild_pace` (**0**, off) is a ceiling in KB/s on the row rebuild
   while the array carries foreground I/O -- our own rate, not md's. md's
   cannot reach this path: it throttles a sync by waiting for

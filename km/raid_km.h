@@ -356,6 +356,8 @@ struct stripe_head {
 	struct stripe_head	*batch_head; /* protected by stripe lock */
 	spinlock_t		batch_lock; /* only header's lock is useful */
 	struct list_head	batch_list; /* protected by head's batch lock*/
+	unsigned long		delayed_since;	/* jiffies when parked on
+						 * delayed_list (age bound) */
 	struct list_head	csum_list;  /* native csum: queued for deferred
 					     * verify (raidkm_csum_cache.vstripes) */
 
@@ -1174,6 +1176,38 @@ struct r5conf {
 	/* pacing state, touched only by md's sync thread */
 	unsigned long		row_rb_pace_due; /* jiffies: next band may start */
 	u64			row_rb_pace_fg;	/* array sectors seen at the last band */
+	bool			row_rb_pace_owed; /* a sleep the last step ran up,
+						 * paid at the start of the next */
+	/* the look-ahead window: a knob, and a counter only md's sync thread
+	 * writes -- cold, like the rest of this line */
+	int			row_rb_window;	/* sysfs rk_row_rebuild_window: chunks
+						 * the row engine may rebuild ahead of
+						 * md's cursor (0 = synchronous bands) */
+	atomic64_t		row_rebuild_head_wait_ns; /* md's sync thread waiting
+						 * for the window's head chunk */
+	atomic64_t		row_rebuild_head_timeouts; /* the head wait ran out its
+						 * timeout: nobody woke it */
+	atomic64_t		row_rebuild_retries; /* attempts repeated on a busy row:
+						 * by the worker that met it, and
+						 * once more at md's cursor */
+	int			dcl_row_rebuild; /* sysfs rk_dcl_row_rebuild: drive
+						 * declustered population through the
+						 * row engine (chunk-sized writes to
+						 * the spare column) instead of the
+						 * 4 KiB stripe path */
+	atomic64_t		dcl_row_pop_rows; /* rows populated by the row engine */
+	atomic64_t		dcl_row_pop_declined; /* rows it left to the stripe
+						 * path (busy, unmapped, or a
+						 * source it could not verify) */
+	/* delayed_list liveness (cold; see raid5_activate_delayed) */
+	atomic64_t		delayed_parked;	/* stripes put on delayed_list */
+	atomic64_t		delayed_aged;	/* ... activated by the age bound,
+						 * not by the preread count */
+	atomic64_t		sync_token_regrant; /* a stripe with a pending
+						 * REQ_SYNC write given the
+						 * preread token it had lost */
+	atomic64_t		overlap_slow;	/* R5_Overlap waits past the
+						 * diagnostic timeout */
 };
 
 /*

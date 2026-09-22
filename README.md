@@ -571,7 +571,9 @@ above).  `rk_row_stats` reports `rebuild_done`, `rebuild_declined` and
 the row path claimed nothing at a chunk boundary.  When that happens the stripe
 path's window stops at the next chunk boundary, so md's cursor returns to the
 chunk grid and the next chunk tries the row path again, however much foreground
-I/O cuts the window short.  The rebuild buffers are
+I/O cuts the window short.  The engine runs a **look-ahead window** ahead of
+md's cursor (`rk_row_rebuild_window`, below) rather than waiting for each batch
+of rows in turn.  The rebuild buffers are
 built once per pass — a folio each, or order-0 pages mapped contiguously when
 the page allocator has no folio — so a buffer shortage cannot take the row
 rebuild away; `rebuild_set_workers` and `rebuild_set_page_bufs` describe
@@ -580,7 +582,16 @@ build is retried a second later), and `rebuild_unclaimed` counts rows finished
 past a declined row in their band, which are rebuilt again.  The
 module parameter `debug_row_rebuild_pages=Y` forces the page form (testing).
 
-**`rk_row_rebuild_workers` — how many rows rebuild at once (default 8).**  A
+**`rk_row_rebuild_workers` — how many rows rebuild at once (default 16).**  The
+default was 8 until a Nimbus X4000 over NVMe-oF rebuilt a third faster at 16
+under a sequential read (899 / 912 against 655–709 MB/s) at no cost to the read.
+A row in flight holds every stripe head of its chunk — 32 at a 128 KiB chunk —
+so the rebuild never asks for more rows than the stripe cache holds: at
+`stripe_cache_size=256` that is 8 rows however many are asked for, and the log
+says what would lift it (`row rebuild limited to 8 rows in flight (of 16 asked
+for) by stripe_cache_size=256; 512 would lift it`).  Leave the cache at its
+auto-sized default or raise it (4096 is ~160 MiB on ten members); do not pin it
+small on an array that rebuilds through the row layer.  A
 row is latency-bound: k survivor reads, a decode, one member write, each phase
 waited on.  What the rebuild is worth therefore follows how many rows are in
 flight, not how large its requests are.  Measured on 8+2 over 10 GCP local
@@ -609,6 +620,131 @@ whole round trip, so 32 rows want 1,024 of them against a default cache of
 instead — `rebuild_declined` climbing with the knob is that.  On the rig at
 `stripe_cache_size=256` declines stayed at 0.5% of chunks even at 32 rows, so
 the effect is real but its size is not yet established.
+
+**`rk_row_rebuild_window` — how far the rebuild runs ahead of md's cursor, in
+chunks (default 64, 0..1024, live).**  md's sync loop is a poor fit for an
+engine that rebuilds whole chunks: it asks for one step, waits for the answer,
+records the progress and only then asks for the next.  A rebuild that answers
+in rows spent that whole round trip with its workers idle, and anything it had
+finished past a row it could not take was thrown away.  The engine therefore
+owns the pass instead.  Workers take chunks in order up to a window ahead of
+md's cursor, and a sync step returns the **contiguous finished prefix** at the
+cursor, waiting only on the head chunk:
+
+- md's cursor still advances in whole chunks and never past a chunk that is not
+  on the member, so `recovery_offset` trails what the engine has reported, and
+  what the window holds beyond it is free to be dropped.  An interrupted pass
+  (a stop, a `frozen`, a second failure, a quiesce) drains the window and
+  rebuilds those chunks again — `rebuild_unclaimed` counts them.
+- md's throttle still works, by backpressure: when md sleeps, the window fills
+  and the workers stop, at most a window's worth past the rate asked for.  That
+  is what bounds the knob — 64 chunks is 8 MiB at a 128 KiB chunk — not memory,
+  which stays at the worker count (`rk_row_rebuild_workers`) however wide the
+  window is, because a chunk holds buffers only while a worker has it.
+- A chunk the row path declines no longer ends anything: the stripe cache
+  takes that one chunk while the workers carry on beyond it.  But a row that
+  is merely **busy** — a stripe in use, or none free to take — is not given up
+  on, because a band never gave up on one either: a declined row ended the
+  band, everyone stood back, and the next band took it again at full width.
+  The window had to learn both halves of that (`rebuild_retries` counts the
+  repeated attempts).  The worker that meets a busy row stands back for a
+  quarter of a millisecond and tries it again, up to eight times, while the
+  others carry on; without this, declining costs a worker nothing, so under a
+  moment's stripe pressure a run of chunks is written off within microseconds
+  and then redone one at a time at md's cursor (8+2 NVMe, 16 rows in flight
+  under a sequential read: 8% *slower* than the bands, until this).  And a
+  chunk that still declined while it was ahead of the cursor is tried once
+  more when md reaches it: it was busy *then*.  Without that, a window under a
+  degraded read served through the stripe cache rebuilt as little as 26% of
+  the member as rows where the bands rebuilt 100%.
+- `rebuild_head_wait_ms` in `rk_row_stats` is how long md's sync thread spent
+  waiting on the head chunk: the part of the pass the window could not hide.
+  `rebuild_head_timeouts` counts the times that wait ran out its 50 ms safety
+  timeout with nobody having woken it; outside a quiesce or an interrupted
+  pass it should stay at 0, and anything else is worth a report.
+
+What it is worth depends on what the round trip through md's sync loop costs
+next to a chunk's I/O.  On 8+2 over 10 GCP local NVMe namespaces (128 KiB
+chunk, window against `rk_row_rebuild_window=0` in the same session) an idle
+rebuild is level — 388 / 388 MiB/s against 387 / 386 / 386, because the member's
+own write bandwidth is the ceiling and `rebuild_head_wait_ms` is the whole pass
+— and under a saturating sequential degraded read it is level to ahead at 8
+rows (256 / 273 against 235 / 231 in one session, 232 / 253 against 195 / 253
+in another) and level at 16 and 32 rows.  On ram disks, where a chunk costs
+microseconds and the round trip is most of the pass, twelve rebuilds
+alternating on one array took 498 ms with the window against 719 ms without.
+It is not a throughput feature on flash; what it changes there is structure —
+what a rebuild covers no longer depends on where md's cursor happens to land,
+and a chunk the row path cannot take costs that chunk.
+
+`0` turns the window off and restores the synchronous bands, which is the
+control arm for any measurement of it; `default_row_rebuild_window` sets what
+new arrays start with.
+
+**`rk_dcl_row_rebuild` — populate a distributed spare through the row engine
+(default off, live).**  On a declustered array the population that fills a
+spare column has always run on the 4 KiB stripe path: `raidkm_row_rebuild_target()`
+disqualifies `conf->dcl`, so the engine that rebuilds a classic member in whole
+chunks never saw it.  Measured on real NVMe (12 × 4 GiB members, 8+2 over twelve
+with two spare columns, 128 KiB chunk), that is **6.4 KiB** per write at the
+members, against the classic row rebuild's 128.0 KiB — on flash with a large
+indirection unit, the drive rewrites a whole unit for each of them.  With this
+knob on, a band of rows goes to the same row-rebuild workers and each writes its
+row's spare column whole: **115.7 KiB** average and 18× fewer requests (the
+population's own writes are 128.0 KiB; the average is that diluted by the
+journal's 4 KiB checkpoints every 16 MiB).
+
+The engine owns the map here rather than reading it, which is what makes this
+safe: a POPULATING redirect resolves against the same mark the pass advances, so
+a row's granules are published only once its chunk write has completed, and a row
+the band cannot take — busy stripes, a source it could not verify, a chain with
+no live endpoint — falls through to the stripe path, which still carries
+backpressure, the unreconstructable-address pause and the resume fast-forward.
+
+The cost is wall-clock at the default worker count, and it scales with
+`rk_row_rebuild_workers` (same rig, 4 GiB members, knob toggled on one boot):
+
+| population | pass | member writes |
+|---|---|---|
+| stripe path (knob off) | 7.3 s | 6.4 KiB |
+| row engine, 8 workers | 14.0 s | 115.7 KiB |
+| row engine, 16 workers | 10.6 s | 115.7 KiB |
+| row engine, 32 workers | 8.6 s | 116.5 KiB |
+
+Off by default while the path is gated; `default_dcl_row_rebuild` sets what new
+arrays start with, and `rk_dcl_populate` grows a `row rows N declined M` line so
+a run can be told which engine drove it.
+
+**Writes that must not wait for the preread throttle.**  md delays a stripe that
+needs prereads (`delayed_list`) until no preread is active anywhere, so small
+writes gather before the reads are paid for.  A `REQ_SYNC` write — every
+O_DIRECT write is one — is exempt: adding it gives the stripe a token that lets
+it read at once.  But the token is one per stripe and is spent when the *first*
+write is issued, so a second write that lands on the stripe in between is left
+with prereads to do and no token, and is parked.  Under a saturating O_DIRECT
+load the list then never drains — there is always a preread active — and the
+parked write waits until the load stops; anything that later overlaps it blocks
+its submitter for just as long (HRT, X4000: fio threads blocked for one to
+three minutes under 4 KiB random writes, released within seconds of the load
+ending).  On 8+2 NVMe under 16 x QD64 4 KiB random writes, 11,500 stripes were
+parked in a minute on a *healthy* array and 63,000 in four minutes on a
+rebuilding one.  Two guards, both module parameters, both on:
+
+- `sync_write_nodelay` (Y): a stripe about to be delayed that carries a pending
+  `REQ_SYNC` write takes the token instead.  Same rig: parked stripes 11,544 →
+  0, random-write IOPS 147.7k → 158.1k, worst write 1.7 s → 0.1 s healthy;
+  rebuilding, 103k → 139k IOPS and p99 188 → 34 ms.
+- `delayed_max_age_ms` (100): whatever else is parked is activated once it has
+  waited this long, even while prereads are active.  A backstop rather than a
+  deadline: the list is walked when raid5d next runs, so on an array that went
+  idle the moment the stripe was parked, it waits for the next thing that wakes
+  raid5d.  0 restores the stock behaviour.
+
+`rk_row_stats` counts them (`delayed_parked`, `delayed_aged`,
+`sync_token_regrant`), and `overlap_warn_secs` (5) makes a writer that has
+waited that long on `R5_Overlap` report what the stripe it waits for is doing
+(`overlap_slow` counts them) — every such writer's stack looks alike, so the
+report is the only way to tell a parked stripe from a row claim or a batch.
 
 **`rk_row_rebuild_pace` — a ceiling in KB/s on the rebuild while the array
 carries foreground I/O (default 0, off).**  md's own rate control cannot reach

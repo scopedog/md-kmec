@@ -824,6 +824,14 @@ fi
 
 FAILED=0
 : > "$OUTPUT/order.txt"
+# What kind of host this is: a machine type is not a machine.
+{
+	lscpu 2>/dev/null | awk -F: '/^Model name/ {gsub(/^ +/, "", $2); print $2}' | head -1
+	echo "$(nproc) CPUs online, $NUMA_NODES NUMA node(s)"
+	echo "kernel $(uname -r)"
+	[ -r /sys/hypervisor/type ] && echo "hypervisor $(cat /sys/hypervisor/type)"
+	command -v systemd-detect-virt >/dev/null && echo "virt $(systemd-detect-virt 2>/dev/null)"
+} > "$OUTPUT/host.txt" 2>/dev/null
 for entry in "${ORDER[@]}"; do
 	r="${entry%%:*}"
 	arm="${entry#*:}"
@@ -850,6 +858,7 @@ python3 - "$OUTPUT" "$BASELINE" "${ARM_LIST[@]}" <<'PY'
 import csv, glob, json, os, re, statistics, sys
 
 out, baseline, arms = sys.argv[1], sys.argv[2], sys.argv[3:]
+steal_seen = []          # hypervisor steal, cores, one entry per measured workload
 DESC = {
     "test1_rand4kw": "rand 4K write",
     "test2_dbmixed": "DB 75/25 8K",
@@ -896,7 +905,9 @@ for arm in arms:
             perrun[(arm, os.path.basename(rdir), t)] = iops
             cf = os.path.join(rdir, f"{t}_run1.cpu.json")
             if os.path.exists(cf):
-                d["cpu"].append(json.load(open(cf))["busy_cores"])
+                cj = json.load(open(cf))
+                d["cpu"].append(cj["busy_cores"])
+                steal_seen.append(cj.get("steal_cores", 0.0))
             mf = os.path.join(rdir, f"{t}_run1.members.json")
             if os.path.exists(mf):
                 mj = json.load(open(mf))
@@ -934,6 +945,18 @@ def emit(s=""):
 
 emit(f"# raidkm A/B benchmark — baseline `{baseline}`")
 emit()
+# The host, because the same command on the same machine TYPE is not the same
+# experiment: two n2-standard-32 instances a few hours apart read 0.86x and
+# 0.99x on one workload with bit-identical modules, and neither run had
+# recorded anything that could say which kind of host it was on.
+hf = os.path.join(out, "host.txt")
+if os.path.exists(hf):
+    emit("Host: " + " · ".join(l.strip() for l in open(hf) if l.strip()))
+    emit()
+if steal_seen and max(steal_seen) >= 0.05:
+    emit(f"**Hypervisor steal reached {max(steal_seen):.2f} cores during a workload** "
+         "(mean %.2f) — this host was contended; ratios from it are suspect." % statistics.mean(steal_seen))
+    emit()
 emit("| arm | level | disks | chunk | group_thread_cnt | stripe_cache_size | skip_copy | profile | module |")
 emit("|---|---|---|---|---|---|---|---|---|")
 for arm in arms:

@@ -147,6 +147,18 @@ else
 	rk_fail "population stalled (mark frozen ${RK_POP_STALL}s while idle): $(rk_pop_show)"; rk_summary; exit 1
 fi
 
+# rk_dcl_row_rebuild: when the knob is on, the row engine must be what drove
+# the pass — the whole point is that the spare column is written a chunk at a
+# time.  Everything below (the raw spare-column oracle especially) then gates
+# the row writer's map, not the stripe path's.
+if [ "$(cat "/sys/block/$MDNAME/md/rk_dcl_row_rebuild" 2>/dev/null)" = 1 ]; then
+	rrows=$(rk_pop_show | sed -n 's/^row rows \([0-9][0-9]*\).*/\1/p')
+	rdecl=$(rk_pop_show | sed -n 's/^row rows [0-9]* declined \([0-9][0-9]*\).*/\1/p')
+	[ -n "${rrows:-}" ] && [ "$rrows" -gt 0 ] \
+		&& rk_pass "row engine drove the population ($rrows rows, $rdecl declined)" \
+		|| rk_fail "rk_dcl_row_rebuild=1 but the row engine populated no rows (${rrows:-no counter})"
+fi
+
 # ---- 4. POPULATED reads + raw spare placement oracle ---------------------------
 ok=1
 for lc in "${FLCS[@]}"; do

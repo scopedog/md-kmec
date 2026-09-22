@@ -190,13 +190,21 @@ drop_caches() {
 
 # Busy jiffies and a timestamp, for busy_cores between two snapshots.
 CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
+# Third field: steal jiffies alone.  Busy includes steal, which is CPU the
+# hypervisor gave to someone else: a guest on a contended host looks busier and
+# gets less done, and nothing else in the results would say why.
 cpu_snap() {
-    awk -v now="$(date +%s.%N)" '$1 == "cpu" {print $2 + $3 + $4 + $7 + $8 + $9, now; exit}' /proc/stat
+    awk -v now="$(date +%s.%N)" '$1 == "cpu" {print $2 + $3 + $4 + $7 + $8 + $9, now, $9; exit}' /proc/stat
 }
 busy_cores() {	# busy_cores "<before>" "<after>" -> cores, 2 decimals
     python3 -c "
-b, bt = map(float, '$1'.split()); a, at = map(float, '$2'.split())
+b, bt = map(float, '$1'.split()[:2]); a, at = map(float, '$2'.split()[:2])
 print(f'{(a - b) / $CLK_TCK / max(at - bt, 1e-6):.2f}')"
+}
+steal_cores() {	# steal_cores "<before>" "<after>" -> cores, 2 decimals
+    python3 -c "
+b = '$1'.split(); a = '$2'.split()
+print(f'{(float(a[2]) - float(b[2])) / $CLK_TCK / max(float(a[1]) - float(b[1]), 1e-6):.2f}')"
 }
 
 # Run fio with a workload config, parse IOPS from JSON output.
@@ -217,7 +225,7 @@ run_test() {
     # shellcheck disable=SC2086
     after=$(rk_stat_snap $LEAVES)
     rk_stat_report "$before" "$after" > "$OUTPUT/${name}_run${run}.members.json"
-    echo "{\"busy_cores\": $(busy_cores "$c0" "$c1")}" > "$OUTPUT/${name}_run${run}.cpu.json"
+    echo "{\"busy_cores\": $(busy_cores "$c0" "$c1"), \"steal_cores\": $(steal_cores "$c0" "$c1")}" > "$OUTPUT/${name}_run${run}.cpu.json"
     # Parse read+write IOPS from the JSON.
     python3 -c "
 import json, sys
