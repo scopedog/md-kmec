@@ -218,6 +218,14 @@ static bool default_row_dread = true;
 module_param(default_row_dread, bool, 0644);
 MODULE_PARM_DESC(default_row_dread,
 		 "Initial rk_row_dread for new arrays: serve degraded reads through the row layer (default Y; N restores the 4 KiB stripe-cache path).");
+
+static bool default_row_write;
+module_param(default_row_write, bool, 0644);
+MODULE_PARM_DESC(default_row_write,
+		 "Initial rk_row_write for new arrays: write a full, aligned row as one request per member instead of through the 4 KiB stripe cache (default N).");
+
+#define RK_ROW_WRITE_DEPTH	64	/* rows in flight through the row path */
+#define RK_ROW_WRITE_DEPTH_MAX	1024
 unsigned int raidkm_dcl_pop_window = RKDCL_REB_WINDOW;
 module_param(raidkm_dcl_pop_window, uint, 0644);
 MODULE_PARM_DESC(raidkm_dcl_pop_window,
@@ -254,6 +262,77 @@ raidkm_row_bucket(struct r5conf *conf, sector_t member_sector, int group)
 
 	return &conf->row_buckets[(key * 0x9E3779B97F4A7C15ULL) >>
 				  (64 - RAIDKM_ROW_BUCKET_BITS)];
+}
+
+/*
+ * Rows a full-row write owns (raidkm_row_write_prep).  One slot per hash of
+ * the row, holding row + 1 while the row is being written, 0 otherwise.  A
+ * slot holds exactly one row: a second row that hashes to a busy slot is not
+ * locked, its write just goes to the stripe cache, and a lookup compares the
+ * row itself, so a collision never makes the stripe cache wait for a row it
+ * is not touching.
+ *
+ * raid5_get_active_stripe() consults the table under the stripe's hash lock
+ * (only while row writes are in flight), and the row writer walks the row's
+ * stripes under those same locks after setting its slot, so every lookup of
+ * the row either happened before the walk -- the writer then finds the stripe
+ * in use and gives the row up -- or sees the slot and waits.
+ */
+#define RAIDKM_ROW_WLOCK_BITS	14
+#define RAIDKM_ROW_WLOCK_SLOTS	(1 << RAIDKM_ROW_WLOCK_BITS)
+/*
+ * Fairness.  A stripe-cache request that waits for a row sets WANTED on the
+ * slot; the unlock then leaves the slot at row + 1 | GRACE instead of 0, which
+ * no longer reads as locked but refuses the next row write's cmpxchg, until
+ * the waiter has its stripe and clears it (raid5_get_active_stripe).  Without
+ * it, back-to-back full-row writes could take the row again every time,
+ * before the woken waiter looks.
+ */
+#define RAIDKM_ROW_WLOCK_WANTED	(1ULL << 63)
+#define RAIDKM_ROW_WLOCK_GRACE	(1ULL << 62)
+
+static inline u64 raidkm_row_of(struct r5conf *conf, sector_t member_sector)
+{
+	sector_div(member_sector, conf->chunk_sectors);
+	return member_sector;
+}
+
+static inline atomic64_t *raidkm_row_wslot(struct r5conf *conf, u64 row)
+{
+	return &conf->row_wlock[(row * 0x9E3779B97F4A7C15ULL) >>
+				(64 - RAIDKM_ROW_WLOCK_BITS)];
+}
+
+/* is the row holding stripe @sector (member sector) being row-written? */
+static inline bool raidkm_row_wlocked(struct r5conf *conf, sector_t sector,
+				      int dcl_group)
+{
+	u64 row;
+
+	if (likely(!atomic_read(&conf->row_writes)) || dcl_group ||
+	    !conf->row_wlock)
+		return false;
+	row = raidkm_row_of(conf, sector);
+	return (atomic64_read(raidkm_row_wslot(conf, row)) &
+		~RAIDKM_ROW_WLOCK_WANTED) == row + 1;
+}
+
+/* a waiter is about to sleep on the row of @sector: ask for it next */
+static inline void raidkm_row_wwant(struct r5conf *conf, sector_t sector)
+{
+	u64 row = raidkm_row_of(conf, sector);
+
+	atomic64_cmpxchg(raidkm_row_wslot(conf, row), row + 1,
+			 (row + 1) | RAIDKM_ROW_WLOCK_WANTED);
+}
+
+/* ... and it has its stripe: the row is fair game again */
+static inline void raidkm_row_wgot(struct r5conf *conf, sector_t sector)
+{
+	u64 row = raidkm_row_of(conf, sector);
+
+	atomic64_cmpxchg(raidkm_row_wslot(conf, row),
+			 (row + 1) | RAIDKM_ROW_WLOCK_GRACE, 0);
 }
 
 /*
@@ -1562,14 +1641,15 @@ struct stripe_request_ctx {
 	/* last sector in the request */
 	sector_t last_sector;
 
-	/*
-	 * bitmap to track stripe sectors that have been added to stripes
-	 * add one to account for unaligned requests
-	 */
-	DECLARE_BITMAP(sectors_to_do, RAID5_MAX_REQ_STRIPES + 1);
-
 	/* the request had REQ_PREFLUSH, cleared after the first stripe_head */
 	bool do_flush;
+
+	/*
+	 * bitmap to track stripe sectors that have been added to stripes;
+	 * sized by raid5_create_ctx_pool() for the array's largest bio, plus
+	 * one for an unaligned one
+	 */
+	unsigned long sectors_to_do[];
 };
 
 /*
@@ -1596,6 +1676,7 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 	struct stripe_head *sh;
 	int hash = stripe_hash_locks_hash(conf, sector, dcl_group);
 	int previous = !!(flags & R5_GAS_PREVIOUS);
+	bool row_waited = false;
 
 	pr_debug("get_stripe, sector %llu\n", (unsigned long long)sector);
 
@@ -1618,6 +1699,29 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 			wait_event_lock_irq(conf->wait_for_quiescent,
 					    !conf->quiesce,
 					    *(conf->hash_locks + hash));
+		}
+
+		/*
+		 * A full-row write owns this stripe's row and is writing its
+		 * members underneath the cache: wait for it, as for a quiesce
+		 * (raidkm_row_write_prep walks the row under this lock).
+		 */
+		if (unlikely(raidkm_row_wlocked(conf, sector, dcl_group))) {
+			if (flags & R5_GAS_NOBLOCK) {
+				sh = NULL;
+				break;
+			}
+			if (ctx && ctx->batch_last) {
+				raid5_release_stripe(ctx->batch_last);
+				ctx->batch_last = NULL;
+			}
+			raidkm_row_wwant(conf, sector);
+			row_waited = true;
+			wait_event_lock_irq(conf->row_write_wait,
+					    !raidkm_row_wlocked(conf, sector,
+								dcl_group),
+					    *(conf->hash_locks + hash));
+			continue;
 		}
 
 		sh = find_get_stripe(conf, sector, conf->generation - previous,
@@ -1656,6 +1760,10 @@ struct stripe_head *raid5_get_active_stripe(struct r5conf *conf,
 		clear_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
 	}
 
+	/* we waited for a row write and hold a stripe of the row now: a row
+	 * write finds it in use from here, so the grace can go */
+	if (unlikely(row_waited) && sh)
+		raidkm_row_wgot(conf, sector);
 	spin_unlock_irq(conf->hash_locks + hash);
 	return sh;
 }
@@ -10286,6 +10394,53 @@ static void raidkm_row_sync_endio(struct bio *bi)
 		complete(&rs->done);
 }
 
+/*
+ * Claim one stripe of a row for a row rebuild: true = it was idle and is now
+ * ours (STRIPE_ROW_SYNC set), false = something is using it and it was left
+ * alone.  On false the caller
+ * drops its reference itself and must NOT hand the stripe to
+ * raidkm_row_rebuild_release(), which clears STRIPE_ROW_SYNC on whatever it
+ * is given: had the stripe been busy because another claimer marked it, that
+ * would clear THEIR claim and let a write into a chunk still being rebuilt.
+ */
+static bool raidkm_row_claim_stripe(struct r5conf *conf,
+				    struct stripe_head *sh)
+{
+	bool busy = false;
+	int i;
+
+	spin_lock_irq(&sh->stripe_lock);
+	if (sh->batch_head ||
+	    test_bit(STRIPE_ACTIVE, &sh->state) ||
+	    test_bit(STRIPE_HANDLE, &sh->state) ||
+	    test_bit(STRIPE_SYNCING, &sh->state) ||
+	    test_bit(STRIPE_ROW_SYNC, &sh->state) ||
+	    test_bit(STRIPE_DELAYED, &sh->state))
+		busy = true;
+	/*
+	 * A stripe waiting on a native-csum verify is not idle even though
+	 * nothing is locked: the shard worker can still turn a mismatch into a
+	 * heal rewrite, which handle_stripe issues internally and the ROW_SYNC
+	 * write bounce therefore never sees.  Leave those rows to the stripe
+	 * cache.  Reading csum_list outside its qlock is deliberately
+	 * one-sided: a queue we miss is a verify that has not run yet, and the
+	 * R5_CsumPending test below still catches it (the worker clears that
+	 * flag only after the verdict).
+	 */
+	if (conf->csum && !list_empty(&sh->csum_list))
+		busy = true;
+	for (i = 0; !busy && i < sh->disks; i++)
+		if (sh->dev[i].toread || sh->dev[i].towrite ||
+		    sh->dev[i].written ||
+		    test_bit(R5_LOCKED, &sh->dev[i].flags) ||
+		    test_bit(R5_CsumPending, &sh->dev[i].flags))
+			busy = true;
+	if (!busy)
+		set_bit(STRIPE_ROW_SYNC, &sh->state);
+	spin_unlock_irq(&sh->stripe_lock);
+	return !busy;
+}
+
 /* release the row's stripes and let any bounced writer through */
 static void raidkm_row_rebuild_release(struct r5conf *conf,
 				       struct stripe_head **shs, int nsh)
@@ -10414,7 +10569,6 @@ static int raidkm_row_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 	/* own the row: every stripe must be idle, or we leave the row alone */
 	for (j = 0; j < nsh; j++) {
 		struct stripe_head *sh;
-		bool busy = false;
 
 		sh = raid5_get_active_stripe(conf, NULL,
 					     sector_nr + j * RAID5_STRIPE_SECTORS(conf),
@@ -10424,51 +10578,13 @@ static int raidkm_row_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 			ret = -EBUSY;
 			goto out_stripes;
 		}
-		shs[j] = sh;
-
-		spin_lock_irq(&sh->stripe_lock);
-		if (sh->batch_head ||
-		    test_bit(STRIPE_ACTIVE, &sh->state) ||
-		    test_bit(STRIPE_HANDLE, &sh->state) ||
-		    test_bit(STRIPE_SYNCING, &sh->state) ||
-		    test_bit(STRIPE_ROW_SYNC, &sh->state) ||
-		    test_bit(STRIPE_DELAYED, &sh->state))
-			busy = true;
-		/*
-		 * A stripe waiting on a native-csum verify is not idle even
-		 * though nothing is locked: the shard worker can still turn a
-		 * mismatch into a heal rewrite, which handle_stripe issues
-		 * internally and the ROW_SYNC write bounce therefore never
-		 * sees.  Leave those rows to the stripe cache.  Reading
-		 * csum_list outside its qlock is deliberately one-sided: a
-		 * queue we miss is a verify that has not run yet, and the
-		 * R5_CsumPending test below still catches it (the worker
-		 * clears that flag only after the verdict).
-		 */
-		if (conf->csum && !list_empty(&sh->csum_list))
-			busy = true;
-		for (i = 0; !busy && i < sh->disks; i++)
-			if (sh->dev[i].toread || sh->dev[i].towrite ||
-			    sh->dev[i].written ||
-			    test_bit(R5_LOCKED, &sh->dev[i].flags) ||
-			    test_bit(R5_CsumPending, &sh->dev[i].flags))
-				busy = true;
-		if (!busy)
-			set_bit(STRIPE_ROW_SYNC, &sh->state);
-		spin_unlock_irq(&sh->stripe_lock);
-		if (busy) {
-			/*
-			 * Not ours: drop it here rather than leave it to the
-			 * release, which clears STRIPE_ROW_SYNC on whatever it
-			 * is handed.  Had this stripe been busy because another
-			 * claimer marked it, that would clear THEIR claim and
-			 * let a write into a chunk still being rebuilt.
-			 */
-			shs[j] = NULL;
+		if (!raidkm_row_claim_stripe(conf, sh)) {
+			/* not ours: never hand it to the release */
 			raid5_release_stripe(sh);
 			ret = -EBUSY;
 			goto out_stripes;
 		}
+		shs[j] = sh;
 	}
 
 	/* read the k survivors, one request each */
@@ -10671,7 +10787,6 @@ static int raidkm_dcl_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 	/* own the row: every stripe of THIS group must be idle */
 	for (j = 0; j < nsh; j++) {
 		struct stripe_head *sh;
-		bool busy = false;
 
 		sh = raid5_get_active_stripe(conf, NULL,
 					     sector_nr + j * RAID5_STRIPE_SECTORS(conf),
@@ -10681,31 +10796,14 @@ static int raidkm_dcl_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 			ret = -EBUSY;
 			goto out_stripes;
 		}
-		shs[j] = sh;
-
-		spin_lock_irq(&sh->stripe_lock);
-		if (sh->batch_head ||
-		    test_bit(STRIPE_ACTIVE, &sh->state) ||
-		    test_bit(STRIPE_HANDLE, &sh->state) ||
-		    test_bit(STRIPE_SYNCING, &sh->state) ||
-		    test_bit(STRIPE_ROW_SYNC, &sh->state) ||
-		    test_bit(STRIPE_DELAYED, &sh->state))
-			busy = true;
-		if (conf->csum && !list_empty(&sh->csum_list))
-			busy = true;
-		for (i = 0; !busy && i < sh->disks; i++)
-			if (sh->dev[i].toread || sh->dev[i].towrite ||
-			    sh->dev[i].written ||
-			    test_bit(R5_LOCKED, &sh->dev[i].flags) ||
-			    test_bit(R5_CsumPending, &sh->dev[i].flags))
-				busy = true;
-		if (!busy)
-			set_bit(STRIPE_ROW_SYNC, &sh->state);
-		spin_unlock_irq(&sh->stripe_lock);
-		if (busy) {
+		if (!raidkm_row_claim_stripe(conf, sh)) {
+			/* not ours: never hand it to the release (it would
+			 * clear another claimer's STRIPE_ROW_SYNC) */
+			raid5_release_stripe(sh);
 			ret = -EBUSY;
 			goto out_stripes;
 		}
+		shs[j] = sh;
 	}
 
 	/* read the k survivors, one request each */
@@ -11729,6 +11827,728 @@ again:
 	return (sector_t)n * conf->chunk_sectors;
 }
 
+/*
+ * Row layer, full-row write.
+ *
+ * A write that covers a whole row (k chunks at one member offset: 1 MiB at
+ * 8+2 with 128 KiB chunks) already reaches the members as one request per
+ * member through the stripe cache, and its parity is already one syndrome call
+ * per row.  What it costs there is CPU: 32 stripe heads per row, each taking
+ * and dropping its locks for every one of the k data pages added and every
+ * member bio issued and completed (on a CPU-bound 8+2 rig, ~37% of the write
+ * path's busy CPU was that lock traffic, parity ~15%).  Here the row is written
+ * without any of it: parity is computed straight from the caller's pages, and
+ * each member gets one bio -- a clone of the caller's bio for a data chunk, a
+ * chunk-sized buffer for a parity chunk.
+ *
+ * Correctness against the stripe cache comes from a row lock
+ * (raidkm_row_write_lock): the row's slot in conf->row_wlock is set, every
+ * stripe of the row already in the cache must be idle, and those have their
+ * cached pages dropped, which the write makes stale.  Until the member writes
+ * are done, any stripe-cache access to the row -- read, write, sync, discard --
+ * waits in raid5_get_active_stripe().  No stripe head is taken, so the row
+ * path does not need room in the stripe cache.  Row readers
+ * (degraded read) see the write through the row's write generation, as they
+ * see a stripe-cache write.  Nothing waits for the row path: a bio whose
+ * rows cannot all be claimed at once, or with no context free, goes to the
+ * stripe cache whole (raidkm_row_write_bio).
+ *
+ * Kept narrow on purpose -- everything else goes to the stripe cache: a
+ * healthy array only (no degraded, recovering or replacement member), no
+ * reshape, no sync pass running (raid5_sync_request waits out row writes in
+ * flight: see the fence below), skip_copy on (the caller's pages are both the
+ * parity source and the data written, which is only safe with the stable
+ * pages skip_copy asks the block layer for), and no journal, PPL, native
+ * checksum or declustered layout.  A write-intent bitmap is kept as the
+ * stripe path keeps it (raidkm_row_write_go / _submit / _done).
+ */
+struct raidkm_row_wctx;
+
+struct raidkm_row_wmember {
+	struct raidkm_row_wctx	*w;
+	struct md_rdev		*rdev;
+	int			failed;		/* its write returned an error */
+};
+
+struct raidkm_row_wctx {
+	struct list_head	list;		/* conf->row_wctx_free while idle */
+	struct work_struct	submit;		/* issues the member writes */
+	struct work_struct	work;		/* runs when they are done */
+	struct r5conf		*conf;
+	struct bio		*raid_bio;
+	struct raidkm_row_bucket *bucket;
+	sector_t		msect;		/* member sector of the row */
+	unsigned int		base;		/* bytes into raid_bio: the row */
+	blk_opf_t		opf;		/* for the member writes */
+	atomic_t		pending;
+	/* fixed when built; a context of another geometry is rebuilt */
+	int			k, m;
+	unsigned int		chunk_sectors;
+	atomic64_t		*wslot;		/* the row's lock slot, NULL = not locked */
+	u64			row;
+	bool			bitmap;		/* counted in the write-intent bitmap */
+	struct raidkm_row_buf	*pbuf;		/* m parity chunks */
+	unsigned char		**src;		/* k data, then m parity: */
+	unsigned char		**dst;		/* = src + k */
+	struct bvec_iter	*it;		/* k: each data chunk in the bio */
+	struct raidkm_row_wmember mw[];		/* k + m, by generator row */
+};
+
+static void raidkm_row_write_done(struct work_struct *work);
+static void raidkm_row_write_submit(struct work_struct *work);
+
+static void raidkm_row_wctx_free(struct raidkm_row_wctx *w)
+{
+	int i;
+
+	if (!w)
+		return;
+	if (w->pbuf)
+		for (i = 0; i < w->m; i++)
+			raidkm_row_buf_free(&w->pbuf[i]);
+	kfree(w->pbuf);
+	kfree(w->src);
+	kfree(w->it);
+	kfree(w);
+}
+
+static struct raidkm_row_wctx *raidkm_row_wctx_alloc(struct r5conf *conf,
+						     int k, int m)
+{
+	const gfp_t gfp = GFP_NOIO | __GFP_NOWARN;
+	unsigned int len = conf->chunk_sectors << 9;
+	struct raidkm_row_wctx *w;
+	int i;
+
+	w = kzalloc(struct_size(w, mw, k + m), gfp);
+	if (!w)
+		return NULL;
+	w->conf = conf;
+	w->k = k;
+	w->m = m;
+	w->chunk_sectors = conf->chunk_sectors;
+	INIT_WORK(&w->submit, raidkm_row_write_submit);
+	INIT_WORK(&w->work, raidkm_row_write_done);
+	w->pbuf = kcalloc(m, sizeof(*w->pbuf), gfp);
+	/* one array, data then parity: raid6's gen_syndrome takes it whole */
+	w->src = kcalloc(k + m, sizeof(*w->src), gfp);
+	w->it = kcalloc(k, sizeof(*w->it), gfp);
+	if (!w->pbuf || !w->src || !w->it)
+		goto fail;
+	w->dst = w->src + k;
+	for (i = 0; i < m; i++)
+		if (raidkm_row_buf_alloc(&w->pbuf[i], len))
+			goto fail;
+	return w;
+fail:
+	raidkm_row_wctx_free(w);
+	return NULL;
+}
+
+/* an idle context for a k + m row, or NULL: rk_row_write_depth are in use */
+static struct raidkm_row_wctx *raidkm_row_wctx_get(struct r5conf *conf,
+						   int k, int m)
+{
+	struct raidkm_row_wctx *w;
+
+	spin_lock(&conf->row_wctx_lock);
+	w = list_first_entry_or_null(&conf->row_wctx_free,
+				     struct raidkm_row_wctx, list);
+	if (w) {
+		list_del(&w->list);
+	} else if (conf->row_wctx_nr < READ_ONCE(conf->row_write_depth)) {
+		conf->row_wctx_nr++;
+	} else {
+		spin_unlock(&conf->row_wctx_lock);
+		return NULL;
+	}
+	spin_unlock(&conf->row_wctx_lock);
+
+	if (w && w->k == k && w->m == m &&
+	    w->chunk_sectors == conf->chunk_sectors)
+		return w;
+	/* none idle (a slot was reserved above), or built for a geometry a
+	 * reshape has since changed: build one; this happens at most
+	 * rk_row_write_depth times per geometry */
+	raidkm_row_wctx_free(w);
+	w = raidkm_row_wctx_alloc(conf, k, m);
+	if (!w) {
+		spin_lock(&conf->row_wctx_lock);
+		conf->row_wctx_nr--;
+		spin_unlock(&conf->row_wctx_lock);
+	}
+	return w;
+}
+
+static void raidkm_row_wctx_put(struct r5conf *conf, struct raidkm_row_wctx *w)
+{
+	spin_lock(&conf->row_wctx_lock);
+	if (!READ_ONCE(conf->row_write) ||
+	    conf->row_wctx_nr > READ_ONCE(conf->row_write_depth)) {
+		conf->row_wctx_nr--;
+		spin_unlock(&conf->row_wctx_lock);
+		raidkm_row_wctx_free(w);
+		return;
+	}
+	list_add(&w->list, &conf->row_wctx_free);
+	spin_unlock(&conf->row_wctx_lock);
+}
+
+/* free the idle contexts; ones in flight are freed as they come back if the
+ * knob is off (raidkm_row_wctx_put), and at the latest by free_conf() */
+static void raidkm_row_wctx_free_idle(struct r5conf *conf)
+{
+	struct raidkm_row_wctx *w, *tmp;
+	LIST_HEAD(idle);
+
+	spin_lock(&conf->row_wctx_lock);
+	list_for_each_entry_safe(w, tmp, &conf->row_wctx_free, list) {
+		list_move(&w->list, &idle);
+		conf->row_wctx_nr--;
+	}
+	spin_unlock(&conf->row_wctx_lock);
+	list_for_each_entry_safe(w, tmp, &idle, list) {
+		list_del(&w->list);
+		raidkm_row_wctx_free(w);
+	}
+}
+
+/*
+ * m parity chunks from k data chunks, @len bytes of each: @src holds the k
+ * data pointers followed by the m parity pointers (@dst == src + k) -- the
+ * stripe path's own encoders, so the two paths cannot disagree.  At m == 2
+ * that is raid6's P+Q (async_gen_syndrome's routine), whose Q weights data
+ * index d by 2^d; above it, ISA-L with the tables raidkm_build_ec() made for
+ * this geometry (conf->ec_g_tbls_*, as isal_gen_syndrome_m uses).  @len is a
+ * multiple of the sector size, which covers the widest raid6 unroll.
+ */
+static void raidkm_row_encode(struct r5conf *conf, unsigned int len, int k,
+			      int m, unsigned char **src, unsigned char **dst)
+{
+	if (m == 2 && k >= 2) {		/* raid6 wants at least 4 disks */
+		raid6_call.gen_syndrome(k + 2, len, (void **)src);
+		return;
+	}
+	/* ec_encode_data_*_gfni bracket kernel_fpu themselves */
+	if (isal_have_avx512_gfni())
+		ec_encode_data_avx512_gfni(len, k, m, conf->ec_g_tbls_gfni,
+					   src, dst);
+	else if (isal_have_gfni())
+		ec_encode_data_avx2_gfni(len, k, m, conf->ec_g_tbls_gfni,
+					 src, dst);
+	else
+		ec_encode_data_base(len, k, m, conf->ec_g_tbls_base, src, dst);
+}
+
+/* may @bi go to the row path at all?  (Per row, the members decide too.) */
+static bool raidkm_row_write_ok(struct mddev *mddev, struct r5conf *conf,
+				struct bio *bi)
+{
+	return READ_ONCE(conf->row_write) &&
+	       bio_op(bi) == REQ_OP_WRITE &&
+	       !(bi->bi_opf & (REQ_PREFLUSH | REQ_NOWAIT)) &&
+	       !IS_ENABLED(CONFIG_HIGHMEM) &&	/* parity reads page_address() */
+	       conf->skip_copy && !conf->csum && !conf->dcl &&
+	       !raid5_has_log(conf) && !raid5_has_ppl(conf) &&
+	       !mddev->degraded && conf->reshape_progress == MaxSector &&
+	       conf->chunk_sectors &&
+	       conf->raid_disks <= RAIDKM_MAX_STRIPE_DISKS &&
+	       !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
+}
+
+/*
+ * The caller's pages for [base, base + bytes) of @bio: every piece a whole
+ * number of sectors, so no encode run is shorter than one.
+ */
+static bool raidkm_row_write_bvecs_ok(struct bio *bio, unsigned int base,
+				      unsigned int bytes)
+{
+	struct bvec_iter it = bio->bi_iter;
+
+	bio_advance_iter(bio, &it, base);
+	while (bytes) {
+		struct bio_vec bv = mp_bvec_iter_bvec(bio->bi_io_vec, it);
+		unsigned int l = min(bv.bv_len, bytes);
+
+		if ((bv.bv_offset | l) & (SECTOR_SIZE - 1))
+			return false;
+		bio_advance_iter_single(bio, &it, l);
+		bytes -= l;
+	}
+	return true;
+}
+
+/*
+ * Give the row back to the stripe cache: whoever waits for it in
+ * raid5_get_active_stripe() looks again.  A bounced aligned read parked for
+ * raid5d (retry_aligned_read asks without blocking) is retried when raid5d
+ * next runs, so poke it -- only then.
+ */
+static void raidkm_row_write_unlock(struct r5conf *conf,
+				    struct raidkm_row_wctx *w)
+{
+	u64 locked = w->row + 1;
+
+	if (!w->wslot)
+		return;
+	/* a stripe-cache request waits for this row: keep the row for it */
+	if (atomic64_cmpxchg(w->wslot, locked, 0) != locked)
+		atomic64_set(w->wslot, locked | RAIDKM_ROW_WLOCK_GRACE);
+	w->wslot = NULL;
+	if (wq_has_sleeper(&conf->row_write_wait))	/* orders the slot */
+		wake_up(&conf->row_write_wait);
+	if (READ_ONCE(conf->retry_read_aligned) ||
+	    READ_ONCE(conf->retry_read_aligned_list))
+		md_wakeup_thread(conf->mddev->thread);
+}
+
+/*
+ * Own the row: set its slot, then walk its stripes under their hash locks.
+ * A stripe that is in use means the stripe cache is working on the row:
+ * give it up (false).  An idle one keeps its R5_UPTODATE pages as a cache --
+ * parity left by a read-modify-write, typically -- which the write is about
+ * to make stale: drop them, or the next read-modify-write of that stripe
+ * computes its parity from the old parity.  Nothing can take an idle stripe
+ * while we hold its hash lock, and after the walk nothing can take one at
+ * all until the slot clears (raid5_get_active_stripe).
+ */
+static bool raidkm_row_write_lock(struct r5conf *conf,
+				  struct raidkm_row_wctx *w)
+{
+	atomic64_t *slot = raidkm_row_wslot(conf, w->row);
+	/* now, not when the context was built: stripe_size can change */
+	unsigned int nsh = conf->chunk_sectors / RAID5_STRIPE_SECTORS(conf);
+	sector_t first = w->msect;
+	bool busy = false;
+	int j, i;
+
+	if (atomic64_cmpxchg(slot, 0, w->row + 1) != 0)
+		return false;		/* this row, or one sharing its slot */
+	w->wslot = slot;
+	smp_mb__after_atomic();		/* the slot, then the walk */
+
+	for (j = 0; j < nsh && !busy; j++) {
+		sector_t sect = first + j * RAID5_STRIPE_SECTORS(conf);
+		int h = stripe_hash_locks_hash(conf, sect, 0);
+		struct stripe_head *sh;
+
+		spin_lock_irq(conf->hash_locks + h);
+		sh = __find_stripe(conf, sect, conf->generation, 0);
+		/* in use: referenced, or queued for handling on a list with
+		 * a zero count */
+		if (sh && (atomic_read(&sh->count) || sh->batch_head ||
+			   test_bit(STRIPE_HANDLE, &sh->state) ||
+			   test_bit(STRIPE_DELAYED, &sh->state) ||
+			   test_bit(STRIPE_BIT_DELAY, &sh->state) ||
+			   test_bit(STRIPE_ROW_SYNC, &sh->state)))
+			busy = true;
+		else if (sh)
+			for (i = 0; i < sh->disks; i++)
+				clear_bit(R5_UPTODATE, &sh->dev[i].flags);
+		spin_unlock_irq(conf->hash_locks + h);
+	}
+	if (busy)
+		raidkm_row_write_unlock(conf, w);
+	return !busy;
+}
+
+/*
+ * A row write is over (or never started): let a sync pass that waits for row
+ * writes (raid5_sync_request) or a quiesce (raid5_quiesce) go ahead.  The last
+ * thing a row write does with conf -- the quiesce is what lets the array be
+ * stopped and conf freed.
+ */
+static void raidkm_row_write_unfence(struct r5conf *conf)
+{
+	if (atomic_dec_and_test(&conf->row_writes)) {
+		if (wq_has_sleeper(&conf->row_write_wait))
+			wake_up(&conf->row_write_wait);
+		wake_up(&conf->wait_for_quiescent);
+	}
+}
+
+static void raidkm_row_write_endio(struct bio *bi)
+{
+	struct raidkm_row_wmember *mw = bi->bi_private;
+	struct raidkm_row_wctx *w = mw->w;
+
+	if (bi->bi_status)
+		WRITE_ONCE(mw->failed, 1);
+	bio_put(bi);
+	if (atomic_dec_and_test(&w->pending))
+		queue_work(raidkm_row_wq, &w->work);
+}
+
+/*
+ * Every member write of the row is done.  In process context: the release
+ * takes stripe_lock with spin_lock_irq, and a failed member may be given a
+ * bad block or failed (both can sleep).
+ */
+static void raidkm_row_write_done(struct work_struct *work)
+{
+	struct raidkm_row_wctx *w = container_of(work, struct raidkm_row_wctx,
+						 work);
+	struct r5conf *conf = w->conf;
+	struct mddev *mddev = conf->mddev;
+	struct bio *raid_bio = w->raid_bio;
+	int i, nfail = 0;
+
+	for (i = 0; i < w->k + w->m; i++) {
+		struct md_rdev *rdev = w->mw[i].rdev;
+
+		if (READ_ONCE(w->mw[i].failed)) {
+			/*
+			 * What raid5_end_write_request() and handle_stripe()
+			 * do for a stripe: remember the error, ask for a
+			 * replacement, and record the chunk as a bad block on
+			 * the member -- or, if it cannot take one, fail it.
+			 * Either way the row then reads back through parity.
+			 */
+			nfail++;
+			atomic64_inc(&conf->row_write_errors);
+			set_bit(WriteErrorSeen, &rdev->flags);
+			if (!test_and_set_bit(WantReplacement, &rdev->flags))
+				set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+			if (!rdev_set_badblocks(rdev, w->msect,
+						w->chunk_sectors, 0))
+				md_error(mddev, rdev);
+		}
+		rdev_dec_pending(rdev, mddev);
+		w->mw[i].rdev = NULL;
+	}
+	/* the members hold the new row: row readers may use it again ... */
+	atomic_dec(&w->bucket->inflight);
+	/* ... and the stripe cache may have it back */
+	raidkm_row_write_unlock(conf, w);
+	if (nfail > w->m)
+		raid_bio->bi_status = BLK_STS_IOERR;	/* beyond the parity */
+	/* a failed member leaves the array degraded, and md then keeps the
+	 * bit set: the region is resynced when the member comes back */
+	if (w->bitmap)
+		raidkm_bitmap_endwrite(mddev, w->msect, w->chunk_sectors,
+				       !nfail);
+	/*
+	 * A failed member is now a bad block or a failed disk -- in memory.
+	 * As the stripe path holds a stripe's bios while MD_SB_CHANGE_PENDING
+	 * is set, the caller's write is not acknowledged before that is on
+	 * disk: after a crash the member must not come back looking in sync
+	 * with the old contents of a chunk the caller was told is written.
+	 */
+	if (nfail) {
+		md_wakeup_thread(mddev->thread);
+		wait_event(mddev->sb_wait,
+			   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags));
+	}
+
+	/*
+	 * The context goes back to the pool (this work item may be queued
+	 * again from there, and then runs once this returns), and only then
+	 * does the in-flight count drop: until it does, a quiesce -- and with
+	 * it a stop of the array, which frees conf and the pool -- waits.
+	 * After it, only mddev and the caller's bio are touched.
+	 */
+	raidkm_row_wctx_put(conf, w);
+	raidkm_row_write_unfence(conf);
+	md_write_end(mddev);
+	bio_endio(raid_bio);
+}
+
+/* issue the member writes of a claimed row: one bio per member */
+static void raidkm_row_write_submit(struct work_struct *work)
+{
+	struct raidkm_row_wctx *w = container_of(work, struct raidkm_row_wctx,
+						 submit);
+	struct mddev *mddev = w->conf->mddev;
+	struct bio *raid_bio = w->raid_bio;
+	unsigned int cs = w->chunk_sectors, len = cs << 9;
+	/*
+	 * Locals: a member that completes inside submit_bio_noacct() (a
+	 * bio-based member does) can finish the row and free @w before the
+	 * loop looks at it again -- nothing below reads @w after the last
+	 * submit.
+	 */
+	const int k = w->k, n = w->k + w->m;
+	struct blk_plug plug;
+	int i;
+
+	/* the bitmap bits for this row are on disk before its data is */
+	if (w->bitmap)
+		mddev->bitmap_ops->unplug(mddev, true);
+	atomic_set(&w->pending, n);
+	blk_start_plug(&plug);
+	for (i = 0; i < n; i++) {
+		struct md_rdev *rdev = w->mw[i].rdev;
+		struct bio *bi;
+
+		if (i < k) {
+			/* a data chunk: the caller's own pages */
+			bi = bio_alloc_clone(rdev->bdev, raid_bio, GFP_NOIO,
+					     &mddev->bio_set);
+			bio_trim(bi, (w->base >> 9) + i * cs, cs);
+			bi->bi_opf = w->opf;
+		} else {
+			struct raidkm_row_buf *pb = &w->pbuf[i - k];
+
+			bi = bio_alloc_bioset(rdev->bdev,
+					      raidkm_row_buf_nr_vecs(pb), w->opf,
+					      GFP_NOIO, &mddev->bio_set);
+			raidkm_row_buf_add_to_bio(bi, pb, len);
+		}
+		bi->bi_iter.bi_sector = w->msect + rdev->data_offset;
+		bi->bi_end_io = raidkm_row_write_endio;
+		bi->bi_private = &w->mw[i];
+		submit_bio_noacct(bi);
+	}
+	blk_finish_plug(&plug);
+}
+
+/*
+ * Undo raidkm_row_write_prep(): the row is not written.  Called in
+ * make_request context, so conf stays valid after the unfence.
+ */
+static void raidkm_row_write_unprep(struct r5conf *conf,
+				    struct raidkm_row_wctx *w)
+{
+	int i;
+
+	raidkm_row_write_unlock(conf, w);
+	raidkm_row_write_unfence(conf);
+	for (i = 0; i < w->k + w->m; i++)
+		if (w->mw[i].rdev) {
+			rdev_dec_pending(w->mw[i].rdev, conf->mddev);
+			w->mw[i].rdev = NULL;
+		}
+	raidkm_row_wctx_put(conf, w);
+}
+
+/*
+ * Get the row of @raid_bio that starts at array sector @logical ready to
+ * write: its members pinned, its stripes claimed, a context to do it in.
+ * Nothing is written yet.  NULL = the row cannot go through the row path now
+ * (counted); nothing is held.
+ */
+static struct raidkm_row_wctx *
+raidkm_row_write_prep(struct mddev *mddev, struct bio *raid_bio,
+		      sector_t logical)
+{
+	struct r5conf *conf = mddev->private;
+	unsigned int base = (logical - raid_bio->bi_iter.bi_sector) << 9;
+	struct raidkm_row_wctx *w;
+	unsigned int cs, len, seq;
+	sector_t msect, row;
+	int n, m, k, dd_idx, pd, i;
+	bool bad;
+
+	/*
+	 * The geometry and the row's place in it, read under the reshape
+	 * seqcount.  A reshape starting meanwhile can make them disagree:
+	 * that is a decline, not a layout bug, so warn only if the seqcount
+	 * held.
+	 */
+	seq = read_seqcount_begin(&conf->gen_lock);
+	n = READ_ONCE(conf->raid_disks);
+	m = READ_ONCE(conf->m);
+	k = n - m;
+	cs = READ_ONCE(conf->chunk_sectors);
+	len = cs << 9;
+	msect = raid5_compute_sector(conf, logical, 0, &dd_idx, NULL);
+	row = msect;
+	bad = sector_div(row, cs) != 0;
+	pd = conf->rotating ? n - 1 - (int)sector_div(row, n) : k;
+	/* the row's first sector is data index 0: if the layout disagrees,
+	 * this path's slot map is wrong for it and must not write */
+	bad |= (dd_idx - pd - m + 2 * n) % n != 0;
+	if (bad) {
+		WARN_ON_ONCE(!read_seqcount_retry(&conf->gen_lock, seq));
+		return NULL;
+	}
+	/* m > 2 encodes with the stripe path's own tables */
+	if ((m != 2 || k < 2) && !conf->ec_g_tbls_gfni && !conf->ec_g_tbls_base)
+		return NULL;
+
+	if (!raidkm_row_write_bvecs_ok(raid_bio, base, k * len)) {
+		atomic64_inc(&conf->row_write_declined);
+		return NULL;
+	}
+
+	w = raidkm_row_wctx_get(conf, k, m);
+	if (!w) {
+		atomic64_inc(&conf->row_write_nobuf);
+		return NULL;
+	}
+	w->raid_bio = raid_bio;
+	w->msect = msect;
+	w->base = base;
+
+	/* the members, by generator row: data index d at slot pd+m+d, parity
+	 * index p at pd+p -- all healthy, all taking the whole chunk */
+	for (i = 0; i < k + m; i++) {
+		w->mw[i].w = w;
+		w->mw[i].failed = 0;
+		w->mw[i].rdev = NULL;
+	}
+	for (i = 0; i < k + m; i++) {
+		int idx = i < k ? (pd + m + i) % n : (pd + i - k) % n;
+		struct md_rdev *rdev = conf->disks[idx].rdev;
+
+		/* Blocked: the stripe path waits for it to be unblocked
+		 * (md_wait_for_blocked_rdev) before writing to it */
+		if (!rdev || test_bit(Faulty, &rdev->flags) ||
+		    !test_bit(In_sync, &rdev->flags) ||
+		    test_bit(Blocked, &rdev->flags) ||
+		    conf->disks[idx].replacement)
+			goto out_declined;
+		atomic_inc(&rdev->nr_pending);
+		w->mw[i].rdev = rdev;
+		if (rdev_has_badblock(rdev, msect, cs))
+			goto out_declined;
+	}
+
+	/*
+	 * The fence against sync passes: count ourselves, THEN look for one.
+	 * raid5_sync_request() sees MD_RECOVERY_RUNNING set, THEN waits for the
+	 * count to drain, so either we see its flag or it sees our count.
+	 */
+	atomic_inc(&conf->row_writes);
+	smp_mb__after_atomic();
+	w->wslot = NULL;
+	w->row = raidkm_row_of(conf, msect);
+	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) ||
+	    !raidkm_row_write_lock(conf, w))
+		goto out_busy;
+	/*
+	 * The in-flight count, THEN the quiesce: raid5_quiesce() sets
+	 * conf->quiesce, THEN waits for the count, so it either sees us and
+	 * waits for this row, or we see it here and give the row up -- and
+	 * with it a reshape it may have begun.
+	 */
+	if (READ_ONCE(conf->quiesce) || conf->reshape_progress != MaxSector ||
+	    read_seqcount_retry(&conf->gen_lock, seq))
+		goto out_busy;
+	return w;
+
+out_busy:
+	atomic64_inc(&conf->row_write_busy);
+	raidkm_row_write_unprep(conf, w);
+	return NULL;
+out_declined:
+	atomic64_inc(&conf->row_write_declined);
+	for (i = 0; i < k + m; i++)
+		if (w->mw[i].rdev) {
+			rdev_dec_pending(w->mw[i].rdev, mddev);
+			w->mw[i].rdev = NULL;
+		}
+	raidkm_row_wctx_put(conf, w);
+	return NULL;
+}
+
+/*
+ * Write a row raidkm_row_write_prep() got ready: compute its parity from the
+ * caller's pages and hand the member writes to a worker.  The caller's bio
+ * completes when the row does (raidkm_row_write_done).
+ */
+static void raidkm_row_write_go(struct mddev *mddev,
+				struct raidkm_row_wctx *w)
+{
+	struct r5conf *conf = mddev->private;
+	struct bio *raid_bio = w->raid_bio;
+	unsigned int len = w->chunk_sectors << 9, done;
+	int k = w->k, m = w->m, i;
+
+	/* row readers must not mix old and new members of this row */
+	w->bucket = raidkm_row_bucket(conf, w->msect, 0);
+	atomic_inc(&w->bucket->inflight);
+	atomic_inc(&w->bucket->gen);
+
+	/* parity, straight from the caller's pages, one run at a time: a run
+	 * is as long as every data chunk stays inside one bio_vec */
+	for (i = 0; i < k; i++) {
+		w->it[i] = raid_bio->bi_iter;
+		bio_advance_iter(raid_bio, &w->it[i], w->base + i * len);
+	}
+	for (done = 0; done < len; ) {
+		unsigned int run = len - done;
+
+		for (i = 0; i < k; i++) {
+			struct bio_vec bv = mp_bvec_iter_bvec(raid_bio->bi_io_vec,
+							      w->it[i]);
+
+			run = min(run, bv.bv_len);
+			w->src[i] = bvec_virt(&bv);
+		}
+		for (i = 0; i < m; i++)
+			w->dst[i] = (unsigned char *)w->pbuf[i].addr + done;
+		raidkm_row_encode(conf, run, k, m, w->src, w->dst);
+		for (i = 0; i < k; i++)
+			bio_advance_iter_single(raid_bio, &w->it[i], run);
+		done += run;
+	}
+
+	/*
+	 * Write-intent bitmap: count the row as the stripe path counts each
+	 * stripe (startwrite in __add_stripe_bio), for the chunk's member
+	 * range.  The bit must be on disk before any member write goes out:
+	 * the submit worker flushes the bitmap first, where the stripe path
+	 * parks the stripe on bitmap_list until raid5d does.
+	 */
+	w->bitmap = !!mddev->bitmap;
+	if (w->bitmap)
+		raidkm_bitmap_startwrite(mddev, w->msect, w->chunk_sectors);
+	md_write_inc(mddev, raid_bio);
+	bio_inc_remaining(raid_bio);
+	w->opf = REQ_OP_WRITE |
+		 (raid_bio->bi_opf & (REQ_SYNC | REQ_FUA | REQ_META | REQ_PRIO));
+	/*
+	 * Not from here: this is md's make_request, and a bio submitted from
+	 * inside it only goes on current->bio_list, to be sent after we
+	 * return.  Until then the row stays claimed, so anything that makes
+	 * this thread wait before it returns -- a stripe-cache write bouncing
+	 * off a row another submitter claimed while that one waits on ours --
+	 * would keep both rows' writes from ever leaving.  A worker sends them.
+	 */
+	queue_work(raidkm_row_wq, &w->submit);
+	atomic64_inc(&conf->row_write_done);
+}
+
+#define RK_ROW_WRITE_BIO_ROWS	16	/* rows per bio the row path takes */
+
+/*
+ * Send @bi through the row path: true = taken, the row writes complete it;
+ * false = nothing was written, the stripe cache takes all of it.
+ *
+ * All or nothing.  The bio must be made of whole rows, and every one of them
+ * must be claimed before any is written.  A bio split between the two paths
+ * could be handed back to md for a retry by the stripe cache
+ * (STRIPE_WAIT_RESHAPE frees the clone, md_free_cloned_bio) while row writes
+ * still hold it.  With 128 KiB chunks at 8+2 a bio is at most one row, so
+ * this costs nothing there; with smaller rows it keeps unaligned bios off the
+ * row path.
+ */
+static bool raidkm_row_write_bio(struct mddev *mddev, struct r5conf *conf,
+				 struct bio *bi)
+{
+	unsigned int rowsz = conf->chunk_sectors * (conf->raid_disks - conf->m);
+	struct raidkm_row_wctx *w[RK_ROW_WRITE_BIO_ROWS];
+	sector_t start = bi->bi_iter.bi_sector, nrows = bio_sectors(bi);
+	int i, n;
+
+	if (sector_div(start, rowsz) || sector_div(nrows, rowsz) ||
+	    !nrows || nrows > RK_ROW_WRITE_BIO_ROWS)
+		return false;
+	for (n = 0; n < nrows; n++) {
+		w[n] = raidkm_row_write_prep(mddev, bi, bi->bi_iter.bi_sector +
+					     (sector_t)n * rowsz);
+		if (!w[n]) {
+			for (i = 0; i < n; i++)
+				raidkm_row_write_unprep(conf, w[i]);
+			return false;
+		}
+	}
+	for (i = 0; i < n; i++)
+		raidkm_row_write_go(mddev, w[i]);
+	return true;
+}
+
 /* degraded read entry: split at the chunk boundary like chunk_aligned_read */
 static struct bio *raidkm_row_read(struct mddev *mddev, struct bio *raid_bio)
 {
@@ -12412,9 +13232,9 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 	bool on_wq;
 	struct r5conf *conf = mddev->private;
 	sector_t logical_sector;
-	struct stripe_request_ctx ctx = {};
+	struct stripe_request_ctx *ctx;
 	const int rw = bio_data_dir(bi);
-	enum stripe_result res;
+	enum stripe_result res = STRIPE_SUCCESS;
 	int s, stripe_cnt;
 
 	if (unlikely(bi->bi_opf & REQ_PREFLUSH)) {
@@ -12427,11 +13247,6 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 				return true;
 		}
 		/* ret == -EAGAIN, fallback */
-		/*
-		 * if r5l_handle_flush_request() didn't clear REQ_PREFLUSH,
-		 * we need to flush journal device
-		 */
-		ctx.do_flush = bi->bi_opf & REQ_PREFLUSH;
 	}
 
 	md_write_start(mddev, bi);
@@ -12488,16 +13303,7 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 	}
 
 	logical_sector = bi->bi_iter.bi_sector & ~((sector_t)RAID5_STRIPE_SECTORS(conf)-1);
-	ctx.first_sector = logical_sector;
-	ctx.last_sector = bio_end_sector(bi);
 	bi->bi_next = NULL;
-
-	stripe_cnt = DIV_ROUND_UP_SECTOR_T(ctx.last_sector - logical_sector,
-					   RAID5_STRIPE_SECTORS(conf));
-	bitmap_set(ctx.sectors_to_do, 0, stripe_cnt);
-
-	pr_debug("raid456: %s, logical %llu to %llu\n", __func__,
-		 bi->bi_iter.bi_sector, ctx.last_sector);
 
 	/* Bail out if conflicts with reshape and REQ_NOWAIT is set */
 	if ((bi->bi_opf & REQ_NOWAIT) &&
@@ -12510,24 +13316,58 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 	}
 	md_account_bio(mddev, &bi);
 
+	/* a bio of whole rows may go to the row layer, all of it -- before
+	 * the stripe path's context is set up, which it does not need */
+	if (rw == WRITE && raidkm_row_write_ok(mddev, conf, bi) &&
+	    raidkm_row_write_bio(mddev, conf, bi)) {
+		md_write_end(mddev);
+		bio_endio(bi);
+		return true;
+	}
+
 	/*
-	 * Lets start with the stripe with the lowest chunk offset in the first
-	 * chunk. That has the best chances of creating IOs adjacent to
-	 * previous IOs in case of sequential IO and thus creates the most
-	 * sequential IO pattern. We don't bother with the optimization when
-	 * reshaping as the performance benefit is not worth the complexity.
+	 * From a pool, with a stripe bitmap as long as the array's largest bio
+	 * (raid5_create_ctx_pool): an array whose row is over 1 MiB takes
+	 * bios of a whole row (raid5_set_limits), more stripes than the fixed
+	 * RAID5_MAX_REQ_STRIPES bitmap this used to be on the stack.
 	 */
+	ctx = mempool_alloc(conf->ctx_pool, GFP_NOIO);
+	memset(ctx, 0, conf->ctx_size);
+	ctx->first_sector = logical_sector;
+	ctx->last_sector = bio_end_sector(bi);
+	/*
+	 * if r5l_handle_flush_request() didn't clear REQ_PREFLUSH,
+	 * we need to flush journal device
+	 */
+	if (unlikely(bi->bi_opf & REQ_PREFLUSH))
+		ctx->do_flush = true;
+
+	stripe_cnt = DIV_ROUND_UP_SECTOR_T(ctx->last_sector - logical_sector,
+					   RAID5_STRIPE_SECTORS(conf));
+	bitmap_set(ctx->sectors_to_do, 0, stripe_cnt);
+
+	pr_debug("raid456: %s, logical %llu to %llu\n", __func__,
+		 bi->bi_iter.bi_sector, ctx->last_sector);
+
 	if (likely(conf->reshape_progress == MaxSector)) {
+		/*
+		 * Lets start with the stripe with the lowest chunk offset in
+		 * the first chunk. That has the best chances of creating IOs
+		 * adjacent to previous IOs in case of sequential IO and thus
+		 * creates the most sequential IO pattern. We don't bother with
+		 * the optimization when reshaping as the performance benefit
+		 * is not worth the complexity.
+		 */
 		logical_sector = raid5_bio_lowest_chunk_sector(conf, bi);
 		on_wq = false;
 	} else {
 		add_wait_queue(&conf->wait_for_reshape, &wait);
 		on_wq = true;
 	}
-	s = (logical_sector - ctx.first_sector) >> RAID5_STRIPE_SHIFT(conf);
+	s = (logical_sector - ctx->first_sector) >> RAID5_STRIPE_SHIFT(conf);
 
 	while (1) {
-		res = make_stripe_request(mddev, conf, &ctx, logical_sector,
+		res = make_stripe_request(mddev, conf, ctx, logical_sector,
 					  bi);
 		if (res == STRIPE_FAIL || res == STRIPE_WAIT_RESHAPE)
 			break;
@@ -12544,9 +13384,9 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 			 * raid5_activate_delayed() from making progress
 			 * and thus deadlocking.
 			 */
-			if (ctx.batch_last) {
-				raid5_release_stripe(ctx.batch_last);
-				ctx.batch_last = NULL;
+			if (ctx->batch_last) {
+				raid5_release_stripe(ctx->batch_last);
+				ctx->batch_last = NULL;
 			}
 
 			wait_woken(&wait, TASK_UNINTERRUPTIBLE,
@@ -12554,21 +13394,23 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 			continue;
 		}
 
-		s = find_next_bit_wrap(ctx.sectors_to_do, stripe_cnt, s);
+		s = find_next_bit_wrap(ctx->sectors_to_do, stripe_cnt, s);
 		if (s == stripe_cnt)
 			break;
 
-		logical_sector = ctx.first_sector +
+		logical_sector = ctx->first_sector +
 			(s << RAID5_STRIPE_SHIFT(conf));
 	}
 	if (unlikely(on_wq))
 		remove_wait_queue(&conf->wait_for_reshape, &wait);
 
-	if (ctx.batch_last)
-		raid5_release_stripe(ctx.batch_last);
+	if (ctx->batch_last)
+		raid5_release_stripe(ctx->batch_last);
 
 	if (rw == WRITE)
 		md_write_end(mddev);
+
+	mempool_free(ctx, conf->ctx_pool);
 	if (res == STRIPE_WAIT_RESHAPE) {
 		md_free_cloned_bio(bi);
 		return false;
@@ -15158,6 +16000,19 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	int tslot = -1;
 
 	/*
+	 * No sync pass touches a stripe while a full-row write is in flight:
+	 * the row write bypasses the stripe cache, so a resync or check
+	 * reading the row under it would see some members old and some new,
+	 * and a resync would then "repair" the parity from that mix.  Row
+	 * writes decline once MD_RECOVERY_RUNNING is set; here the pass waits
+	 * out the ones already issued (raidkm_row_write_prep: its count, then
+	 * the flag; here the flag was set before the thread ran, then the
+	 * count).  Free when none are in flight.
+	 */
+	smp_mb();
+	wait_event(conf->row_write_wait, !atomic_read(&conf->row_writes));
+
+	/*
 	 * raid_km redesign: m > 2 resync/scrub goes through the synchronous
 	 * ISA-L verify+repair path in handle_parity_checks6 / ops_run_check_pq
 	 * (re-encode each parity from data, compare, repair).  A *degraded*
@@ -17324,6 +18179,98 @@ raidkm_row_dread_entry = __ATTR(rk_row_dread, S_IRUGO | S_IWUSR,
 				raidkm_row_dread_show, raidkm_row_dread_store);
 
 static ssize_t
+raidkm_row_write_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	int ret = 0;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf)
+		ret = sprintf(page, "%d\n", READ_ONCE(conf->row_write));
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+static ssize_t
+raidkm_row_write_store(struct mddev *mddev, const char *page, size_t len)
+{
+	struct r5conf *conf;
+	unsigned long new;
+	int err;
+
+	if (len >= PAGE_SIZE)
+		return -EINVAL;
+	if (kstrtoul(page, 10, &new))
+		return -EINVAL;
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf) {
+		err = -ENODEV;
+	} else {
+		WRITE_ONCE(conf->row_write, !!new);
+		/* off: give back the idle contexts; rows in flight give
+		 * theirs back as they finish (raidkm_row_wctx_put) */
+		if (!new)
+			raidkm_row_wctx_free_idle(conf);
+	}
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_row_write_entry = __ATTR(rk_row_write, S_IRUGO | S_IWUSR,
+				raidkm_row_write_show, raidkm_row_write_store);
+
+static ssize_t
+raidkm_row_write_depth_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	int ret = 0;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf)
+		ret = sprintf(page, "%d\n", READ_ONCE(conf->row_write_depth));
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+/* rows the row path keeps in flight; each holds m chunk-sized parity buffers */
+static ssize_t
+raidkm_row_write_depth_store(struct mddev *mddev, const char *page, size_t len)
+{
+	struct r5conf *conf;
+	unsigned long new;
+	int err;
+
+	if (len >= PAGE_SIZE)
+		return -EINVAL;
+	if (kstrtoul(page, 10, &new) || !new || new > RK_ROW_WRITE_DEPTH_MAX)
+		return -EINVAL;
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf) {
+		err = -ENODEV;
+	} else {
+		WRITE_ONCE(conf->row_write_depth, new);
+		/* a smaller pool shrinks as contexts come back */
+		raidkm_row_wctx_free_idle(conf);
+	}
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_row_write_depth_entry = __ATTR(rk_row_write_depth, S_IRUGO | S_IWUSR,
+				      raidkm_row_write_depth_show,
+				      raidkm_row_write_depth_store);
+
+static ssize_t
 raidkm_row_rebuild_show(struct mddev *mddev, char *page)
 {
 	struct r5conf *conf;
@@ -17607,7 +18554,7 @@ raidkm_row_stats_show(struct mddev *mddev, char *page)
 	conf = mddev->private;
 	if (conf)
 		ret = sprintf(page,
-			      "dread_done %lld\ndread_bypass %lld\ndread_raced %lld\ndread_declined %lld\ndread_csum_bad %lld\nrebuild_done %lld\nrebuild_declined %lld\nrebuild_csum_bad %lld\ndread_wide %lld\nrebuild_band_nomem %lld\nrebuild_stripe_chunks %lld\nrebuild_set_workers %d\nrebuild_set_page_bufs %d\nrebuild_unclaimed %lld\nrebuild_head_wait_ms %lld\nrebuild_retries %lld\nrebuild_head_timeouts %lld\ndelayed_parked %lld\ndelayed_aged %lld\nsync_token_regrant %lld\noverlap_slow %lld\n",
+			      "dread_done %lld\ndread_bypass %lld\ndread_raced %lld\ndread_declined %lld\ndread_csum_bad %lld\nrebuild_done %lld\nrebuild_declined %lld\nrebuild_csum_bad %lld\ndread_wide %lld\nrebuild_band_nomem %lld\nrebuild_stripe_chunks %lld\nrebuild_set_workers %d\nrebuild_set_page_bufs %d\nrebuild_unclaimed %lld\nrebuild_head_wait_ms %lld\nrebuild_retries %lld\nrebuild_head_timeouts %lld\ndelayed_parked %lld\ndelayed_aged %lld\nsync_token_regrant %lld\noverlap_slow %lld\nwrite_done %lld\nwrite_busy %lld\nwrite_nobuf %lld\nwrite_declined %lld\nwrite_errors %lld\n",
 			      (long long)atomic64_read(&conf->row_dread_done),
 			      (long long)atomic64_read(&conf->row_dread_bypass),
 			      (long long)atomic64_read(&conf->row_dread_raced),
@@ -17629,7 +18576,12 @@ raidkm_row_stats_show(struct mddev *mddev, char *page)
 			      (long long)atomic64_read(&conf->delayed_parked),
 			      (long long)atomic64_read(&conf->delayed_aged),
 			      (long long)atomic64_read(&conf->sync_token_regrant),
-			      (long long)atomic64_read(&conf->overlap_slow));
+			      (long long)atomic64_read(&conf->overlap_slow),
+			      (long long)atomic64_read(&conf->row_write_done),
+			      (long long)atomic64_read(&conf->row_write_busy),
+			      (long long)atomic64_read(&conf->row_write_nobuf),
+			      (long long)atomic64_read(&conf->row_write_declined),
+			      (long long)atomic64_read(&conf->row_write_errors));
 	spin_unlock(&mddev->lock);
 	return ret;
 }
@@ -17688,6 +18640,8 @@ static struct attribute *raid5_attrs[] =  {
 	&raid5_worker_thread_cnt.attr,
 	&raid5_skip_copy.attr,
 	&raidkm_row_dread_entry.attr,
+	&raidkm_row_write_entry.attr,
+	&raidkm_row_write_depth_entry.attr,
 	&raidkm_row_rebuild_entry.attr,
 	&raidkm_row_rebuild_workers_entry.attr,
 	&raidkm_row_rebuild_window_entry.attr,
@@ -17935,6 +18889,13 @@ static void free_conf(struct r5conf *conf)
 
 	log_exit(conf);
 	raidkm_row_rb_set_free(conf);
+	/* an abort in setup_conf() can come here before the pool exists */
+	if (conf->row_wctx_free.next) {
+		raidkm_row_wctx_free_idle(conf);
+		WARN_ON_ONCE(conf->row_wctx_nr);	/* a row still in flight */
+	}
+	kvfree(conf->row_wlock);
+	mempool_destroy(conf->ctx_pool);
 
 	shrinker_free(conf->shrinker);
 	free_thread_groups(conf);
@@ -18160,6 +19121,16 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	if (!conf->row_buckets)
 		goto abort;
 	conf->row_dread = default_row_dread;
+	conf->row_write = default_row_write;
+	conf->row_wlock = kvcalloc(RAIDKM_ROW_WLOCK_SLOTS,
+				   sizeof(*conf->row_wlock), GFP_KERNEL);
+	if (!conf->row_wlock)
+		goto abort;
+	conf->row_write_depth = RK_ROW_WRITE_DEPTH;
+	atomic_set(&conf->row_writes, 0);
+	init_waitqueue_head(&conf->row_write_wait);
+	spin_lock_init(&conf->row_wctx_lock);
+	INIT_LIST_HEAD(&conf->row_wctx_free);
 	conf->row_rebuild = default_row_rebuild;
 	conf->row_rb_workers = RK_ROW_REBUILD_WORKERS;
 	conf->row_rb_window = default_row_rebuild_window < 0 ?
@@ -18639,6 +19610,34 @@ static int raid5_stripe_data_disks(struct r5conf *conf)
 	return conf->raid_disks - conf->max_degraded;
 }
 
+/*
+ * The per-request context of raid5_make_request(), from a pool: its stripe
+ * bitmap has one bit per stripe of the largest bio the array takes, which
+ * raid5_set_limits() raises to a whole row when a row is over
+ * RAID5_MAX_REQ_STRIPES stripes (as upstream 4ffe28ed0d7c "md/raid5: make
+ * sure max_sectors is not less than io_opt" does, with this pool).  The limit
+ * is set once, before this runs, and a reshape only moves io_opt.  dm-raid
+ * has no queue of ours: it keeps the old fixed size.
+ */
+#define RAID5_CTX_POOL_MIN	16
+
+static int raid5_create_ctx_pool(struct r5conf *conf)
+{
+	struct stripe_request_ctx *ctx;
+	unsigned int stripes = RAID5_MAX_REQ_STRIPES;
+
+	if (!mddev_is_dm(conf->mddev))
+		stripes = max_t(unsigned int, stripes,
+				queue_max_hw_sectors(conf->mddev->gendisk->queue) >>
+				RAID5_STRIPE_SHIFT(conf));
+	/* + 1: an unaligned bio spans one more stripe */
+	conf->ctx_size = struct_size(ctx, sectors_to_do,
+				     BITS_TO_LONGS(stripes + 1));
+	conf->ctx_pool = mempool_create_kmalloc_pool(RAID5_CTX_POOL_MIN,
+						     conf->ctx_size);
+	return conf->ctx_pool ? 0 : -ENOMEM;
+}
+
 static int raid5_set_limits(struct mddev *mddev)
 {
 	struct r5conf *conf = mddev->private;
@@ -19079,6 +20078,10 @@ static int raid5_run(struct mddev *mddev)
 		if (ret)
 			goto abort;
 	}
+
+	ret = raid5_create_ctx_pool(conf);
+	if (ret)
+		goto abort;
 
 	if (log_init(conf, journal_dev, raid5_has_ppl(conf)))
 		goto abort;
@@ -20374,9 +21377,13 @@ static void raid5_quiesce(struct mddev *mddev, int quiesce)
 		 * quiesce started and reverts to slow (locked) path.
 		 */
 		smp_store_release(&conf->quiesce, 2);
+		/* row writes too: their completion work still uses its
+		 * context and conf after the stripes are released
+		 * (raidkm_row_write_done) */
 		wait_event_cmd(conf->wait_for_quiescent,
 				    atomic_read(&conf->active_stripes) == 0 &&
-				    atomic_read(&conf->active_aligned_reads) == 0,
+				    atomic_read(&conf->active_aligned_reads) == 0 &&
+				    atomic_read(&conf->row_writes) == 0,
 				    unlock_all_device_hash_locks_irq(conf),
 				    lock_all_device_hash_locks_irq(conf));
 		conf->quiesce = 1;

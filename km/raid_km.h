@@ -925,6 +925,26 @@ struct r5conf {
 	unsigned long		row_rb_retry;	/* jiffies: build failed, no set before then */
 	int			row_rb_nwk;	/* workers in the last set built (rk_row_stats) */
 	int			row_rb_page_bufs; /* of its buffers, built from order-0 pages */
+	mempool_t		*ctx_pool;		/* raid5_make_request()'s contexts */
+	int			ctx_size;
+	/*
+	 * Full-row writes (raid_km.c raidkm_row_write_bio): sysfs
+	 * rk_row_write and rk_row_write_depth, the contexts they run in, and
+	 * the fence that keeps a sync pass from starting under one.
+	 */
+	int			row_write;		/* sysfs rk_row_write */
+	atomic64_t		*row_wlock;		/* rows being row-written: slot = row + 1 */
+	int			row_write_depth;	/* rows in flight, at most */
+	atomic_t		row_writes;		/* in flight now: the sync fence */
+	wait_queue_head_t	row_write_wait;		/* ... reaching zero */
+	spinlock_t		row_wctx_lock;
+	struct list_head	row_wctx_free;		/* idle contexts */
+	int			row_wctx_nr;		/* contexts built */
+	atomic64_t		row_write_done;		/* rows written as one request per member */
+	atomic64_t		row_write_busy;		/* a stripe of the row in use: stripe cache */
+	atomic64_t		row_write_nobuf;	/* no context to spare: stripe cache */
+	atomic64_t		row_write_declined;	/* bio not eligible: stripe cache */
+	atomic64_t		row_write_errors;	/* member writes that failed */
 	atomic_t		pending_full_writes; /* full write backlog */
 	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */

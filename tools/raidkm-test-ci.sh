@@ -17,10 +17,12 @@
 #   smoke   ~25 min.  The row layer (degraded read once per row, native
 #           checksum through the row paths), declustered population to
 #           completion, rebuild onto a spare and hot-replace (through the row
-#           layer, the default), plus the functional and degraded smoke.  Meant
-#           for every CI run.
+#           layer, the default), full-row writes (row-write), plus the
+#           functional and degraded smoke.  Meant for every CI run.
 #   quick   smoke + the same rebuilds on the 4 KiB stripe path
-#           (replace@default_row_rebuild=0) and declustered population (~40 min).
+#           (replace@default_row_rebuild=0), declustered population, and the
+#           functional, degraded and replace suites again with full-row writes
+#           on (@default_row_write=1) (~50 min).
 #   full    quick + the core regression (grow, reshape) and the declustered
 #           crash / multi-assignment suites.  Several of those stop EVERY md array
 #           on the host (mdadm --stop --scan): refused without --allow-stop-all.
@@ -74,11 +76,16 @@ PATH="$PATH:/usr/sbin:/sbin"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window declustered-degraded replace
-       scrub-badblocks degraded-trust-disk row-rebuild-load)
+       scrub-badblocks degraded-trust-disk row-rebuild-load wide-row row-write)
 # <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.
-QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate)
+# <suite>@default_row_write=1 runs a suite written for the stripe cache with
+# full-row writes on: every aligned whole-row write it issues takes the row
+# path instead, and its own data and parity checks gate it.
+QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate
+       functional@default_row_write=1 degraded@default_row_write=1
+       replace@default_row_write=1)
 # declustered-populate@default_dcl_row_rebuild=1 runs the SAME gate (raw
 # spare-column oracle, resume from a journaled mark, scrub) with population
 # driven by the row engine: one chunk-sized write to the spare column instead
