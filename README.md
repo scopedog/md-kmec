@@ -691,7 +691,7 @@ control arm for any measurement of it; `default_row_rebuild_window` sets what
 new arrays start with.
 
 **`rk_dcl_row_rebuild` — populate a distributed spare through the row engine
-(default off, live).**  On a declustered array the population that fills a
+(default on, live).**  On a declustered array the population that fills a
 spare column has always run on the 4 KiB stripe path: `raidkm_row_rebuild_target()`
 disqualifies `conf->dcl`, so the engine that rebuilds a classic member in whole
 chunks never saw it.  Measured on real NVMe (12 × 4 GiB members, 8+2 over twelve
@@ -710,19 +710,34 @@ the band cannot take — busy stripes, a source it could not verify, a chain wit
 no live endpoint — falls through to the stripe path, which still carries
 backpressure, the unreconstructable-address pause and the resume fast-forward.
 
-The cost is wall-clock at the default worker count, and it scales with
-`rk_row_rebuild_workers` (same rig, 4 GiB members, knob toggled on one boot):
+The rows go through the same look-ahead window as a classic row rebuild
+(`rk_row_rebuild_window`): the workers keep taking rows ahead of md's cursor,
+and a row the foreground is using is retried rather than ending a band.  Its
+rate follows the rows in flight, `rk_dcl_row_rebuild_workers` (default 32; the
+classic rebuild keeps its own `rk_row_rebuild_workers`, 16), capped at
+`stripe_cache_size` / 32 (a row holds a chunk's stripe heads, so the default
+cache of 1024 holds exactly 32).  The workers sleep on I/O: the count is a queue
+depth, not a CPU budget.  Measured on
+12 × 16 GiB local NVMe, the population of one failed member under the
+benchmark's Test 7L foreground (4 × 1 MiB sequential readers), against tuned
+stock raid6 8+2 on the same disks rebuilding at 322 MiB/s behind a
+1256 MiB/s foreground:
 
-| population | pass | member writes |
-|---|---|---|
-| stripe path (knob off) | 7.3 s | 6.4 KiB |
-| row engine, 8 workers | 14.0 s | 115.7 KiB |
-| row engine, 16 workers | 10.6 s | 115.7 KiB |
-| row engine, 32 workers | 8.6 s | 116.5 KiB |
+| population | rebuild | foreground | idle rebuild |
+|---|---|---|---|
+| stripe path (knob off) | 507 MiB/s | 779 MiB/s | 581 MiB/s, 7.3 cores |
+| row engine, 16 workers | 250 MiB/s | 3302 MiB/s | 512 MiB/s, 2.8 cores |
+| **row engine, 32 workers (default)** | **314 MiB/s** | **2800 MiB/s** | **598 MiB/s, 3.6 cores** |
+| row engine, 48 workers, `stripe_cache_size` 2048 | 360 MiB/s | 2444 MiB/s | 598 MiB/s, 3.8 cores |
 
-Off by default while the path is gated; `default_dcl_row_rebuild` sets what new
-arrays start with, and `rk_dcl_populate` grows a `row rows N declined M` line so
-a run can be told which engine drove it.
+The stripe path takes the devices from the foreground; the row engine yields
+them, by as much as the worker count says.  At the default it rebuilds at
+stock's rate (0.97×) while serving 2.3× its foreground, and 1.61× faster when
+idle on half the stripe path's cores; 48 workers with a 2048 cache is 1.12×
+stock's rebuild at 1.95× its foreground.  On by default; `default_dcl_row_rebuild`
+sets what new arrays start with (N for the stripe path), and `rk_dcl_populate`
+grows a `row rows N declined M` line -- rows the engine wrote, rows it handed
+to the stripe path -- so a run can be told which engine drove it.
 
 **Writes that must not wait for the preread throttle.**  md delays a stripe that
 needs prereads (`delayed_list`) until no preread is active anywhere, so small

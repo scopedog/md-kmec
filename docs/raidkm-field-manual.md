@@ -932,20 +932,28 @@ Rebuild onto a spare no longer is:
   pass, 498 vs 719 ms per rebuild. Set **0** to restore the synchronous bands — the control arm for
   measuring the window, and the setting to try if a rebuild behaves oddly under
   load; `default_row_rebuild_window` sets what new arrays start with.
-- `rk_dcl_row_rebuild` (**0**, off, live) drives a DECLUSTERED population
+- `rk_dcl_row_rebuild` (**1**, on, live) drives a DECLUSTERED population
   through the row engine instead of the 4 KiB stripe path. Filling a spare
   column has always run on the stripe path (`raidkm_row_rebuild_target()`
   disqualifies `conf->dcl`), which on real NVMe writes the members at 6.4 KiB
   against the classic row rebuild's 128.0 KiB; with this on, a band of rows
   goes to the row-rebuild workers and each writes its row's spare column whole
   — 115.7 KiB average, 18x fewer requests (128.0 KiB writes diluted by the
-  journal checkpoints). It costs wall-clock at the default worker count and
-  scales with `rk_row_rebuild_workers`: on 4 GiB members, 14.0 s at 8, 10.6 s
-  at 16, 8.6 s at 32, against the stripe path's 7.3 s. A row the band cannot
-  take falls through to the stripe path, which still carries backpressure, the
-  unreconstructable-address pause and the resume fast-forward. `rk_dcl_populate`
-  gains a `row rows N declined M` line; `default_dcl_row_rebuild` sets what new
-  arrays start with.
+  journal checkpoints). The rows run through the look-ahead window
+  (`rk_row_rebuild_window`; 0 = the synchronous bands), and the rate follows
+  `rk_dcl_row_rebuild_workers` (**32**; the classic rebuild's
+  `rk_row_rebuild_workers` stays 16), capped at `stripe_cache_size` / 32. On
+  12 x 16 GiB local NVMe under 4 x 1 MiB sequential readers, against tuned
+  stock at 323 MiB/s rebuild behind a 1226 MiB/s foreground: 16 workers
+  250 / 3302, **32 workers 314 / 2800**, 48 workers with `stripe_cache_size`
+  2048 360 / 2444 (rebuild / foreground MiB/s); the stripe path 507 / 779.
+  Idle at the default: 598 MiB/s on 3.6 cores against the stripe path's 581
+  on 7.3. A row the
+  engine cannot take falls through to the stripe path, which still carries
+  backpressure, the unreconstructable-address pause and the resume
+  fast-forward. `rk_dcl_populate` gains a `row rows N declined M` line (rows
+  written, rows handed to the stripe path); `default_dcl_row_rebuild` sets
+  what new arrays start with (N = the stripe path).
 - `rk_row_rebuild_pace` (**0**, off) is a ceiling in KB/s on the row rebuild
   while the array carries foreground I/O -- our own rate, not md's. md's
   cannot reach this path: it throttles a sync by waiting for

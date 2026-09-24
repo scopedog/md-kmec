@@ -1215,6 +1215,10 @@ struct r5conf {
 						 * row engine (chunk-sized writes to
 						 * the spare column) instead of the
 						 * 4 KiB stripe path */
+	int			dcl_row_rb_workers; /* sysfs rk_dcl_row_rebuild_workers:
+						 * rows the population keeps in flight
+						 * (rk_row_rebuild_workers is the
+						 * classic rebuild's) */
 	atomic64_t		dcl_row_pop_rows; /* rows populated by the row engine */
 	atomic64_t		dcl_row_pop_declined; /* rows it left to the stripe
 						 * path (busy, unmapped, or a

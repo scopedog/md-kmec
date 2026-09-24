@@ -38,6 +38,10 @@
 #                  knobs raidkm defaults to, so one run compares
 #                  raid6,raid6+tuned,raidkm2: stock out of the box, stock tuned
 #                  by hand, and ours.  Combines with @<n>: raid6@10+tuned
+#   <arm>%<build>  a raidkm or dcl arm on the module --ko=<build>=PATH names
+#                  instead of the tree's km/raidkm.ko: build-against-build A/B,
+#                  e.g. raidkm2%old,raidkm2%new; with a profile, the %<build>
+#                  comes last: raidkm2+rw%new
 #   dcl<M>         raidkm declustered with M parity: stripes of width
 #                  --group-width scattered over the whole member pool with
 #                  --spare-columns distributed spare columns.  The layout we
@@ -97,6 +101,11 @@
 #   --bitmap=MODE       none | internal (default none)
 #   --gtc=N             set group_thread_cnt on every md arm
 #   --stripe-cache=N    set stripe_cache_size on every md arm
+#   --ko=TAG=PATH       a raidkm build for arms written <arm>%TAG (repeatable),
+#                       e.g. --ko=old=/tmp/raidkm-c5ff48f.ko --ko=new=km/raidkm.ko
+#                       --arms=raidkm2%old,raidkm2%new: two builds, same disks,
+#                       one ABBA run.  The module is swapped between arms when
+#                       the loaded srcversion differs; arm.env records which ran
 #   --md-attr=NAME=V    write V to /sys/block/mdX/md/NAME on every md arm after
 #                       the create (repeatable).  Best-effort: an arm without
 #                       that attribute keeps its own default and the arm record
@@ -121,8 +130,9 @@
 #   --rebuild           also time a rebuild of the last member (Test 7) per md run
 #                       (from the degraded state when --degraded is given)
 #   --rebuild-load=LIST also rebuild it again under each foreground load
-#                       (seqread, randread; classic layouts), recording the
-#                       rebuild rate and the foreground throughput (Test 7L)
+#                       (seqread, randread), recording the rebuild rate and
+#                       the foreground throughput (Test 7L); a dcl arm first
+#                       copies the victim back, then populates it again
 #   --rebuild-floor=KBPS md speed_limit_min during rebuilds (default 500000)
 #   --workloads=LIST    workloads passed to raidkm-standard-benchmark.sh
 #                       (default 1,2,3,4,5,8,9,10)
@@ -208,6 +218,7 @@ preflight_fail() {
 MD_ATTRS=()
 MD_ATTRS_SET=()
 declare -A PROFILES=()
+declare -A KOS=()			# --ko=TAG=PATH: raidkm builds for %TAG arms
 for arg in "$@"; do
 	case "$arg" in
 	--devs=*)         DEVS="${arg#*=}" ;;
@@ -221,6 +232,9 @@ for arg in "$@"; do
 	--gtc=*)          GTC="${arg#*=}" ;;
 	--stripe-cache=*) SCS="${arg#*=}" ;;
 	--md-attr=*)      MD_ATTRS+=("${arg#*=}") ;;
+	--ko=*)           t="${arg#*=}"
+	                  [[ "$t" == ?*=?* ]] || die "--ko wants TAG=PATH, got '$t'"
+	                  KOS["${t%%=*}"]="${t#*=}" ;;
 	--group-width=*)  DCL_G="${arg#*=}" ;;
 	--spare-columns=*) DCL_S="${arg#*=}" ;;
 	--rebuild)        REBUILD=1 ;;
@@ -274,12 +288,18 @@ N=${#MEMBERS[@]}
 [ "$N" -ge 4 ] || die "need at least 4 member devices, got $N"
 LAST_MEMBER="${MEMBERS[$((N - 1))]}"
 
-# Arm spec: <type>[@<n>][+<profile>].  "@<n>" builds the arm on the first n of
-# --devs; "+<profile>" applies a --tune profile after create.
-arm_base() { echo "${1%%+*}"; }				# the arm without +<profile>
-arm_type() { local a="${1%%+*}"; echo "${a%@*}"; }	# ... and without @<n>
-arm_n() { local a="${1%%+*}"; case "$a" in *@*) echo "${a##*@}" ;; *) echo "$N" ;; esac; }
-arm_profile() { case "$1" in *+*) echo "${1#*+}" ;; esac; }
+# Arm spec: <type>[@<n>][+<profile>][%<build>].  "@<n>" builds the arm on the
+# first n of --devs; "+<profile>" applies a --tune profile after create;
+# "%<build>" runs a raidkm arm on the module --ko=<build>=PATH names, so one
+# ABBA run compares two raidkm builds on the same disks.
+arm_core() { echo "${1%%\%*}"; }			# the arm without %<build>
+arm_tag() { case "$1" in *%*) echo "${1##*%}" ;; esac; }
+arm_base() { local a; a=$(arm_core "$1"); echo "${a%%+*}"; }	# ... and without +<profile>
+arm_type() { local a; a=$(arm_base "$1"); echo "${a%@*}"; }	# ... and without @<n>
+arm_n() { local a; a=$(arm_base "$1"); case "$a" in *@*) echo "${a##*@}" ;; *) echo "$N" ;; esac; }
+arm_profile() { local a; a=$(arm_core "$1"); case "$a" in *+*) echo "${a#*+}" ;; esac; }
+# arm_ko <arm>: the raidkm module the arm runs on
+arm_ko() { local t; t=$(arm_tag "$1"); if [ -n "$t" ]; then echo "${KOS[$t]}"; else echo "$DEFAULT_RAIDKM_KO"; fi; }
 arm_select() {					# -> AM (members), AN, ALAST
 	AN=$(arm_n "$1")
 	AM=("${MEMBERS[@]:0:$AN}")
@@ -316,10 +336,18 @@ TUNED_GTC=$(( $(nproc) / (2 * NUMA_NODES) ))
 [ -n "${PROFILES[tuned]:-}" ] ||
 	PROFILES[tuned]="group_thread_cnt=$TUNED_GTC,stripe_cache_size=auto,skip_copy=1"
 
+DEFAULT_RAIDKM_KO="$RAIDKM_KO"
+for t in "${!KOS[@]}"; do
+	[ -f "${KOS[$t]}" ] || die "--ko=$t=${KOS[$t]}: no such file"
+done
 NEED_RAIDKM=0
 NEED_INTREE=0
 for arm in "${ARM_LIST[@]}"; do
 	t=$(arm_type "$arm"); n=$(arm_n "$arm"); prof=$(arm_profile "$arm")
+	if [ -n "$(arm_tag "$arm")" ]; then
+		case "$t" in raidkm*|dcl*) ;; *) die "$arm: %<build> is for raidkm arms" ;; esac
+		[ -n "${KOS[$(arm_tag "$arm")]:-}" ] || die "$arm: no --ko=$(arm_tag "$arm")=PATH"
+	fi
 	if [ -n "$prof" ]; then
 		[ "$t" != raw ] || die "$arm: the raw arm takes no +<profile>"
 		[ -n "${PROFILES[$prof]:-}" ] || die "$arm: no tuning profile '$prof' (built in: tuned; define one with --tune=$prof:ATTR=V,...)"
@@ -595,7 +623,16 @@ create_arm() {
 		return 0 ;;
 	raid5|raid6)               use_456 default ;;
 	raid5-intree|raid6-intree) use_456 intree ;;
-	raidkm*|dcl*)              rk_load_modules || die "raidkm module not loadable" ;;
+	raidkm*|dcl*)
+		# the arm's own build: swap it in if another raidkm is loaded
+		# (the previous arm's array is stopped by now)
+		RAIDKM_KO=$(arm_ko "$arm")
+		if [ -f "$RAIDKM_KO" ] && [ -e /sys/module/raidkm ] &&
+		   [ "$(cat /sys/module/raidkm/srcversion 2>/dev/null)" != \
+		     "$(modinfo -F srcversion "$RAIDKM_KO" 2>/dev/null)" ]; then
+			rmmod raidkm || die "$arm: cannot unload the previous raidkm"
+		fi
+		rk_load_modules || die "raidkm module not loadable" ;;
 	esac
 	wipe_members
 	udevadm settle
@@ -743,8 +780,8 @@ if [ "$DRYRUN" = 1 ]; then
 			fi ;;
 		raidkm*|dcl*)
 			if [ -f "$ISAL_KO" ]; then echo "  insmod $ISAL_KO"; else echo "  modprobe isal_lib"; fi
-			if [ -f "$RAIDKM_KO" ]; then
-				echo "  insmod $RAIDKM_KO"
+			if [ -f "$(arm_ko "$arm")" ]; then
+				echo "  insmod $(arm_ko "$arm")   # srcversion $(modinfo -F srcversion "$(arm_ko "$arm")" 2>/dev/null)"
 			else
 				echo "  modprobe raidkm              # -> $(modinfo -n raidkm 2>/dev/null || echo '? (not installed)')"
 			fi ;;
@@ -1112,7 +1149,7 @@ if rebuild:
 
 if loaded:
     emit()
-    emit("## Rebuild under a foreground load (classic layouts)")
+    emit("## Rebuild under a foreground load")
     emit()
     emit("| arm | load | rebuild MiB/s | rebuild seconds | foreground MiB/s | foreground IOPS | busy cores |")
     emit("|---|---|---|---|---|---|---|")

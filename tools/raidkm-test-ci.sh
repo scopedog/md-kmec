@@ -75,7 +75,8 @@ set -u
 PATH="$PATH:/usr/sbin:/sbin"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window declustered-degraded replace
+SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window
+       declustered-populate-window@default_dcl_row_rebuild=0 declustered-degraded replace
        scrub-badblocks degraded-trust-disk row-rebuild-load wide-row row-write)
 # <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
@@ -83,19 +84,18 @@ SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window d
 # <suite>@default_row_write=1 runs a suite written for the stripe cache with
 # full-row writes on: every aligned whole-row write it issues takes the row
 # path instead, and its own data and parity checks gate it.
+# Declustered population runs on the row engine by default
+# (default_dcl_row_rebuild=Y); <suite>@default_dcl_row_rebuild=0 gates the
+# 4 KiB stripe path it falls back to, which is also where the population's
+# backpressure (populate-window T6, the mark-stall fix) is exercised.
 QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate
+       declustered-populate@default_dcl_row_rebuild=0
        functional@default_row_write=1 degraded@default_row_write=1
        replace@default_row_write=1)
-# declustered-populate@default_dcl_row_rebuild=1 runs the SAME gate (raw
-# spare-column oracle, resume from a journaled mark, scrub) with population
-# driven by the row engine: one chunk-sized write to the spare column instead
-# of a stripe write per granule.
 FULL=("${QUICK[@]}" grow grow-traditional reshape-concurrent declustered-create declustered-io
       declustered-rebalance declustered-csum declustered-autoarm declustered-multi declustered-crash
       declustered-row-transitions
-      declustered-populate@default_dcl_row_rebuild=1
-      declustered-populate-window@default_dcl_row_rebuild=1
-      declustered-csum@default_dcl_row_rebuild=1)
+      declustered-csum@default_dcl_row_rebuild=0)
 NIGHTLY=("${QUICK[@]}" faultinject xfstests mdadm-suite)
 # suites that run `mdadm --stop --scan` (directly, via rk_udev_quiesce, or in
 # mdadm's own test harness)

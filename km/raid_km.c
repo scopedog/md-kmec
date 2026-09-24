@@ -182,10 +182,10 @@ module_param(default_row_rebuild_window, int, 0644);
 MODULE_PARM_DESC(default_row_rebuild_window,
 		 "Initial rk_row_rebuild_window for new arrays: chunks the row rebuild may run ahead of md's cursor (-1 = built-in default, 64; 0 = synchronous bands, the engine before the window).");
 
-static bool default_dcl_row_rebuild;
+static bool default_dcl_row_rebuild = true;
 module_param(default_dcl_row_rebuild, bool, 0644);
 MODULE_PARM_DESC(default_dcl_row_rebuild,
-		 "Initial rk_dcl_row_rebuild for new arrays: drive declustered population through the row engine, so the spare column is written a chunk at a time instead of in 4 KiB stripe writes (default N while the path is being gated).");
+		 "Initial rk_dcl_row_rebuild for new arrays: drive declustered population through the row engine, so the spare column is written a chunk at a time instead of in 4 KiB stripe writes (default Y; N = the stripe path).");
 
 /*
  * delayed_list liveness.  A DELAYED stripe waits on delayed_list until
@@ -680,6 +680,17 @@ static inline int raidkm_dcl_pop_slot(struct r5conf *conf,
 	if (root / (int)conf->dcl->g != sh->dcl_group)
 		return -1;			/* other group's stripe */
 	return root % (int)conf->dcl->g;
+}
+
+/* Is @X still the disk a population is running for?  Single load of reb_pop,
+ * as in raidkm_dcl_pop_slot(): a retire stores -1 under a running pass. */
+static inline bool raidkm_dcl_populating(struct r5conf *conf, int X)
+{
+	int pop = READ_ONCE(conf->reb_pop);
+
+	return pop >= 0 && pop < READ_ONCE(conf->nreb) &&
+	       READ_ONCE(conf->reb[pop].state) == RKDCL_ASSIGN_POPULATING &&
+	       READ_ONCE(conf->reb[pop].disk) == X;
 }
 
 /* dcl_selftest cross-check hooks (raid_km-dcl.c): evaluate the RUNTIME
@@ -10806,6 +10817,24 @@ static int raidkm_dcl_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 		shs[j] = sh;
 	}
 
+	/*
+	 * The target and sources above were resolved from the spare map
+	 * before the row was ours, and a writer that is not md's sync thread
+	 * (the look-ahead window's workers) gets its stripes past a quiesce
+	 * (R5_GAS_NOQUIESCE).  The map only changes under raid5_quiesce()
+	 * (raidkm_dcl_retire_all/_one), which waits for the stripes we now
+	 * hold: so a quiesce not yet begun waits for this row, and one that
+	 * has begun -- or a retire that finished while we resolved -- is seen
+	 * here, before anything is read or written.
+	 */
+	smp_mb();	/* the claims above, then the quiesce and the map */
+	if (READ_ONCE(conf->quiesce)) {
+		ret = -EBUSY;
+		goto out_stripes;
+	}
+	if (!raidkm_dcl_populating(conf, X))
+		goto out_stripes;		/* the assignment is gone */
+
 	/* read the k survivors, one request each */
 	init_completion(&rs.done);
 	rs.status = 0;
@@ -10870,10 +10899,6 @@ out_sources:
 		rdev_dec_pending(rr->src[i].rdev, mddev);
 	if (pinned_target)
 		rdev_dec_pending(target, mddev);
-	if (ret > 0)
-		atomic64_inc(&conf->dcl_row_pop_rows);
-	else
-		atomic64_inc(&conf->dcl_row_pop_declined);
 	return ret;
 }
 
@@ -11041,6 +11066,19 @@ static void raidkm_row_rb_pace_wait(struct mddev *mddev)
  * and the stripe-cache rule in raidkm_row_rb_set_get() bounds what it holds */
 #define RK_ROW_REBUILD_WORKERS	16
 #define RK_ROW_REBUILD_WORKERS_MAX 64
+/*
+ * Rows in flight for a declustered population: the default for sysfs
+ * rk_dcl_row_rebuild_workers, kept apart from the classic rebuild's count.
+ * A population reads and writes across the whole pool rather than one
+ * member, so it has the spindles for more rows, and it is what sets its
+ * share against a foreground load.  Measured on 12 x 16 GiB local NVMe
+ * under four 1 MiB sequential readers, against tuned stock raid6 8+2 on the
+ * same disks: 16 rows 0.77x stock's rebuild at 2.6x its foreground, 32 rows
+ * 0.99-1.06x at 2.2-2.8x.  32 is also what the default stripe cache holds
+ * (1024 / 32 heads a row at a 128 KiB chunk).  The workers sleep on I/O;
+ * the count is a queue depth, not a CPU budget.
+ */
+#define RK_DCL_ROW_REBUILD_WORKERS 32
 /* ceiling on one pass's rebuild buffers: nwk x (k + 1) chunks */
 #define RK_ROW_RB_BUDGET	(64UL << 20)
 /*
@@ -11053,6 +11091,13 @@ static void raidkm_row_rb_pace_wait(struct mddev *mddev)
  */
 #define RK_ROW_REBUILD_WINDOW	64
 #define RK_ROW_REBUILD_WINDOW_MAX 1024
+
+/* the window a pass runs with, in chunks; 0 = synchronous bands */
+static inline unsigned int raidkm_row_win_size(struct r5conf *conf)
+{
+	return clamp_t(int, READ_ONCE(conf->row_rb_window), 0,
+		       RK_ROW_REBUILD_WINDOW_MAX);
+}
 /* how often a window worker tries a row it found busy before leaving the
  * chunk to md's cursor, and how long it stands back in between (usec) */
 #define RK_ROW_WIN_BUSY_TRIES	8
@@ -11134,6 +11179,9 @@ struct raidkm_row_rb_set {
 	struct mddev			*mddev;
 	struct md_rdev			*target;
 	int				target_slot;
+	/* declustered population: the disk being populated, or -1 for a
+	 * classic rebuild onto target (raidkm_dcl_populate_request) */
+	int				dcl_X;
 	unsigned int			win;	/* slots in use of st[] */
 	s64				head;	/* md's cursor: first unclaimed */
 	atomic64_t			next;	/* first chunk no worker has */
@@ -11275,7 +11323,7 @@ fail:
 }
 
 static struct raidkm_row_rb_set *raidkm_row_rb_set_get(struct r5conf *conf,
-							 int k)
+							 int k, int workers)
 {
 	struct raidkm_row_rb_set *set = conf->row_rb;
 	unsigned long per_wk = (unsigned long)(k + 1) * (conf->chunk_sectors << 9);
@@ -11287,7 +11335,7 @@ static struct raidkm_row_rb_set *raidkm_row_rb_set_get(struct r5conf *conf,
 	/* the budget trims workers, never below one: a wide or large-chunk
 	 * array still rebuilds by rows, one row at a time */
 	nwk = (unsigned int)clamp_t(unsigned long, RK_ROW_RB_BUDGET / per_wk, 1,
-				    clamp_t(int, READ_ONCE(conf->row_rb_workers),
+				    clamp_t(int, workers,
 					    1, RK_ROW_REBUILD_WORKERS_MAX));
 	/*
 	 * A row in flight holds every stripe head of its chunk (32 at a 128 KiB
@@ -11380,7 +11428,8 @@ static sector_t raidkm_row_rebuild_band(struct mddev *mddev, sector_t sector_nr,
 
 	if (avail < conf->chunk_sectors)
 		return 0;
-	set = raidkm_row_rb_set_get(conf, k);
+	set = raidkm_row_rb_set_get(conf, k,
+				    READ_ONCE(conf->row_rb_workers));
 	if (!set) {
 		atomic64_inc(&conf->row_rebuild_band_nomem);
 		return 0;
@@ -11464,7 +11513,8 @@ static sector_t raidkm_dcl_rebuild_band(struct mddev *mddev, sector_t sector_nr,
 
 	if (avail < conf->chunk_sectors)
 		return 0;
-	set = raidkm_row_rb_set_get(conf, (int)ge->k);
+	set = raidkm_row_rb_set_get(conf, (int)ge->k,
+				    READ_ONCE(conf->dcl_row_rb_workers));
 	if (!set) {
 		atomic64_inc(&conf->row_rebuild_band_nomem);
 		return 0;
@@ -11616,8 +11666,14 @@ static void raidkm_row_rebuild_win_worker(struct work_struct *work)
 		 * while the others carry on.
 		 */
 		for (tries = 0; ; tries++) {
-			ok = raidkm_row_rebuild_chunk(mddev,
-					(sector_t)c * conf->chunk_sectors,
+			sector_t sect = (sector_t)c * conf->chunk_sectors;
+
+			/* RK_DCL_ROW_EMPTY (no chain crosses X here) is > 0:
+			 * nothing to write, and md may claim it all the same */
+			ok = set->dcl_X >= 0 ?
+				raidkm_dcl_rebuild_chunk(mddev, sect,
+							 set->dcl_X, &w->ctx) :
+				raidkm_row_rebuild_chunk(mddev, sect,
 					set->target, set->target_slot, &w->ctx);
 			if (ok != -EBUSY)
 				break;
@@ -11676,11 +11732,11 @@ static sector_t raidkm_row_rebuild_window(struct mddev *mddev,
 					  sector_t sector_nr,
 					  sector_t max_sector,
 					  struct md_rdev *target,
-					  int target_slot, unsigned int win)
+					  int target_slot, int dcl_X, int k,
+					  unsigned int win)
 {
 	struct r5conf *conf = mddev->private;
 	struct raidkm_row_rb_set *set = conf->row_rb;
-	int k = conf->raid_disks - conf->m;
 	sector_t tmp;
 	s64 head, end_c;
 	unsigned int i, n = 0, slot;
@@ -11714,11 +11770,14 @@ static sector_t raidkm_row_rebuild_window(struct mddev *mddev,
 	 */
 	if (set && set->active &&
 	    (set->head != head || set->target != target ||
-	     set->target_slot != target_slot || set->win != win))
+	     set->target_slot != target_slot || set->dcl_X != dcl_X ||
+	     set->win != win))
 		raidkm_row_win_drain(conf, set);
 	/* a changed geometry or worker count builds a new set, which drains
 	 * the old one on its way out (raidkm_row_rb_set_free) */
-	set = raidkm_row_rb_set_get(conf, k);
+	set = raidkm_row_rb_set_get(conf, k, dcl_X >= 0 ?
+				    READ_ONCE(conf->dcl_row_rb_workers) :
+				    READ_ONCE(conf->row_rb_workers));
 	if (!set) {
 		atomic64_inc(&conf->row_rebuild_band_nomem);
 		return 0;
@@ -11727,6 +11786,7 @@ static sector_t raidkm_row_rebuild_window(struct mddev *mddev,
 		set->mddev = mddev;
 		set->target = target;
 		set->target_slot = target_slot;
+		set->dcl_X = dcl_X;
 		set->win = win;
 		set->head = head;
 		atomic64_set(&set->next, head);
@@ -11858,15 +11918,18 @@ again:
  * reshape, no sync pass running (raid5_sync_request waits out row writes in
  * flight: see the fence below), skip_copy on (the caller's pages are both the
  * parity source and the data written, which is only safe with the stable
- * pages skip_copy asks the block layer for), and no journal, PPL, native
- * checksum or declustered layout.  A write-intent bitmap is kept as the
- * stripe path keeps it (raidkm_row_write_go / _submit / _done).
+ * pages skip_copy asks the block layer for), and no journal, PPL or
+ * declustered layout.  A write-intent bitmap is kept as the stripe path keeps
+ * it (raidkm_row_write_go / _submit / _done), and so is a native checksum:
+ * the CRC of every block the row writes, data and parity, is stored before
+ * any member write goes out, as ops_run_io() stores it at write issue.
  */
 struct raidkm_row_wctx;
 
 struct raidkm_row_wmember {
 	struct raidkm_row_wctx	*w;
 	struct md_rdev		*rdev;
+	int			disk;		/* its slot: native-checksum key */
 	int			failed;		/* its write returned an error */
 };
 
@@ -11891,6 +11954,7 @@ struct raidkm_row_wctx {
 	unsigned char		**src;		/* k data, then m parity: */
 	unsigned char		**dst;		/* = src + k */
 	struct bvec_iter	*it;		/* k: each data chunk in the bio */
+	u32			*crc;		/* k: native checksum, block so far */
 	struct raidkm_row_wmember mw[];		/* k + m, by generator row */
 };
 
@@ -11909,6 +11973,7 @@ static void raidkm_row_wctx_free(struct raidkm_row_wctx *w)
 	kfree(w->pbuf);
 	kfree(w->src);
 	kfree(w->it);
+	kfree(w->crc);
 	kfree(w);
 }
 
@@ -11933,7 +11998,8 @@ static struct raidkm_row_wctx *raidkm_row_wctx_alloc(struct r5conf *conf,
 	/* one array, data then parity: raid6's gen_syndrome takes it whole */
 	w->src = kcalloc(k + m, sizeof(*w->src), gfp);
 	w->it = kcalloc(k, sizeof(*w->it), gfp);
-	if (!w->pbuf || !w->src || !w->it)
+	w->crc = kcalloc(k, sizeof(*w->crc), gfp);
+	if (!w->pbuf || !w->src || !w->it || !w->crc)
 		goto fail;
 	w->dst = w->src + k;
 	for (i = 0; i < m; i++)
@@ -12048,7 +12114,7 @@ static bool raidkm_row_write_ok(struct mddev *mddev, struct r5conf *conf,
 	       bio_op(bi) == REQ_OP_WRITE &&
 	       !(bi->bi_opf & (REQ_PREFLUSH | REQ_NOWAIT)) &&
 	       !IS_ENABLED(CONFIG_HIGHMEM) &&	/* parity reads page_address() */
-	       conf->skip_copy && !conf->csum && !conf->dcl &&
+	       conf->skip_copy && !conf->dcl &&
 	       !raid5_has_log(conf) && !raid5_has_ppl(conf) &&
 	       !mddev->degraded && conf->reshape_progress == MaxSector &&
 	       conf->chunk_sectors &&
@@ -12400,6 +12466,7 @@ raidkm_row_write_prep(struct mddev *mddev, struct bio *raid_bio,
 			goto out_declined;
 		atomic_inc(&rdev->nr_pending);
 		w->mw[i].rdev = rdev;
+		w->mw[i].disk = idx;
 		if (rdev_has_badblock(rdev, msect, cs))
 			goto out_declined;
 	}
@@ -12453,6 +12520,7 @@ static void raidkm_row_write_go(struct mddev *mddev,
 	struct r5conf *conf = mddev->private;
 	struct bio *raid_bio = w->raid_bio;
 	unsigned int len = w->chunk_sectors << 9, done;
+	unsigned int bsize = RAID5_STRIPE_SIZE(conf);
 	int k = w->k, m = w->m, i;
 
 	/* row readers must not mix old and new members of this row */
@@ -12460,15 +12528,23 @@ static void raidkm_row_write_go(struct mddev *mddev,
 	atomic_inc(&w->bucket->inflight);
 	atomic_inc(&w->bucket->gen);
 
-	/* parity, straight from the caller's pages, one run at a time: a run
-	 * is as long as every data chunk stays inside one bio_vec */
+	/*
+	 * Parity, straight from the caller's pages, one run at a time: a run
+	 * is as long as every data chunk stays inside one bio_vec.  With a
+	 * native checksum a run also stops at each block boundary, and the
+	 * pass CRCs the data as it goes: a block's CRC chains over the runs
+	 * that make it up, and is stored when the block is complete.
+	 */
 	for (i = 0; i < k; i++) {
 		w->it[i] = raid_bio->bi_iter;
 		bio_advance_iter(raid_bio, &w->it[i], w->base + i * len);
+		w->crc[i] = 0;
 	}
 	for (done = 0; done < len; ) {
 		unsigned int run = len - done;
 
+		if (conf->csum)
+			run = min(run, bsize - done % bsize);
 		for (i = 0; i < k; i++) {
 			struct bio_vec bv = mp_bvec_iter_bvec(raid_bio->bi_io_vec,
 							      w->it[i]);
@@ -12479,10 +12555,27 @@ static void raidkm_row_write_go(struct mddev *mddev,
 		for (i = 0; i < m; i++)
 			w->dst[i] = (unsigned char *)w->pbuf[i].addr + done;
 		raidkm_row_encode(conf, run, k, m, w->src, w->dst);
+		if (conf->csum)
+			for (i = 0; i < k; i++)
+				w->crc[i] = crc32c_le(w->crc[i], w->src[i], run);
 		for (i = 0; i < k; i++)
 			bio_advance_iter_single(raid_bio, &w->it[i], run);
 		done += run;
+		if (conf->csum && !(done % bsize)) {
+			unsigned long blk = raidkm_csum_blkidx(conf, w->msect) +
+					    (done - 1) / bsize;
+
+			for (i = 0; i < k; i++) {
+				raidkm_csum_store(conf, w->mw[i].disk, blk,
+						  raidkm_csum_fold(w->crc[i]));
+				w->crc[i] = 0;
+			}
+		}
 	}
+	/* ... and the parity chunks, now that they are whole */
+	for (i = 0; i < m; i++)
+		raidkm_row_csum_store(conf, w->mw[k + i].disk, w->msect,
+				      w->pbuf[i].addr, len);
 
 	/*
 	 * Write-intent bitmap: count the row as the stripe path counts each
@@ -15254,6 +15347,32 @@ static bool raidkm_dcl_pop_admit(struct r5conf *conf, sector_t first,
 	return true;
 }
 
+/*
+ * Claim @did sectors of rows the row engine has put on their spare columns
+ * (whole rows from @sector_nr, a band's or the window's finished prefix):
+ * md is told first, then the granules go to the prefix mark, as in the
+ * stripe path's completion.  @admit: wait for room in the mark's window
+ * first (the band admits its range before it starts).  false: the pass was
+ * interrupted during that wait and nothing was claimed.
+ */
+static bool raidkm_dcl_pop_claim(struct mddev *mddev, sector_t sector_nr,
+				 sector_t did, bool admit)
+{
+	struct r5conf *conf = mddev->private;
+	sector_t s;
+
+	if (admit && !raidkm_dcl_pop_admit(conf, sector_nr,
+					   sector_nr + did - 1))
+		return false;
+	md_done_sync(mddev, did, 1);
+	for (s = 0; s < did; s += RAID5_STRIPE_SECTORS(conf))
+		raidkm_dcl_pop_done(conf, sector_nr + s);
+	raidkm_dcl_maybe_checkpoint(conf);
+	atomic64_add(div_u64(did, conf->chunk_sectors),
+		     &conf->dcl_row_pop_rows);
+	return true;
+}
+
 /* Declustered Phase 3/3b: one address of the population pass
  * (notes/declustered-population-design.md §4).  Rides a REQUESTED sync;
  * md_do_sync drives sector_nr over dev_sectors.  Per address: if some group
@@ -15278,8 +15397,10 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 	 * we returned) and always ends one with sync_request(max_sectors),
 	 * which resets reb_next: a mismatch means this call STARTS a pass */
 	bool pass_start = conf->reb_next != (u64)sector_nr;
+	bool row_engine = READ_ONCE(conf->dcl_row_rebuild);
+	unsigned int win;
 	sector_t ret;
-	int root;
+	int root, pop, X;
 
 	/* A pass that starts while population is paused IS the retry — an
 	 * explicit repair, or the resume at assemble: lift the pause now, so a
@@ -15289,6 +15410,22 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 		WRITE_ONCE(conf->reb_pop_stuck, false);
 		WRITE_ONCE(conf->reb_fail_sector, U64_MAX);
 	}
+
+	/*
+	 * One load of reb_pop for the whole call: raid5_sync_request() checked
+	 * it, but a retire (sysfs, raid5d's rescue) can store -1 under a
+	 * running pass, and re-loading it to index reb[] would read reb[-1].
+	 * An assignment that is gone ends the pass; the finish path then has
+	 * nothing to flip.
+	 */
+	pop = READ_ONCE(conf->reb_pop);
+	if (pop < 0 || pop >= READ_ONCE(conf->nreb) ||
+	    READ_ONCE(conf->reb[pop].state) != RKDCL_ASSIGN_POPULATING) {
+		*skipped = 1;
+		ret = mddev->dev_sectors - sector_nr;
+		goto out;
+	}
+	X = READ_ONCE(conf->reb[pop].disk);
 
 	/* resume fast-forward: everything below the restored mark is done */
 	if (sector_nr + RAID5_STRIPE_SECTORS(conf) <= mark) {
@@ -15324,8 +15461,62 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 		goto out;
 	}
 
+	/*
+	 * rk_dcl_row_rebuild: rebuild whole rows through the row engine, so
+	 * each spare column takes one chunk-sized write per row instead of a
+	 * stripe write per RAID5_STRIPE_SIZE granule (§H4).  With
+	 * rk_row_rebuild_window > 0 (the default) that is the classic
+	 * rebuild's look-ahead window: the workers keep taking rows ahead of
+	 * md's cursor instead of waiting at every band for its slowest row,
+	 * and a busy row is tried again rather than ending the band
+	 * (raidkm_row_rebuild_win_worker).  Measured on 12 x 16 GiB NVMe
+	 * under 4 x 1 MiB sequential readers: 274-416 MiB/s against the
+	 * bands' 162-231 at 16-48 workers.  With 0, synchronous bands.
+	 *
+	 * Only on the chunk grid, and before the content-free check: an empty
+	 * row is one the workers finish at once, and a call that went around
+	 * the window would drain it.  A row the engine declines (busy stripes,
+	 * a source it could not verify, a chain with no live endpoint) falls
+	 * through to the stripe path below, which is also what carries the
+	 * unreconstructable-address pause.
+	 */
+	win = row_engine ? raidkm_row_win_size(conf) : 0;
+	if (!win)
+		raidkm_row_win_drain(conf, conf->row_rb);
+	if (row_engine && !(sector_nr % conf->chunk_sectors) &&
+	    sector_nr + conf->chunk_sectors <= mddev->dev_sectors) {
+		unsigned long started;
+		sector_t did;
+
+		raidkm_row_rb_pace_wait(mddev);
+		started = jiffies;
+		did = win ? raidkm_row_rebuild_window(mddev, sector_nr,
+					mddev->dev_sectors, NULL, -1, X,
+					(int)ge->k, win) :
+			    raidkm_dcl_rebuild_band(mddev, sector_nr,
+					mddev->dev_sectors, X);
+		if (did) {
+			if (!raidkm_dcl_pop_claim(mddev, sector_nr, did,
+						  win != 0)) {
+				/* interrupted: the window had already handed
+				 * these rows over; the next pass does them
+				 * again */
+				u64 n = div_u64(did, conf->chunk_sectors);
+
+				atomic64_sub(n, &conf->row_rebuild_done);
+				atomic64_add(n, &conf->row_rebuild_unclaimed);
+				return 0;
+			}
+			raidkm_row_rb_pace(mddev, did, started);
+			ret = did;
+			goto out;
+		}
+		/* this row goes to the stripe path */
+		atomic64_inc(&conf->dcl_row_pop_declined);
+	}
+
 	sector_div(row, conf->chunk_sectors);
-	root = raidkm_dcl_chain_root(conf, row, conf->reb[conf->reb_pop].disk);
+	root = raidkm_dcl_chain_root(conf, row, X);
 	if (root < 0) {
 		/* No chain traverses X in this row — nothing to rebuild.
 		 * Feed the skipped granules to the prefix mark and advance
@@ -15344,37 +15535,6 @@ static sector_t raidkm_dcl_populate_request(struct mddev *mddev,
 		*skipped = 1;
 		ret = sk;
 		goto out;
-	}
-
-	/*
-	 * rk_dcl_row_rebuild: rebuild a BAND of rows through the row engine,
-	 * so each spare column takes one chunk-sized write per row instead of
-	 * a stripe write per RAID5_STRIPE_SIZE granule (§H4).  Only on the
-	 * chunk grid; a row the band declines (busy stripes, a source it could
-	 * not verify, a chain with no live endpoint) ends the claimed prefix
-	 * and falls through to the stripe path below, which is also what
-	 * carries the unreconstructable-address pause.
-	 */
-	if (READ_ONCE(conf->dcl_row_rebuild) &&
-	    !(sector_nr % conf->chunk_sectors) &&
-	    sector_nr + conf->chunk_sectors <= mddev->dev_sectors) {
-		sector_t did = raidkm_dcl_rebuild_band(mddev, sector_nr,
-					mddev->dev_sectors,
-					conf->reb[conf->reb_pop].disk);
-
-		if (did) {
-			sector_t s;
-
-			/* every claimed row is on its spare column before md
-			 * is told: md_done_sync() first, then the granules,
-			 * as in the stripe path's completion */
-			md_done_sync(mddev, did, 1);
-			for (s = 0; s < did; s += RAID5_STRIPE_SECTORS(conf))
-				raidkm_dcl_pop_done(conf, sector_nr + s);
-			raidkm_dcl_maybe_checkpoint(conf);
-			ret = did;
-			goto out;
-		}
 	}
 
 	if (!raidkm_dcl_pop_admit(conf, sector_nr, sector_nr))
@@ -16225,8 +16385,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	 * CRCs for the chunk it writes itself.
 	 */
 	row_target = raidkm_row_rebuild_target(mddev, sector_nr, &tslot);
-	row_win = row_target ? clamp_t(int, READ_ONCE(conf->row_rb_window), 0,
-				       RK_ROW_REBUILD_WINDOW_MAX) : 0;
+	row_win = row_target ? raidkm_row_win_size(conf) : 0;
 	/*
 	 * A pass the look-ahead window no longer serves -- the knob turned
 	 * off, a second failure, rk_row_rebuild cleared -- must not leave its
@@ -16247,7 +16406,9 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		if (row_win)
 			did = raidkm_row_rebuild_window(mddev, sector_nr,
 							max_sector, row_target,
-							tslot, row_win);
+							tslot, -1,
+							conf->raid_disks -
+							conf->m, row_win);
 		else
 			did = raidkm_row_rebuild_band(mddev, sector_nr,
 						      max_sector, row_target,
@@ -18358,6 +18519,51 @@ raidkm_row_rebuild_workers_entry = __ATTR(rk_row_rebuild_workers,
 					  raidkm_row_rebuild_workers_store);
 
 static ssize_t
+raidkm_dcl_row_rebuild_workers_show(struct mddev *mddev, char *page)
+{
+	struct r5conf *conf;
+	int ret = 0;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf)
+		ret = sprintf(page, "%d\n", READ_ONCE(conf->dcl_row_rb_workers));
+	spin_unlock(&mddev->lock);
+	return ret;
+}
+
+static ssize_t
+raidkm_dcl_row_rebuild_workers_store(struct mddev *mddev, const char *page,
+				     size_t len)
+{
+	struct r5conf *conf;
+	unsigned long new;
+	int err;
+
+	if (len >= PAGE_SIZE || kstrtoul(page, 10, &new) ||
+	    new < 1 || new > RK_ROW_REBUILD_WORKERS_MAX)
+		return -EINVAL;
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf)
+		err = -ENODEV;
+	else
+		/* as rk_row_rebuild_workers: taken on the next sync step,
+		 * trimmed by the buffer budget and the stripe-cache cap */
+		WRITE_ONCE(conf->dcl_row_rb_workers, (int)new);
+	mddev_unlock(mddev);
+	return err ?: len;
+}
+
+static struct md_sysfs_entry
+raidkm_dcl_row_rebuild_workers_entry = __ATTR(rk_dcl_row_rebuild_workers,
+					      S_IRUGO | S_IWUSR,
+					      raidkm_dcl_row_rebuild_workers_show,
+					      raidkm_dcl_row_rebuild_workers_store);
+
+static ssize_t
 raidkm_row_rebuild_window_show(struct mddev *mddev, char *page)
 {
 	struct r5conf *conf;
@@ -18646,6 +18852,7 @@ static struct attribute *raid5_attrs[] =  {
 	&raidkm_row_rebuild_workers_entry.attr,
 	&raidkm_row_rebuild_window_entry.attr,
 	&raidkm_dcl_row_rebuild_entry.attr,
+	&raidkm_dcl_row_rebuild_workers_entry.attr,
 	&raidkm_row_rebuild_pace_entry.attr,
 	&raidkm_batch_mparity_entry.attr,
 	&raidkm_row_stats_entry.attr,
@@ -19133,6 +19340,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	INIT_LIST_HEAD(&conf->row_wctx_free);
 	conf->row_rebuild = default_row_rebuild;
 	conf->row_rb_workers = RK_ROW_REBUILD_WORKERS;
+	conf->dcl_row_rb_workers = RK_DCL_ROW_REBUILD_WORKERS;
 	conf->row_rb_window = default_row_rebuild_window < 0 ?
 		RK_ROW_REBUILD_WINDOW :
 		min(default_row_rebuild_window, RK_ROW_REBUILD_WINDOW_MAX);

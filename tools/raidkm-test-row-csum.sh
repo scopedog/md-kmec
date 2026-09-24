@@ -23,6 +23,19 @@
 #   T4  fail-closed on rebuild: a survivor block corrupted before the rebuild
 #       makes the row engine decline that row (rebuild_csum_bad moves) rather
 #       than decode rot onto the spare; the data still comes back correct.
+#   T5  a sub-block read of a poisoned healthy member on a degraded array is
+#       verified (regression for the aligned-bypass guard).
+#   T6  full-row writes (rk_row_write) store the CRCs of everything they
+#       write.  An absent CRC is never checked (it reads as "never written"),
+#       so each part is built to fail if a store were missing:
+#       a) rows first written through the stripe cache, then rewritten as
+#          whole rows: a healthy read raises no mismatch, so every data CRC
+#          was replaced (the old ones would all mismatch); scrub clean.
+#       b) a row-written block corrupted raw is caught on read and the
+#          original bytes come back, so its CRC is really there.
+#       c) with a data member failed, the row layer's degraded read -- which
+#          verifies the survivors, parity included -- serves the rewritten
+#          rows without refusing any, so the parity CRCs were replaced too.
 #
 # Usage: bash <this>     (MEMBERS/geometry via RC_N, RC_M; see raidkm-test-lib.sh)
 set -u
@@ -281,5 +294,78 @@ else
 		rk_fail "T5: SUB-BLOCK READ SERVED UNVERIFIED DATA from a poisoned member"
 	fi
 fi
+
+# ---- T6: full-row writes store the CRCs of what they write ------------------
+echo "=== T6: full-row writes (rk_row_write) on a --checksum array ==="
+EMPTY_MD5=d41d8cd98f00b204e9800998ecf8427e	# what read_md5 gives when the read fails
+bad_read() {	# bad_read <md5>: how a wrong read failed
+	[ "$1" = "$EMPTY_MD5" ] && echo "READ FAILED (EIO)" || echo "WRONG BYTES ($1)"
+}
+ROWKB=$(( K * CHUNK_KB ))
+# T6 works on whole rows only: a row need not divide PATMB (k=3 at 64 KiB is
+# 192 KiB), and a tail left holding the stripe path's pattern would fail the
+# compare with nothing wrong in the kernel.
+SPANKB=$(( PATMB * 1024 / ROWKB * ROWKB ))
+span_md5() {	# md5 of the whole-row span T6 rewrote
+	echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+	sudo dd if="$MD" bs="${ROWKB}k" count=$(( SPANKB / ROWKB )) iflag=direct \
+		status=none 2>/dev/null | md5sum | cut -d' ' -f1
+}
+mk_chunk_tokens t6old			# what the stripe cache writes first
+cp "$RK_TMP/pat" "$RK_TMP/t6-old"
+rk_create "${M}r" "${MEMBERS[@]:0:$N}" || { rk_fail "T6: create"; rk_summary; exit 1; }
+row_knob rk_row_write 0
+write_pattern				# stripe path: CRCs stored for the OLD data
+mk_chunk_tokens t6			# the rows the row path will rewrite
+truncate -s "${SPANKB}K" "$RK_TMP/pat"
+PRE=$(md5sum "$RK_TMP/pat" | cut -d' ' -f1)
+row_knob rk_row_write 1
+[ "$(cat "/sys/block/$MDNAME/md/rk_row_write" 2>/dev/null)" = 1 ] \
+	|| { rk_fail "T6: rk_row_write did not take"; rk_summary; exit 1; }
+W0=$(row_stat write_done)
+sudo dd if="$RK_TMP/pat" of="$MD" bs="${ROWKB}k" count=$(( SPANKB / ROWKB )) \
+	oflag=direct status=none
+W1=$(row_stat write_done)
+[ "$W1" -gt "$W0" ] && rk_pass "T6a: whole rows took the row path (write_done $W0 -> $W1)" \
+		    || rk_fail "T6a: row path never ran on a --checksum array (write_done $W0 -> $W1; declined $(row_stat write_declined), busy $(row_stat write_busy))"
+sudo dmesg -C >/dev/null 2>&1
+POST=$(span_md5)
+[ "$POST" = "$PRE" ] && rk_pass "T6a: rewritten rows read back right" \
+			|| rk_fail "T6a: rewritten rows: $(bad_read "$POST")"
+S=$(storms)
+[ "$S" = 0 ] && rk_pass "T6a: no csum mismatch on a healthy read -- the data CRCs were replaced" \
+	     || rk_fail "T6a: $S csum mismatches after row writes (the stripe path's old CRCs survived)"
+MM=$(rk_scrub)
+[ "$MM" = 0 ] && rk_pass "T6a: scrub clean after row writes" \
+	      || rk_fail "T6a: scrub mismatch_cnt=$MM after row writes"
+S=$(storms)
+[ "$S" = 0 ] && rk_pass "T6a: the scrub found no CRC disagreement either" \
+	     || rk_fail "T6a: $S csum mismatches during the scrub after row writes"
+
+# b) rot in a row-written block is caught against its stored CRC
+map_chunk_tokens t6 || { rk_fail "T6b: could not map row-0 chunks to members"; rk_summary; exit 1; }
+ND_DEV="${TOKDEV[1]}"; ND_OFF="${TOKOFF[1]}"
+rk_log "poisoning row-written chunk 1 on $ND_DEV at byte $ND_OFF"
+sudo dmesg -C >/dev/null 2>&1
+poison_needle
+POST=$(span_md5)
+S=$(storms)
+[ "$POST" = "$PRE" ] && rk_pass "T6b: original bytes returned over a rotted row-written block" \
+			|| rk_fail "T6b: read over a rotted row-written block: $(bad_read "$POST")"
+[ "$S" -gt 0 ] && rk_pass "T6b: the rot was caught against the stored CRC ($S mismatch line(s))" \
+	       || rk_fail "T6b: rot in a row-written block went unnoticed (no CRC stored for it)"
+
+# c) the parity CRCs: a degraded read verifies the survivors, parity included
+FAILDEV="${TOKDEV[0]}"
+row_knob rk_row_dread 1
+rk_fail_disks "$FAILDEV"
+D0=$(row_stat dread_done); C0=$(row_stat dread_csum_bad)
+POST=$(span_md5)
+D1=$(row_stat dread_done); C1=$(row_stat dread_csum_bad)
+[ "$POST" = "$PRE" ] && rk_pass "T6c: degraded read of row-written data is right" \
+			|| rk_fail "T6c: degraded read of row-written data: $(bad_read "$POST")"
+[ "$D1" -gt "$D0" ] && [ "$C1" = "$C0" ] \
+	&& rk_pass "T6c: the row layer decoded from verified survivors, parity included (dread_done $D0 -> $D1, dread_csum_bad $C0)" \
+	|| rk_fail "T6c: survivors failed their CRCs after row writes (dread_done $D0 -> $D1, dread_csum_bad $C0 -> $C1)"
 
 rk_summary

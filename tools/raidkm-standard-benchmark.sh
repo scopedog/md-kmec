@@ -25,11 +25,13 @@
 #   --rebuild-victim=DEV  after the fio tests, fail DEV and time the rebuild
 #                      (Test 7).  Declustered arrays populate the distributed
 #                      spare; classic arrays recover onto the re-added member.
-#   --rebuild-load=LIST   classic arrays: after Test 7, rebuild DEV again while
-#                      a foreground workload runs on the degraded array (Test
-#                      7L), once per entry: seqread (1 MiB QD8 x4) or randread
-#                      (4 KiB QD16 x4).  Records the rebuild rate and the
-#                      foreground throughput together
+#   --rebuild-load=LIST   after Test 7, rebuild DEV again while a foreground
+#                      workload runs on the degraded array (Test 7L), once per
+#                      entry: seqread (1 MiB QD8 x4) or randread (4 KiB QD16
+#                      x4).  Records the rebuild rate and the foreground
+#                      throughput together.  A declustered array first gets
+#                      DEV back (re-added, copied back from the spare), then
+#                      fails it again and populates under the load
 #   --rebuild-floor=KBPS  md's speed_limit_min during Tests 7/7L (default
 #                      500000); under a foreground load md throttles the
 #                      rebuild down to this floor
@@ -78,11 +80,13 @@ OUTPUT=
 DROP_CACHES=1
 CHECK=1
 REBUILD_VICTIM=          # member device to fail+rebuild (enables Test 7)
-REBUILD_LOAD=            # foreground workloads for Test 7L (classic arrays)
+REBUILD_LOAD=            # foreground workloads for Test 7L
 REBUILD_FLOOR=500000     # speed_limit_min during Tests 7/7L, KB/s
 DEGRADED_VICTIM=         # member device to fail for the degraded phase
 DEGRADED_WORKLOADS="9 10"
 DCL_SLOT=                # declustered: RaidDevice slot of a victim failed early
+DCL_ROWS_PREV="0 0"      # declustered: row engine rows/declines seen so far
+ROWENG=                  # ... and this populate's share, "<rows> <declined>"
 MDADM=                   # raidkm-aware mdadm (auto-resolved if empty)
 REBUILD_SECS=
 MISMATCH=
@@ -345,10 +349,6 @@ rebuild_test() {
     # declustered raidkm arrays, so it is not a reliable discriminator.)
     local dcl=0
     is_dcl && dcl=1
-    if [ "$dcl" = 1 ] && [ -n "$load" ]; then
-        echo "  7L: skipped for $load — a declustered array populates once; a loaded populate needs its own run"
-        return 0
-    fi
 
     # wait out any in-flight sync (e.g. the Test-6 consistency check)
     while [ "$(cat "/sys/block/$md/md/sync_action" 2>/dev/null)" != idle ]; do sleep 0.5; done
@@ -362,6 +362,33 @@ rebuild_test() {
     echo 8000000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
     echo "$REBUILD_FLOOR" | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null
 
+    # A declustered array populates a failed member once: the next loaded
+    # populate needs the victim back first.  Do what an operator would --
+    # add the (wiped) disk as the replacement, let the copy-from-spare
+    # rebalance put its content back and retire the assignment -- then the
+    # populate below starts from the same healthy state Test 7 did.
+    if [ "$dcl" = 1 ] && [ -n "$load" ] && ! is_member "$victim"; then
+        sudo "$MDADM" --zero-superblock "$victim" 2>/dev/null || true
+        sudo dd if=/dev/zero of="$victim" bs=1M count=64 status=none
+        local cb ok=0
+        if sudo "$MDADM" --add "$TARGET" "$victim" >/dev/null; then
+            for cb in $(seq 6000); do
+                if [ "$(cat "/sys/block/$md/md/rk_dcl_populate" 2>/dev/null)" = none ] &&
+                    [ "$(cat "/sys/block/$md/md/degraded" 2>/dev/null)" = 0 ]; then
+                    ok=1; break
+                fi
+                sleep 0.3
+            done
+        fi
+        if [ "$ok" = 0 ]; then
+            echo "  7L: copy-back of $victim did not finish — skipping $load" >&2
+            echo "$omax" | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+            echo "$omin" | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null
+            return 1
+        fi
+        while [ "$(cat "/sys/block/$md/md/sync_action" 2>/dev/null)" != idle ]; do sleep 0.5; done
+    fi
+
     local t0 t1 c0 c1 json
     if [ -n "$load" ]; then
         json="$OUTPUT/test7L_${load}_rebuild.json"
@@ -370,10 +397,12 @@ rebuild_test() {
     fi
     is_member "$victim" && fail_remove "$victim"
     LOAD_PID=
+    ROWENG=
     if [ "$dcl" = 1 ]; then
         [ -n "$DCL_SLOT" ] || { echo "warning: declustered victim slot unknown — skipping rebuild test" >&2; return 1; }
         t0=$(date +%s.%N); c0=$(cpu_snap)
         echo "$DCL_SLOT" | sudo tee "/sys/block/$md/md/rk_dcl_populate" >/dev/null
+        [ -n "$load" ] && load_fio "$load" "$OUTPUT/test7L_${load}_load.json"
         while :; do
             case "$(cat "/sys/block/$md/md/rk_dcl_populate" 2>/dev/null)" in
                 populated*) break ;;
@@ -381,6 +410,14 @@ rebuild_test() {
             sleep 0.3
         done
         t1=$(date +%s.%N); c1=$(cpu_snap)
+        # rk_dcl_row_rebuild: the row engine's rows and declines this
+        # populate (the counters are cumulative per array)
+        local rr rd
+        read -r rr rd < <(awk '/^row rows/ {print $3, $5}' "/sys/block/$md/md/rk_dcl_populate")
+        if [ -n "${rr:-}" ]; then
+            ROWENG="$((rr - ${DCL_ROWS_PREV% *})) $((rd - ${DCL_ROWS_PREV#* }))"
+            DCL_ROWS_PREV="$rr $rd"
+        fi
     else
         sudo "$MDADM" --zero-superblock "$victim" 2>/dev/null || true
         sudo dd if=/dev/zero of="$victim" bs=1M count=64 status=none
@@ -423,6 +460,7 @@ rebuild_test() {
     mibps=$(python3 -c "print(f'{$vmib/($t1-$t0):.0f}')" 2>/dev/null || echo '?')
     cores=$(busy_cores "$c0" "$c1")
     [ "$dcl" = 1 ] && kind="declustered populate" || kind="classic recover"
+    [ -n "$ROWENG" ] && kind+=", row engine ${ROWENG% *} rows / ${ROWENG#* } declined"
     if [ -n "$load" ]; then
         read -r lmib liops < <(python3 -c '
 import json, sys
@@ -440,8 +478,10 @@ except Exception:
         printf "  7: %ss  (%s of %d MiB member, %s MiB/s, %s busy cores)\n" "$secs" "$kind" "$vmib" "$mibps" "$cores"
         REBUILD_SECS=$secs
     fi
-    printf '{"kind": "%s", "load": "%s", "member_mib": %d, "secs": %s, "mibps": %s, "busy_cores": %s, "load_mibps": %s, "load_iops": %s}\n' \
+    printf '{"kind": "%s", "load": "%s", "member_mib": %d, "secs": %s, "mibps": %s, "busy_cores": %s, "load_mibps": %s, "load_iops": %s, "row_rows": %s, "row_declined": %s}\n' \
         "$kind" "${load:-none}" "$vmib" "$secs" "${mibps/\?/null}" "$cores" "${lmib:-null}" "${liops:-null}" \
+        "$([ -n "$ROWENG" ] && echo "${ROWENG% *}" || echo null)" \
+        "$([ -n "$ROWENG" ] && echo "${ROWENG#* }" || echo null)" \
         | sed 's/: ?,/: null,/g; s/: ?}/: null}/' > "$json"
 }
 
