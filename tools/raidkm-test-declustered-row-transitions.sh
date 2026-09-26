@@ -26,7 +26,9 @@
 #       that exact condition -- 0 hits in 6 runs.  raid5_quiesce() waits for
 #       the active_aligned_reads reference a row read holds, so an in-flight
 #       read holds the arm off instead.  See raidkm_row_dcl_steady().)
-#   T4  after the copy: data correct, scrub clean, no WARN/BUG.
+#   T4  the copy COMPLETES -- decoding the rows whose source is T2's failed
+#       member rather than abandoning the copy for a decode rebuild -- and
+#       then: data correct, scrub clean, no WARN/BUG.
 #   T5  TWO assignments POPULATED at once: reads correct and scrub clean with
 #       chained redirects live, AND the accounting property behind it -- a
 #       populated assignment restores the data but leaves the slot empty, so
@@ -45,6 +47,10 @@ set -u
 
 N=${DCL_N:-14}; G=${DCL_G:-6}; M=${DCL_M:-2}; SC=${DCL_SC:-2}; NBASE=${DCL_NBASE:-16}
 SEED=${DCL_SEED:-0x10}
+# DCL_CSUM=1 creates the array with native checksums: the copy then verifies
+# the survivors it decodes a dead-source row from, and the decode result
+# against the CRCs the row was written with
+CSUM_OPT=; [ "${DCL_CSUM:-0}" = 1 ] && CSUM_OPT=--checksum
 FIO_OFF=${FIO_OFF:-$((64 * 1024 * 1024))}
 FIO_SZ=${FIO_SZ:-$((48 * 1024 * 1024))}
 VICTIM=${DCL_VICTIM:-3}		# populated into the spare
@@ -105,7 +111,7 @@ done
 rk_dmesg_clear
 sudo "$MDADM" --create "$MD" --level=raidkm --parity-count=$M \
 	--layout=declustered --group-width=$G --spare-columns=$SC \
-	--dcl-nbase=$NBASE --dcl-seed=$SEED --chunk="$CHUNK_KB" \
+	--dcl-nbase=$NBASE --dcl-seed=$SEED --chunk="$CHUNK_KB" $CSUM_OPT \
 	--raid-devices=$N "${MEMBERS[@]}" --run --force > /dev/null 2>&1 &&
    grep -q "$MDNAME : active raidkm" /proc/mdstat ||
 	{ rk_fail "create/activate failed"; rk_summary; exit 1; }
@@ -224,6 +230,18 @@ echo 2000000 | sudo tee "/sys/block/$MDNAME/md/sync_speed_max" > /dev/null 2>&1
 # ---- T4: settle, verify, scrub ------------------------------------------------
 echo "=== T4: the copy completes and the data is intact ==="
 rk_wait_idle
+# The copy must COMPLETE, not fall back to the decode rebuild: until the copy
+# decoded rows whose source is gone, T2's failed $SDEV hosted X's content in
+# some rows, every copy aborted in its first band, and T3 passed on a
+# rebuild that happened to keep the row path quiet.  Some of those rows are
+# the ones decoded here, so the count must be nonzero too.
+done_line=$(sudo dmesg | grep "copy of disk $VICTIM COMPLETE" | tail -1)
+ndec=$(sed -n 's/.*(\([0-9]*\) row(s) decoded.*/\1/p' <<< "$done_line")
+if [ -n "$done_line" ] && [ "${ndec:-0}" -gt 0 ]; then
+	rk_pass "T4: the copy completed ($ndec row(s) decoded around the failed $SDEV)"
+else
+	rk_fail "T4: the copy did not complete with decoded rows: $(sudo dmesg | grep -iE 'declustered:.*(copy|retired)' | tail -1)"
+fi
 sudo "$MDADM" --re-add "$MD" "$SDEV" > /dev/null 2>&1 || \
 	sudo "$MDADM" --add "$MD" "$SDEV" > /dev/null 2>&1 || true
 rk_wait_full

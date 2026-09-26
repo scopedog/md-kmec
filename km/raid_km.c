@@ -15756,6 +15756,13 @@ static void raidkm_dcl_rescue_worker(struct work_struct *work)
  * dance); md advances curr_resync + R's recovery_offset so spare_active marks
  * R In_sync at the end.
  *
+ * A row whose chain endpoint is gone (a second member failed while X was
+ * POPULATED, and it hosts X's content in this row) or does not read is
+ * DECODED from its group (raidkm_dcl_copy_decode) and the copy goes on: the
+ * array still has the redundancy to do that, and abandoning the whole copy
+ * for it would throw every other row's cheap copy away for a full decode
+ * rebuild.  Only a row that neither reads nor decodes aborts the band.
+ *
  * PARALLEL: the band's chunk-copies are pulled off an atomic row cursor by a
  * small pool of unbound workers, each doing blocking sync_page_io read+write
  * on its own chunk buffer — queue depth == pool size with none of the
@@ -15848,6 +15855,139 @@ static int raidkm_dcl_copy_src(struct r5conf *conf, u64 row, int X)
 	return src;
 }
 
+/* Scratch for decoding copy rows whose source is gone: k chunk buffers and a
+ * row-read descriptor, built on the first such row and kept for the rest of
+ * the worker's band (most bands never need it). */
+struct rkdcl_copy_dec {
+	struct raidkm_row_read	*rr;
+	struct page		**pg;
+	int			k, order;
+};
+
+static void raidkm_dcl_copy_dec_free(struct rkdcl_copy_dec *dec)
+{
+	int i;
+
+	if (dec->pg)
+		for (i = 0; i < dec->k; i++)
+			if (dec->pg[i])
+				__free_pages(dec->pg[i], dec->order);
+	kfree(dec->pg);
+	kfree(dec->rr);
+	memset(dec, 0, sizeof(*dec));
+}
+
+static int raidkm_dcl_copy_dec_get(struct rkdcl_copy_dec *dec, int k, int order)
+{
+	int i;
+
+	if (dec->rr)
+		return 0;
+	/* GFP_NOIO: the band runs with the array quiesced, so reclaim must
+	 * not write back through it */
+	dec->rr = kzalloc(struct_size(dec->rr, src, k), GFP_NOIO);
+	dec->pg = kcalloc(k, sizeof(*dec->pg), GFP_NOIO);
+	dec->k = k;
+	dec->order = order;
+	if (!dec->rr || !dec->pg)
+		goto fail;
+	for (i = 0; i < k; i++) {
+		dec->pg[i] = alloc_pages(GFP_NOIO | __GFP_NOWARN, order);
+		if (!dec->pg[i])
+			goto fail;
+	}
+	return 0;
+fail:
+	raidkm_dcl_copy_dec_free(dec);
+	return -ENOMEM;
+}
+
+/*
+ * A copy row whose source -- the live endpoint of X's chain -- is gone: a
+ * second failure landed on the disk hosting that content, or its read failed.
+ * The content is still in its group's parity, so decode it from k surviving
+ * columns into @out instead of abandoning the copy: R ends up byte-identical
+ * either way.  Sources are picked the way raidkm_dcl_rebuild_chunk() picks
+ * them (slot order, data rows only for a parity target).  With native
+ * checksums the survivors are verified before the decode and the result
+ * after it, against the CRCs recorded for @sd -- the bytes R is meant to
+ * receive.  0 = @len bytes in @out; nonzero = the band must abort.
+ */
+static int raidkm_dcl_copy_decode(struct r5conf *conf,
+				  struct rkdcl_copy_dec *dec, u64 row, int X,
+				  int sd, void *out, unsigned int len)
+{
+	struct dcl_geom *ge = conf->dcl;
+	int k = (int)ge->k, g = (int)ge->g;
+	sector_t asect = row * conf->chunk_sectors;
+	unsigned int clen = round_down(len, RAID5_STRIPE_SIZE(conf));
+	struct raidkm_row_read *rr;
+	int root, group, tslot, i, nsrc = 0, err;
+
+	root = raidkm_dcl_chain_root(conf, row, X);
+	if (root < 0)
+		return -EIO;
+	err = raidkm_dcl_copy_dec_get(dec, k,
+				      get_order(conf->chunk_sectors << 9));
+	if (err)
+		return err;
+	group = root / g;
+	tslot = root % g;
+
+	rr = dec->rr;
+	rr->k = k;
+	rr->m = (int)ge->m;
+	rr->target = tslot;
+	rr->asect = asect;
+	rr->len = len;
+	rr->out_addr = out;
+
+	for (i = 0; i < g && nsrc < k; i++) {
+		struct md_rdev *rdev;
+		bool ok;
+		int disk;
+
+		if (i == tslot)
+			continue;
+		if (tslot >= k && i >= k)
+			continue;	/* parity target: data rows only */
+		disk = raidkm_dcl_redirect(conf,
+					   dcl_disk(ge, row, (u32)(group * g + i)),
+					   row, false);
+		if (disk < 0 || disk >= conf->raid_disks || disk == X ||
+		    disk == sd)
+			continue;
+		rdev = conf->disks[disk].rdev;
+		if (!rdev || test_bit(Faulty, &rdev->flags) ||
+		    !test_bit(In_sync, &rdev->flags) ||
+		    rdev_has_badblock(rdev, asect, len >> 9))
+			continue;
+		atomic_inc(&rdev->nr_pending);
+		ok = sync_page_io(rdev, asect, len, dec->pg[nsrc],
+				  REQ_OP_READ, false);
+		rdev_dec_pending(rdev, conf->mddev);
+		if (!ok)
+			continue;	/* another column may still serve */
+		rr->src[nsrc].row = i;
+		rr->src[nsrc].member = disk;
+		rr->src[nsrc].addr = page_address(dec->pg[nsrc]);
+		nsrc++;
+	}
+	if (nsrc < k)
+		return -EIO;		/* more than m of the group gone */
+
+	for (i = 0; i < k; i++) {
+		err = raidkm_row_csum_check(conf, rr->src[i].member, asect,
+					    rr->src[i].addr, clen);
+		if (err)
+			return err;
+	}
+	err = raidkm_row_decode(rr);
+	if (err)
+		return err;
+	return raidkm_row_csum_check(conf, sd, asect, out, clen);
+}
+
 struct rkdcl_copy_worker {
 	struct work_struct	work;
 	struct rkdcl_copy_band	*band;
@@ -15861,6 +16001,7 @@ static void raidkm_dcl_copy_worker(struct work_struct *work)
 	struct rkdcl_copy_band *b = w->band;
 	struct r5conf *conf = b->conf;
 	unsigned int chunk_bytes = conf->chunk_sectors << 9;
+	struct rkdcl_copy_dec dec = {};
 
 	while (!atomic_read(&b->error)) {
 		u64 row = (u64)atomic64_fetch_inc(&b->next_row);
@@ -15879,23 +16020,30 @@ static void raidkm_dcl_copy_worker(struct work_struct *work)
 			break;
 		}
 		rsrc = conf->disks[sd].rdev;
-		if (!rsrc || test_bit(Faulty, &rsrc->flags)) {
-			/* copy source lost (second failure on the chain
-			 * endpoint for this row): abort the band; the array
-			 * runs POPULATED-degraded and the copy resumes once
-			 * the failure is handled */
-			atomic_set(&b->error, 1);
-			break;
+		/* read the source chunk -- or, when the source is gone (a
+		 * second failure on this row's chain endpoint) or its read
+		 * fails, decode it from the group -- then write it to R
+		 * (data-relative) */
+		if (!rsrc || test_bit(Faulty, &rsrc->flags) ||
+		    !sync_page_io(rsrc, row * conf->chunk_sectors, chunk_bytes,
+				  w->pg, REQ_OP_READ, false)) {
+			if (raidkm_dcl_copy_decode(conf, &dec, row, b->X, sd,
+						   page_address(w->pg),
+						   chunk_bytes)) {
+				pr_warn("md/raid:%s: declustered: copy row %llu: source disk %d is gone and the row does not decode\n",
+					mdname(conf->mddev),
+					(unsigned long long)row, sd);
+				atomic_set(&b->error, 1);
+				break;
+			}
+			atomic64_inc(&conf->reb_copy_decoded);
 		}
-		/* read the source chunk, write it to R (data-relative) */
-		if (!sync_page_io(rsrc, row * conf->chunk_sectors, chunk_bytes,
-				  w->pg, REQ_OP_READ, false) ||
-		    !sync_page_io(b->rdst, row * conf->chunk_sectors,
+		if (!sync_page_io(b->rdst, row * conf->chunk_sectors,
 				  chunk_bytes, w->pg,
 				  REQ_OP_WRITE | REQ_SYNC, false)) {
-			pr_warn("md/raid:%s: declustered: copy I/O error at row %llu (source disk %d -> replacement %d)\n",
+			pr_warn("md/raid:%s: declustered: copy write error at row %llu (replacement %d)\n",
 				mdname(conf->mddev),
-				(unsigned long long)row, sd, b->X);
+				(unsigned long long)row, b->X);
 			atomic_set(&b->error, 1);
 			break;
 		}
@@ -15903,6 +16051,7 @@ static void raidkm_dcl_copy_worker(struct work_struct *work)
 		raidkm_dcl_csum_migrate(conf, row, conf->chunk_sectors,
 					sd, b->X);
 	}
+	raidkm_dcl_copy_dec_free(&dec);
 }
 
 static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
@@ -16030,11 +16179,22 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 			atomic_set(&band.error, 1);
 		if (sd >= 0) {
 			struct md_rdev *rsrc = conf->disks[sd].rdev;
+			struct rkdcl_copy_dec dec = {};
+			bool got = true;
 
+			/* the workers' read-or-decode, for the clamped row */
 			if (!rsrc || test_bit(Faulty, &rsrc->flags) ||
 			    !sync_page_io(rsrc, row * conf->chunk_sectors,
 					  tail_bytes, wk[0].pg,
-					  REQ_OP_READ, false) ||
+					  REQ_OP_READ, false)) {
+				got = !raidkm_dcl_copy_decode(conf, &dec, row,
+						X, sd, page_address(wk[0].pg),
+						tail_bytes);
+				if (got)
+					atomic64_inc(&conf->reb_copy_decoded);
+				raidkm_dcl_copy_dec_free(&dec);
+			}
+			if (!got ||
 			    !sync_page_io(rdst, row * conf->chunk_sectors,
 					  tail_bytes, wk[0].pg,
 					  REQ_OP_WRITE | REQ_SYNC, false)) {
@@ -16071,8 +16231,9 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 	for (i = 0; i < nwk; i++)
 		__free_pages(wk[i].pg, order);
 	if (atomic_read(&band.error)) {
-		/* persistent copy failure (dead source disk, I/O error,
-		 * journal failure): fall back to the decode leg — retire
+		/* persistent copy failure (a row that neither reads nor
+		 * decodes, a write error on R, journal failure): fall back
+		 * to the decode leg — retire
 		 * (journal failure there keeps COPYING for raid5d's rescue
 		 * to retry; either way no progress is claimed).  Retire-ALL,
 		 * not one: R survives with a partial copy, and the decode
@@ -16229,8 +16390,9 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 			    mark >= mddev->dev_sectors && rd >= 0) {
 				if (!raidkm_dcl_retire_one(mddev, rd,
 							   "copy complete"))
-					pr_info("md/raid:%s: declustered: copy of disk %d COMPLETE — replacement rebuilt\n",
-						mdname(mddev), rd);
+					pr_info("md/raid:%s: declustered: copy of disk %d COMPLETE — replacement rebuilt (%lld row(s) decoded: source gone)\n",
+						mdname(mddev), rd,
+						(long long)atomic64_read(&conf->reb_copy_decoded));
 			} else {
 				raidkm_dcl_journal_write(conf, false);
 			}
@@ -20734,6 +20896,7 @@ out:
 			conf->reb_journal_mark = 0;
 			conf->reb[idx].state = RKDCL_ASSIGN_COPYING;
 			WRITE_ONCE(conf->reb_pop, idx);
+			atomic64_set(&conf->reb_copy_decoded, 0);
 			jerr = raidkm_dcl_journal_write(conf, true);
 			if (jerr) {
 				/* full rollback, marks included: POPULATED

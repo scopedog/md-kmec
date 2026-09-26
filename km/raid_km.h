@@ -1087,6 +1087,9 @@ struct r5conf {
 						 * when the prefix advances	*/
 	atomic64_t		reb_win_waits;	/* admissions that had to wait,
 						 * this population (sysfs)	*/
+	atomic64_t		reb_copy_decoded; /* copy rows decoded because
+						 * their source was gone, this
+						 * copy (logged at COMPLETE)	*/
 	u64			reb_fail_sector; /* last address population could not
 						 * reconstruct (sysfs); U64_MAX: none */
 	bool			reb_pop_stuck;	/* population paused by it: raid5d
