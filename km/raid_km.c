@@ -16779,6 +16779,21 @@ static void raid5_do_work(struct work_struct *work)
  */
 static int raidkm_dcl_arm(struct mddev *mddev, unsigned int x);
 
+/* Stock recovery has a device to rebuild onto: a usable member that is
+ * not In_sync -- an unslotted spare, a slotted member mid-recovery, or a
+ * hot-replace target.  Caller holds mddev lock (rdev list). */
+static bool raidkm_dcl_recovery_target(struct mddev *mddev)
+{
+	struct md_rdev *rdev;
+
+	rdev_for_each(rdev, mddev)
+		if (!test_bit(Faulty, &rdev->flags) &&
+		    !test_bit(Journal, &rdev->flags) &&
+		    !test_bit(In_sync, &rdev->flags))
+			return true;
+	return false;
+}
+
 static void raid5d(struct md_thread *thread)
 {
 	struct mddev *mddev = thread->mddev;
@@ -16843,9 +16858,15 @@ static void raid5d(struct md_thread *thread)
 		for (di = 0; di < conf->raid_disks && conf->reb_want < 0;
 		     di++) {
 			struct md_rdev *rdev = conf->disks[di].rdev;
+			struct md_rdev *rep = conf->disks[di].replacement;
 
 			if (rdev && !test_bit(Faulty, &rdev->flags))
 				continue;	/* member alive */
+			/* a completed hot replace leaves the old rdev Faulty
+			 * here until remove_and_add_spares swaps the In_sync
+			 * replacement in: the slot is healthy, not missing */
+			if (rep && !test_bit(Faulty, &rep->flags))
+				continue;
 			for (ai = 0; ai < conf->nreb; ai++)
 				if (conf->reb[ai].disk == di)
 					break;
@@ -16869,6 +16890,18 @@ static void raid5d(struct md_thread *thread)
 
 		if (conf->nreb >= (int)conf->dcl->s) {
 			conf->reb_want = -1;	/* table full */
+		} else if (raidkm_dcl_recovery_target(mddev)) {
+			/* md's stock recovery has a device to rebuild onto (a
+			 * spare, or a member already slotted and recovering).
+			 * Arming now livelocks: the §13 guard in
+			 * raid5_sync_request retires every live assignment
+			 * when that recovery (re)starts and interrupts it, and
+			 * the rescan re-arms the next uncovered slot (found by
+			 * the chaos harness: dcl m=3 at degraded 3 with spares,
+			 * ~8 arm/retire/interrupt cycles a second, recovery
+			 * never finishing).  Drop the want; the rescan re-parks
+			 * it once every usable member is In_sync. */
+			conf->reb_want = -1;
 		} else if (conf->reb_pop < 0 &&
 			   !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
 			int err = raidkm_dcl_arm(mddev, x);
@@ -17351,6 +17384,15 @@ static int raidkm_dcl_arm(struct mddev *mddev, unsigned int x)
 	rdev = conf->disks[x].rdev;
 	if (rdev && !test_bit(Faulty, &rdev->flags))
 		return -EINVAL;	/* member is alive */
+	/* ... or served by its replacement: after a completed hot replace
+	 * the old rdev is Faulty while the In_sync replacement still sits in
+	 * .replacement.  Arming then redirected a HEALTHY slot's I/O to the
+	 * spare column mid-swap and lost durable writes (chaos harness, dcl
+	 * m=4; a plain mdadm --replace with rk_dcl_auto=1 reproduces it every
+	 * time, any m). */
+	rdev = conf->disks[x].replacement;
+	if (rdev && !test_bit(Faulty, &rdev->flags))
+		return -EINVAL;
 
 	/* first spare column not used by an active assignment */
 	for (j = 0; j < (int)conf->dcl->s; j++) {
