@@ -17,8 +17,10 @@
 #   smoke   ~25 min.  The row layer (degraded read once per row, native
 #           checksum through the row paths), declustered population to
 #           completion, rebuild onto a spare and hot-replace (through the row
-#           layer, the default), full-row writes (row-write), plus the
-#           functional and degraded smoke.  Meant for every CI run.
+#           layer, the default), full-row writes (row-write), resync and
+#           check through the row layer (row-sync), sysfs tunings that must
+#           not suspend the array (tunables), plus the functional and
+#           degraded smoke.  Meant for every CI run.
 #   quick   smoke + the same rebuilds on the 4 KiB stripe path
 #           (replace@default_row_rebuild=0), declustered population, and the
 #           functional, degraded and replace suites again with full-row writes
@@ -78,7 +80,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window
        declustered-populate-window@default_dcl_row_rebuild=0 declustered-degraded replace
        scrub-badblocks degraded-trust-disk row-rebuild-load wide-row row-write
-       row-sync)
+       row-sync tunables)
 # <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.

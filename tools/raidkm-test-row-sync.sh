@@ -123,17 +123,11 @@ setup() {
 }
 # run <check|repair|resync> <engine>: one pass, echo mismatch_cnt
 run() {
-	local i
 	knob rk_row_sync "$2"
 	echo "$1" > "$(SYS sync_action)"
-	# md starts the pass from its own thread: see it running before
-	# waiting for it to end, or a late start would hand back the previous
-	# pass's mismatch_cnt as this one's
-	for i in $(seq 1 100); do
-		[ "$(cat "$(SYS sync_action)")" != idle ] && break
-		sleep 0.05
-	done
-	rk_wait_idle
+	# md starts the pass from its own thread, which on a busy array can be
+	# later than a look at /proc/mdstat: wait on sync_action
+	rk_wait_pass
 	cat "$(SYS mismatch_cnt)"
 }
 reassemble() {	# stop and assemble: nothing stays cached, the array is clean
@@ -448,7 +442,12 @@ if setup 2r 10 0; then
 		BGPID=$!
 		sleep 1
 		a=$(run repair 1)
+		# fio runs 8 s, the repair a fraction of that here: one still
+		# running when fio ended ran, at least in part, without the writes
+		kill -0 "$BGPID" 2>/dev/null && under=1 || under=0
 		wait "$BGPID"; BGPID=
+		[ "$under" = 1 ] ||
+			rk_skip_check "T7: the repair outlasted the writes: part of it ran without them"
 		b=$(run check 0)
 		if [ "$a" = $(( nrot * 8 )) ] && [ "$b" = 0 ]; then
 			rk_pass "T7: row repair under writes fixed $nrot blocks (mismatch_cnt $a); the stripe cache's check finds 0"

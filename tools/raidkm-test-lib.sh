@@ -364,10 +364,28 @@ rk_readback() {
 	[ "$(md5sum "$RK_TMP/rd" | cut -d' ' -f1)" = "$RK_SRC_MD5" ]
 }
 
+# Wait for the pass just started through sync_action to end.  sync_action
+# reads the pass from the write on (md sets RUNNING before it clears NEEDED,
+# and clears RUNNING only when it reaps the finished pass, mismatch_cnt final),
+# but /proc/mdstat shows the pass only once md's thread has started it, which
+# on a busy array can come after rk_wait_idle's first look: rk_wait_idle alone
+# then returns at once, and the caller reads the mismatch_cnt of a pass that
+# has not run yet.
+rk_wait_pass() {
+	local i
+	for i in $(seq 1 2400); do
+		case $(cat "/sys/block/$MDNAME/md/sync_action" 2>/dev/null) in
+		check|repair|resync|recover|reshape) sleep 0.25 ;;
+		*) break ;;
+		esac
+	done
+	rk_wait_idle
+}
+
 # Run a parity scrub and echo the resulting mismatch_cnt.
 rk_scrub() {
 	echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
-	rk_wait_idle
+	rk_wait_pass
 	cat "/sys/block/$MDNAME/md/mismatch_cnt"
 }
 

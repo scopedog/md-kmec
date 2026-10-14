@@ -17797,6 +17797,47 @@ raid5_rmw_level = __ATTR(rmw_level, S_IRUGO | S_IWUSR,
 			 raid5_show_rmw_level,
 			 raid5_store_rmw_level);
 
+/*
+ * The tunings whose store suspends the array (stripe_size, skip_copy,
+ * group_thread_cnt, worker_thread_cnt) answer a write of the value they
+ * already have before the suspend.  (consistency_policy is not one: a write of
+ * the current policy is refused, -EINVAL, as in stock raid5.)  Tuning tools rewrite every value on
+ * every md change uevent (mdadm --readwrite, a writer closing the device), and
+ * each suspend would drain the array's I/O for nothing.  Read as the show
+ * functions read it; the store compares again under the reconfig mutex, so a
+ * change racing with this one still lands.
+ */
+enum raid5_tunable {
+	R5T_STRIPE_SIZE,
+	R5T_SKIP_COPY,
+	R5T_WORKER_CNT_PER_GROUP,
+};
+
+static bool raid5_tunable_is(struct mddev *mddev, enum raid5_tunable t,
+			     unsigned long val)
+{
+	struct r5conf *conf;
+	bool same = false;
+
+	spin_lock(&mddev->lock);
+	conf = mddev->private;
+	if (conf) {
+		switch (t) {
+		case R5T_STRIPE_SIZE:
+			same = val == RAID5_STRIPE_SIZE(conf);
+			break;
+		case R5T_SKIP_COPY:
+			same = val == conf->skip_copy;
+			break;
+		case R5T_WORKER_CNT_PER_GROUP:
+			same = val == conf->worker_cnt_per_group;
+			break;
+		}
+	}
+	spin_unlock(&mddev->lock);
+	return same;
+}
+
 static ssize_t
 raid5_show_stripe_size(struct mddev  *mddev, char *page)
 {
@@ -17834,6 +17875,8 @@ raid5_store_stripe_size(struct mddev  *mddev, const char *page, size_t len)
 			new > PAGE_SIZE || new == 0 ||
 			new != roundup_pow_of_two(new))
 		return -EINVAL;
+	if (raid5_tunable_is(mddev, R5T_STRIPE_SIZE, new))
+		return len;
 
 	err = mddev_suspend_and_lock(mddev);
 	if (err)
@@ -17958,6 +18001,8 @@ raid5_store_skip_copy(struct mddev *mddev, const char *page, size_t len)
 	if (kstrtoul(page, 10, &new))
 		return -EINVAL;
 	new = !!new;
+	if (raid5_tunable_is(mddev, R5T_SKIP_COPY, new))
+		return len;
 
 	err = mddev_suspend_and_lock(mddev);
 	if (err)
@@ -18463,6 +18508,8 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	/* 8192 should be big enough */
 	if (new > 8192)
 		return -EINVAL;
+	if (raid5_tunable_is(mddev, R5T_WORKER_CNT_PER_GROUP, new))
+		return len;
 
 	err = mddev_suspend_and_lock(mddev);
 	if (err)
@@ -18576,15 +18623,6 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	if (new_total > 8192)
 		return -EINVAL;
 
-	err = mddev_suspend_and_lock(mddev);
-	if (err)
-		return err;
-	conf = mddev->private;
-	if (!conf) {
-		err = -ENODEV;
-		goto out;
-	}
-
 	nodes = num_possible_nodes();
 	/* Defensive: a running kernel always has node 0 in the possible map,
 	 * but a broken invariant upstream shouldn't OOPS us with a div-by-0. */
@@ -18595,6 +18633,17 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	else
 		/* round up so total >= requested */
 		new_per_group = (new_total + nodes - 1) / nodes;
+	if (raid5_tunable_is(mddev, R5T_WORKER_CNT_PER_GROUP, new_per_group))
+		return len;
+
+	err = mddev_suspend_and_lock(mddev);
+	if (err)
+		return err;
+	conf = mddev->private;
+	if (!conf) {
+		err = -ENODEV;
+		goto out;
+	}
 
 	if (new_per_group != conf->worker_cnt_per_group) {
 		old_groups = conf->worker_groups;
