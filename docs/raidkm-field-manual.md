@@ -883,6 +883,28 @@ Rebuild onto a spare no longer is:
   under foreground I/O costs that one chunk only: the next chunk boundary
   tries the row path again (on earlier builds the first such chunk
   could keep the rest of the pass on the 4 KiB stripe path).
+- `rk_row_sync` (**off by default**) does the same for the other full passes
+  over a healthy array — the initial sync, a resync after an unclean stop,
+  `check` and `repair`: one 128 KiB read per member and row instead of
+  ~6 KiB stripe reads, and a parity chunk that differs is rewritten whole.
+  On the rig a `check` runs at 2,367–2,435 MiB/s per member against 437–450
+  on the stripe path, at a fifth of the CPU per GiB/s (4-vCPU guest, 100 µs
+  member latency, both CPU-bound); on 8+2 GCP local NVMe, where the devices
+  set the limit, 625–675 against 267–268 MiB/s per member (a 96 GiB member in
+  156 s instead of 357 s) and an initial sync at 374–389 against 166–191,
+  on 1.3 busy cores instead of 5.5–5.8. Under foreground load it leaves a
+  4 KiB random writer 10–25% more IOPS at a lower p99 than the stripe-path
+  check while checking a third faster; against a sequential write load it
+  takes the larger share unless `sync_speed_max` holds it back, and then
+  leaves the writer more than the stripe-path check does. `mismatch_cnt`, the bitmap, `sync_min` /
+  `sync_max` and the sync speed limits behave as before.
+  `echo 1 > /sys/block/mdX/md/rk_row_sync` enables it for one array, also
+  under a running pass; `default_row_sync=1` enables it for arrays created or
+  assembled afterwards, which is how an initial sync gets it. Classic layouts
+  with every member present only; a degraded or declustered array, a log or
+  PPL, and any row with foreground I/O in flight, a read error or a bad block
+  keep the stripe path. `sync_done + sync_stripe_chunks` in `rk_row_stats`
+  accounts for a pass that ran with it on throughout.
 - `rk_row_rebuild_workers` (**16**, 1..64, live; 8 until 2026-09, when 16 rebuilt
   a third faster on an X4000 at no foreground cost) is how many rows rebuild at
   once — never more than the stripe cache holds, since a row in flight takes all

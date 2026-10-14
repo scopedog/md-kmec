@@ -577,11 +577,17 @@ enum {
 	STRIPE_R5C_PREFLUSH,	/* need to flush journal device */
 	STRIPE_ROW_GUARD,	/* row layer: this ops_run_io call holds a
 				 * guard on the stripe's row write count */
-	STRIPE_ROW_SYNC,	/* row layer: a row rebuild owns this stripe's
+	STRIPE_ROW_SYNC,	/* row layer: a row rebuild or a row
+				 * resync/check owns this stripe's
 				 * chunk — new writes bounce on R5_Overlap
-				 * until it clears (raidkm_row_rebuild_chunk);
+				 * until it clears (raidkm_row_rebuild_chunk,
+				 * raidkm_row_sync_chunk);
 				 * with native csum on, reads bounce too, so
 				 * no verify-driven heal can start under it */
+	STRIPE_ROW_SYNC_RD,	/* row layer: the owner of STRIPE_ROW_SYNC is a
+				 * resync/check (raidkm_row_sync_chunk), which
+				 * may rewrite the parity under the cache: reads
+				 * bounce too, whatever the checksum setting */
 };
 
 #define STRIPE_EXPAND_SYNC_FLAGS \
@@ -1235,6 +1241,25 @@ struct r5conf {
 						 * preread token it had lost */
 	atomic64_t		overlap_slow;	/* R5_Overlap waits past the
 						 * diagnostic timeout */
+	/*
+	 * Row-layer resync and check (raid_km.c raidkm_row_sync_chunk): sysfs
+	 * rk_row_sync and its counters in rk_row_stats.  Cold: read once per
+	 * sync step, written once per chunk.
+	 */
+	int			row_sync;	/* sysfs rk_row_sync */
+	atomic64_t		row_sync_done;	/* rows checked as one chunk per member */
+	atomic64_t		row_sync_declined; /* rows left to the stripe cache */
+	atomic64_t		row_sync_csum_bad; /* native csum rejected it: stripe cache */
+	atomic64_t		row_sync_stripe_chunks; /* chunks md then synced through
+						 * the stripe cache */
+	atomic64_t		row_sync_mismatch_blocks; /* stripe-size blocks whose
+						 * parity did not match */
+	atomic64_t		row_sync_parity_writes; /* parity chunks rewritten */
+	/* the bitmap look-ahead of a row pass (raidkm_row_bitmap_run_end);
+	 * md's sync thread only */
+	sector_t		row_bm_from;	/* [from, to) is dirty ... */
+	sector_t		row_bm_to;
+	bool			row_bm_clean;	/* ... and a clean region starts at to */
 };
 
 /*

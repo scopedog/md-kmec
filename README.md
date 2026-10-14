@@ -467,6 +467,7 @@ chunk, 1 MiB sequential I/O; the rig reproduces an NVMe-oF QLC array's table):
 | full-row writes, **m ≥ 3** | **127 KiB** (`rk_batch_mparity`, on by default; ~5 KiB with it off) |
 | degraded reads (classic / declustered) | **128 KiB** (`rk_row_dread`, on by default) |
 | rebuild onto a spare: survivor reads / spare writes | **128 KiB / 128 KiB** (`rk_row_rebuild`, on by default; ~5 / ~7 KiB with it off) |
+| resync, check, repair of a healthy array: member reads / parity rewrites | ~6 KiB / ~5 KiB; **128 KiB / 128 KiB** with `rk_row_sync=1` (off by default) |
 | declustered population: survivor reads / spare-column writes | ~5.5 / ~8 KiB (a population-completion bug is fixed; see below) |
 | declustered copy back to a replacement | ~128 KiB |
 
@@ -590,6 +591,86 @@ the last set built, `rebuild_band_nomem` counts bands that found none (a failed
 build is retried a second later), and `rebuild_unclaimed` counts rows finished
 past a declined row in their band, which are rebuilt again.  The
 module parameter `debug_row_rebuild_pages=Y` forces the page form (testing).
+
+**`rk_row_sync` — resync, check and repair a whole row at a time (off by
+default).**  The other full passes over an array — the initial sync, a resync
+after an unclean stop, `check` and `repair` — otherwise run through the stripe
+cache like the rebuild used to: 32 stripe heads per 128 KiB chunk, each reading
+every member 4 KiB at a time.  With `rk_row_sync=1` a pass over a healthy
+array owns one chunk-aligned row at a time as the row rebuild does, reads it
+as one chunk-sized request per member (k + m of them), encodes once and
+compares the parity on disk with the parity computed.  A `check` counts what
+differs; a `repair` or a resync rewrites each parity chunk that differs, whole.
+`mismatch_cnt` keeps its meaning and its unit (one 4 KiB stripe whose parity
+differs adds 8 sectors), a write-intent bitmap is honoured and cleared as on
+the stripe path, and `sync_min`, `sync_max`, `sync_speed_min/max`, `idle` and
+`frozen` work as before.  Measured on the rig (8+2, 128 KiB chunk, 100 µs
+member latency, a 4-vCPU guest, both arms CPU-bound; `check` of a consistent
+array, paired runs in both orders):
+
+| check | member reads | rate per member | busy cores per GiB/s |
+|---|---|---|---|
+| stripe path (`rk_row_sync=0`) | 6.1–6.2 KiB | 437–450 MiB/s | 7.9–8.1 |
+| row layer (`rk_row_sync=1`) | **128 KiB** | **2,367–2,435 MiB/s** | **1.6–1.7** |
+
+On real NVMe the device, not the CPU, sets the row layer's rate.  8+2 over
+10 GCP local-SSD namespaces (96 GiB partitions, 4096-byte logical blocks,
+n2-standard-32, internal bitmap, `group_thread_cnt=8`,
+`stripe_cache_size=4096`; 60 s windows, paired runs in both orders):
+
+| pass | stripe path | row layer |
+|---|---|---|
+| initial sync over random members (all parity rewritten) | 166–191 MiB/s per member, 6 KiB reads / 4.4 KiB writes, 5.5–5.8 busy cores | **374–389 MiB/s, 128 KiB / 128 KiB, 1.3 cores** |
+| `check` | 267–268 MiB/s per member, 6 KiB reads, 2.9–3.0 cores | **625–675 MiB/s, 128 KiB, 2.2–2.3 cores** (the platform's read ceiling, ~6.5 GiB/s over the ten members) |
+| a whole `check` of the 96 GiB members | 357 s | **156 s** |
+
+And with the array serving I/O while a `check` runs (fio, 60 s; alone = no
+check running):
+
+| foreground load (alone) | stripe-path check: foreground, check rate | row check: foreground, check rate | row check held to ~200 MiB/s (`sync_speed_max`) |
+|---|---|---|---|
+| 4 KiB random write, QD32 x 4 (66–82k IOPS, p99 3.4 ms) | 39–40k IOPS, p99 23–24 ms; 195 MiB/s | 44–49k IOPS, p99 16–18 ms; 261–281 MiB/s | 51k IOPS, p99 15 ms |
+| 1 MiB sequential read, QD8 x 4 (6.3 GiB/s) | 3.8 GiB/s, p99 56–59 ms; 195 MiB/s | 4.4 GiB/s, p99 65–66 ms; 186–189 MiB/s | 4.5 GiB/s, p99 64 ms |
+| 1 MiB sequential write, QD8 x 4 (2.5 GiB/s) | 1.32 GiB/s, p99 89–92 ms; 198–202 MiB/s | 1.03–1.05 GiB/s, p99 96–109 ms; 283–285 MiB/s | 1.49 GiB/s, p99 80 ms |
+
+Left unthrottled against a sequential write load the row check takes the
+larger share of the devices (it checks 42% faster and the writes get 22%
+less); held to the stripe-path check's rate it leaves the writes 12% more
+than that check does.  `sync_speed_max` is the dial, as for any md pass.  A
+stripe-path check of the whole array after all of these runs found no
+mismatch.
+
+`echo 1 > /sys/block/mdX/md/rk_row_sync` turns it on for one array, also under
+a running pass; the module parameter `default_row_sync=1` makes new and newly
+assembled arrays start with it on, which is what puts an array's initial sync
+through it.  It is off by default until it has run on more hardware.
+
+It covers what the row rebuild covers, on a healthy array: a classic layout
+with every member present and in sync.  A degraded array, a replacement in
+progress, a declustered layout, an attached log or PPL and a live reshape keep
+the stripe path; so does any single row with foreground I/O in flight, a
+member read error or a bad block, and those rows get the stripe path's retry
+and bad-block handling.  On a `--checksum` array a check or repair verifies
+all k + m chunks of a row against the stored CRCs and hands a row that fails
+to the stripe path, which re-reads it and heals; an automatic resync
+re-derives the CRCs instead, as the stripe path does.  While a row is owned,
+writes to it wait, and so do reads that come through the stripe cache (on a
+healthy array reads normally go to the members directly).  Full-row writes
+(`rk_row_write`) stand aside for the whole pass, as they do for a stripe-path
+pass.  `rk_row_stats` reports `sync_done`, `sync_declined`, `sync_csum_bad`,
+`sync_stripe_chunks` (chunks the stripe cache took after the row path claimed
+nothing at a chunk boundary), `sync_mismatch_blocks` and `sync_parity_writes`.
+The pass runs through the look-ahead window with the rebuild's worker count
+(`rk_row_rebuild_window`, `rk_row_rebuild_workers`; a window of 0 means the
+default here), and `rk_row_rebuild_pace` applies to it as well.  Because the
+array is serving its normal load meanwhile, the pass never holds more than
+half the stripe cache: at `stripe_cache_size=256` and a 128 KiB chunk that is
+4 rows in flight, and the log names the size that would lift the limit; a
+chunk whose stripe heads do not fit into half the cache at all (1 MiB at
+`stripe_cache_size=256`) keeps the stripe path until the cache is raised.  The
+window's own counters are shared with the rebuild: `rebuild_retries`,
+`rebuild_unclaimed`, `rebuild_head_wait_ms`, `rebuild_head_timeouts` and
+`rebuild_band_nomem` move for whichever row pass is running.
 
 **`rk_row_rebuild_workers` — how many rows rebuild at once (default 16).**  The
 default was 8 until a Nimbus X4000 over NVMe-oF rebuilt a third faster at 16

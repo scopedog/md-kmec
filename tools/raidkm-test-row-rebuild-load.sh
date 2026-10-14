@@ -72,8 +72,9 @@
 #   T13 a bitmap re-add: md recovers only the regions written while the member
 #       was out and skips the rest, so its cursor jumps over chunks the window
 #       had already taken.  The window follows the cursor (drains, restarts
-#       where md is), far fewer chunks are rebuilt than the member holds, and
-#       the re-added member serves the data written while it was away
+#       where md is), far fewer chunks are rebuilt than the member holds, the
+#       bitmap comes clean afterwards, and the re-added member serves the data
+#       written while it was away
 #   T14 the window under WRITES.  What it rebuilt ahead of md's cursor waits
 #       there until md claims it -- for seconds when md is throttled, as it is
 #       here -- and stays right only because a foreground write reaches the
@@ -469,7 +470,7 @@ run_window_pass() {
 
 # T13: a bitmap re-add, where md's cursor skips ahead of the window.
 run_bitmap_pass() {
-	local tag=bitmap victim=${MEMBERS[3]} off d sc chunks mm done0 sc0 secs
+	local tag=bitmap victim=${MEMBERS[3]} off d sc chunks mm done0 sc0 secs dirty
 
 	RK_CREATE_EXTRA="--bitmap=internal --bitmap-chunk=4M" \
 		rk_create 2r "${MEMBERS[@]:0:$N}" || { rk_fail "$tag: create"; return; }
@@ -521,6 +522,18 @@ run_bitmap_pass() {
 	else
 		rk_fail "$tag T13: expected a partial recovery through rows: rebuild_done $d + stripe_chunks $sc of $chunks"
 	fi
+	# The row engine tells the bitmap what it recovered, so the regions
+	# written while the member was out come clean (the bitmap daemon writes
+	# that out over three of its 5 s periods).  Before it did, they stayed
+	# dirty for good and every later re-add or resync went over them again.
+	for secs in $(seq 45); do
+		dirty=$(sudo "$MDADM" -X "${MEMBERS[0]}" 2>/dev/null |
+			sed -n 's/.*Bitmap : [0-9]* bits (chunks), \([0-9]*\) dirty.*/\1/p')
+		[ "$dirty" = 0 ] && break
+		sleep 1
+	done
+	[ "$dirty" = 0 ] && rk_pass "$tag T13: no dirty bitmap bit is left after the recovery" \
+		|| rk_fail "$tag T13: ${dirty:-?} bitmap bits still dirty after the recovery"
 	rk_fail_disks "${MEMBERS[5]}"
 	rk_readback "$DATAMB" && rk_pass "$tag T13: data written while the member was out reads back through it" \
 		|| rk_fail "$tag T13: data differs with the re-added member serving"

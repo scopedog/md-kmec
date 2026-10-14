@@ -77,13 +77,17 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window
        declustered-populate-window@default_dcl_row_rebuild=0 declustered-degraded replace
-       scrub-badblocks degraded-trust-disk row-rebuild-load wide-row row-write)
+       scrub-badblocks degraded-trust-disk row-rebuild-load wide-row row-write
+       row-sync)
 # <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.
 # <suite>@default_row_write=1 runs a suite written for the stripe cache with
 # full-row writes on: every aligned whole-row write it issues takes the row
 # path instead, and its own data and parity checks gate it.
+# <suite>@default_row_sync=1 runs a suite's resyncs, checks and repairs of a
+# healthy array through the row layer (rk_row_sync, off by default) instead of
+# the stripe cache; its own data and parity checks gate it.
 # Declustered population runs on the row engine by default
 # (default_dcl_row_rebuild=Y); <suite>@default_dcl_row_rebuild=0 gates the
 # 4 KiB stripe path it falls back to, which is also where the population's
@@ -91,7 +95,9 @@ SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window
 QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate
        declustered-populate@default_dcl_row_rebuild=0
        functional@default_row_write=1 degraded@default_row_write=1
-       replace@default_row_write=1)
+       replace@default_row_write=1
+       functional@default_row_sync=1 degraded@default_row_sync=1
+       scrub-badblocks@default_row_sync=1 row-write@default_row_sync=1)
 FULL=("${QUICK[@]}" grow grow-traditional reshape-concurrent declustered-create declustered-io
       declustered-rebalance declustered-csum declustered-autoarm declustered-multi declustered-crash
       declustered-row-transitions
