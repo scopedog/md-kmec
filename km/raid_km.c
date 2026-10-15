@@ -20711,6 +20711,28 @@ static int raid5_create_ctx_pool(struct r5conf *conf)
 	return conf->ctx_pool ? 0 : -ENOMEM;
 }
 
+/*
+ * A reshape moved the row: mddev_update_io_opt() with the row boundary
+ * raid5_set_limits() splits bios at (lim.chunk_sectors) moved along, or
+ * bios would go on being split at the old row and miss the row path.
+ */
+static void raidkm_update_row_limits(struct r5conf *conf)
+{
+	struct mddev *mddev = conf->mddev;
+	struct queue_limits lim;
+
+	if (mddev_is_dm(mddev))
+		return;
+	/* as mddev_update_io_opt(): not worth it if we cannot suspend */
+	if (mddev_suspend(mddev, false) < 0)
+		return;
+	lim = queue_limits_start_update(mddev->gendisk->queue);
+	lim.io_opt = lim.io_min * raid5_stripe_data_disks(conf);
+	lim.chunk_sectors = lim.io_opt >> 9;
+	queue_limits_commit_update(mddev->gendisk->queue, &lim);
+	mddev_resume(mddev);
+}
+
 static int raid5_set_limits(struct mddev *mddev)
 {
 	struct r5conf *conf = mddev->private;
@@ -20759,6 +20781,19 @@ static int raid5_set_limits(struct mddev *mddev)
 	rdev_for_each(rdev, mddev)
 		queue_limits_stack_bdev(&lim, rdev->bdev, rdev->new_data_offset,
 				mddev->gendisk->disk_name);
+	/*
+	 * Split bios at row boundaries (upstream d51e1668fad6, 7.1).  Without
+	 * it the block layer cuts a bio over max_sectors into pieces counted
+	 * from the bio's own start, so a bio that starts mid-row -- the second
+	 * of two bios a 4 MiB request was submitted as -- reaches us as pieces
+	 * that each straddle two rows: none goes through the row path
+	 * (raidkm_row_write_bio() takes whole rows only), all through the
+	 * stripe cache.  Split at rows, only the partial rows at a bio's ends
+	 * take the stripe cache.  Set after the stacking above: a member's own
+	 * boundary (an NVMe NOIOB, say) is in the member's sectors, not ours,
+	 * and would otherwise narrow this one to a fraction of a row.
+	 */
+	lim.chunk_sectors = lim.io_opt >> 9;
 
 	/*
 	 * Zeroing is required for discard, otherwise data could be lost.
@@ -22316,8 +22351,7 @@ static void end_reshape(struct r5conf *conf)
 		spin_unlock_irq(&conf->device_lock);
 		wake_up(&conf->wait_for_reshape);
 
-		mddev_update_io_opt(conf->mddev,
-				    raid5_stripe_data_disks(conf));
+		raidkm_update_row_limits(conf);
 	}
 }
 

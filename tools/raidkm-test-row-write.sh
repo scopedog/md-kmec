@@ -7,9 +7,10 @@
 # here checks the bytes, the parity, or both:
 #   T1  aligned 1 MiB writes take the row path (write_done moves); the data
 #       reads back and a scrub finds no parity mismatch.
-#   T2  spans that start and end mid-row: a bio goes to the row path only if
-#       it is made of whole rows, all or nothing, so these go to the stripe
-#       cache whole, and the result is right.
+#   T2  spans that start and end mid-row: the array splits bios at row
+#       boundaries (queue chunk_sectors), so exactly the whole rows inside each
+#       bio take the row path, the partial rows the stripe cache; the result is
+#       right.
 #   T3  the stale-cache case.  4 KiB read-modify-writes leave a stripe's
 #       parity cached; a row write then rewrites the members underneath; the
 #       next read-modify-write of the same stripe must not use the old parity
@@ -33,6 +34,11 @@
 #   T11 rows over 1 MiB (10+2), written from huge pages so a bio can hold a
 #       whole row: the row path takes them; the same bios through the stripe
 #       cache are right too (fio verify, scrub).
+#   T12 the row boundary: queue chunk_sectors is the row at create (6+2, a
+#       row that is not a power of two) and after a grow to 8+2; one-and-a-half
+#       row bios from huge pages keep their whole rows (one per bio, where a
+#       bio starting mid-row used to lose its row to the 1 MiB split); fio
+#       verify, scrub.
 #
 # Usage: bash <this>    (CHUNK_KB default 128; RW_N/RW_M the classic geometry)
 set -u
@@ -124,16 +130,23 @@ scrub_clean && rk_pass "T1: scrub clean" || rk_fail "T1: parity mismatch after r
 
 # ---- T2: spans with partial rows at both ends -----------------------------
 echo "=== T2: spans starting and ending mid-row ==="
-# A bio goes to the row path only if it is made of whole rows (all or
-# nothing: raidkm_row_write_bio), so a span starting 64K into a row -- whose
-# 1 MiB bios never line up with rows -- goes to the stripe cache whole, at
-# any chunk size.  The data must be right, and the parity.
+# The array splits bios at row boundaries (queue chunk_sectors), and the row
+# path takes a bio made of whole rows: of a span starting 64K into a row,
+# written as 1 MiB bios, exactly the whole rows inside each bio go to the row
+# path (none with a 1 MiB row), the partial rows to the stripe cache.  The
+# data must be right, and the parity.
 mk_pattern "$RK_TMP/B" 20
+T2OFF=$(( ROWB + 64 * 1024 ))	# starts 64K into a row
+WANT=0
+for i in $(seq 0 19); do	# whole rows inside [s, s + 1 MiB)
+	s=$(( T2OFF + i * 1048576 )); a=$(( (s + ROWB - 1) / ROWB )); b=$(( (s + 1048576) / ROWB ))
+	[ "$b" -gt "$a" ] && WANT=$(( WANT + b - a ))
+done
 D0=$(row_stat write_done)
-put "$RK_TMP/B" $(( ROWB + 64 * 1024 )) 1M	# starts 64K into a row
+put "$RK_TMP/B" "$T2OFF" 1M
 D1=$(row_stat write_done)
-[ "$((D1 - D0))" = 0 ] && rk_pass "T2: no bio with a partial row took the row path" \
-	|| rk_fail "T2: row path took $((D1 - D0)) row(s) from bios with partial rows"
+[ "$((D1 - D0))" = "$WANT" ] && rk_pass "T2: the row path took exactly the $WANT whole row(s) inside the bios" \
+	|| rk_fail "T2: row path took $((D1 - D0)) row(s), $WANT whole rows inside the bios"
 same "$RK_TMP/B" $(( ROWB + 64 * 1024 )) && rk_pass "T2: unaligned span right" \
 	|| rk_fail "T2: unaligned span WRONG"
 head -c "$(( ROWB + 64 * 1024 ))" "$RK_TMP/A" > "$RK_TMP/A.head"
@@ -359,6 +372,58 @@ elif setup "${M}r" 12; then
 	echo "$HP0" | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
 else
 	rk_fail "T11: create 10+2 (row $((ROWB / 1024)) KiB)"
+fi
+
+# ---- T12: the row boundary ---------------------------------------------------
+# raid5_set_limits() sets queue chunk_sectors to the row so the block layer
+# splits bios at rows; a reshape moves it with io_opt.  Without it, a bio over
+# max_sectors (1 MiB) is cut into pieces counted from the bio's own start: one
+# starting mid-row reaches us as pieces that each straddle two rows, and its
+# whole rows go to the stripe cache.  Bios of one and a half rows from huge
+# pages (one bio each, as in T11): every bio holds one whole row, half of them
+# from a mid-row start.
+echo "=== T12: bios split at row boundaries (6+2, grown to 8+2) ==="
+qlim() { cat "/sys/block/$MDNAME/queue/$1"; }
+t12_write() {	# t12_write <tag>: 16 bios of 1.5 rows; one row each on the row path
+	local bs=$(( ROWB * 3 / 2 )) d0 d1
+	d0=$(row_stat write_done)
+	if sudo fio --output="$RK_TMP/t12-$1.fio" --name=w --filename="$MD" \
+		--direct=1 --ioengine=libaio --rw=write --bs="$bs" --iodepth=4 \
+		--size=$(( 16 * bs )) --iomem=shmhuge --verify=crc32c \
+		--verify_fatal=1 >/dev/null 2>&1; then
+		rk_pass "T12[$1]: fio write+verify of 1.5-row bios clean"
+	else
+		rk_fail "T12[$1]: fio verify FAILED ($RK_TMP/t12-$1.fio)"
+	fi
+	d1=$(row_stat write_done)
+	[ "$((d1 - d0))" -ge 16 ] && rk_pass "T12[$1]: $((d1 - d0)) rows via the row path (16 bios, one whole row each)" \
+		|| rk_fail "T12[$1]: row path took $((d1 - d0)) rows of 16 bios holding one whole row each"
+}
+if setup "${M}r" $(( N - 2 )); then
+	[ "$(qlim chunk_sectors)" = $(( ROWB / 512 )) ] && rk_pass "T12: chunk_sectors $(qlim chunk_sectors) = the $(( N - 2 - M ))+$M row" \
+		|| rk_fail "T12: chunk_sectors $(qlim chunk_sectors), row $(( ROWB / 512 )) sectors"
+	HP0=$(cat /proc/sys/vm/nr_hugepages)
+	echo 64 | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
+	HPOK=0; [ "$(awk '/HugePages_Free/{print $2}' /proc/meminfo)" -ge 8 ] && HPOK=1
+	if [ "$HPOK" = 1 ]; then
+		t12_write create
+	else
+		rk_skip_check "T12: no huge pages to write 1.5-row bios from"
+	fi
+	sudo "$MDADM" --add "$MD" "${MEMBERS[@]:$(( N - 2 )):2}" >/dev/null 2>&1
+	if sudo "$MDADM" --grow "$MD" --raid-devices="$N" --backup-file="$RK_TMP/t12.bak" >/dev/null 2>&1; then
+		sleep 1; rk_wait_idle
+		ROWB=$(( (N - M) * CHUNK_KB * 1024 ))
+		[ "$(qlim chunk_sectors)" = $(( ROWB / 512 )) ] && rk_pass "T12: after the grow chunk_sectors $(qlim chunk_sectors) = the $(( N - M ))+$M row" \
+			|| rk_fail "T12: after the grow chunk_sectors $(qlim chunk_sectors), row $(( ROWB / 512 )) sectors"
+		if [ "$HPOK" = 1 ]; then t12_write grown; fi
+		scrub_clean && rk_pass "T12: scrub clean after the grow" || rk_fail "T12: parity mismatch after the grow"
+	else
+		rk_fail "T12: grow to $N devices"
+	fi
+	echo "$HP0" | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
+else
+	rk_fail "T12: create $(( N - 2 - M ))+$M"
 fi
 
 [ "$(splats)" = 0 ] && rk_pass "no WARN/BUG/KASAN/hung task" || rk_fail "$(splats) kernel splat line(s)"
