@@ -67,6 +67,37 @@
 #include "raid_km-log.h"
 #include "../isa-l/isa-l_ec.h"
 
+/*
+ * rdev_has_badblock() with the member's bad-block writers held off.
+ *
+ * badblocks_check() walks the list without a lock and redoes the walk when
+ * read_seqretry() says a writer changed it.  Since 7e76336e14de (6.15, and
+ * RHEL 10's 6.12) a walk over a list that is being changed can trip
+ * WARN_ON(sectors < len) in _badblocks_check() before it gets to the retry:
+ * the answer after the retry is right, but the WARN taints the kernel and
+ * panics a panic_on_warn host.  check and repair produce exactly that case,
+ * a "read error corrected" clearing a range while other stripes of the same
+ * member look it up.  Holding the seqlock's spinlock keeps badblocks_set()
+ * and badblocks_clear() out for the walk; they take it with interrupts off
+ * and take nothing under it, so any context may hold it here.  Only members
+ * with a recorded bad block pay for the lock.
+ */
+static inline int rk_has_badblock(struct md_rdev *rdev, sector_t s,
+				  int sectors)
+{
+	unsigned long flags;
+	int rv;
+
+	if (likely(!READ_ONCE(rdev->badblocks.count)))
+		return 0;
+	read_seqlock_excl_irqsave(&rdev->badblocks.lock, flags);
+	rv = rdev_has_badblock(rdev, s, sectors);
+	read_sequnlock_excl_irqrestore(&rdev->badblocks.lock, flags);
+	return rv;
+}
+/* every lookup goes through the lock above */
+#pragma GCC poison rdev_has_badblock is_badblock
+
 #define UNSUPPORTED_MDDEV_FLAGS	(1L << MD_FAILFAST_SUPPORTED)
 
 /*
@@ -3131,8 +3162,8 @@ again:
 		 */
 		while (op_is_write(op) && rdev &&
 		       test_bit(WriteErrorSeen, &rdev->flags)) {
-			int bad = rdev_has_badblock(rdev, sh->sector,
-						    RAID5_STRIPE_SECTORS(conf));
+			int bad = rk_has_badblock(rdev, sh->sector,
+						  RAID5_STRIPE_SECTORS(conf));
 			if (!bad)
 				break;
 
@@ -5597,8 +5628,8 @@ static void raid5_end_write_request(struct bio *bi)
 	if (replacement) {
 		if (bi->bi_status)
 			md_error(conf->mddev, rdev);
-		else if (rdev_has_badblock(rdev, sh->sector,
-					   RAID5_STRIPE_SECTORS(conf)))
+		else if (rk_has_badblock(rdev, sh->sector,
+					 RAID5_STRIPE_SECTORS(conf)))
 			set_bit(R5_MadeGoodRepl, &sh->dev[i].flags);
 	} else {
 		if (bi->bi_status) {
@@ -5608,8 +5639,8 @@ static void raid5_end_write_request(struct bio *bi)
 			if (!test_and_set_bit(WantReplacement, &rdev->flags))
 				set_bit(MD_RECOVERY_NEEDED,
 					&rdev->mddev->recovery);
-		} else if (rdev_has_badblock(rdev, sh->sector,
-					     RAID5_STRIPE_SECTORS(conf))) {
+		} else if (rk_has_badblock(rdev, sh->sector,
+					   RAID5_STRIPE_SECTORS(conf))) {
 			set_bit(R5_MadeGood, &sh->dev[i].flags);
 			if (test_bit(R5_ReadError, &sh->dev[i].flags))
 				/* That was a successful write so make
@@ -8345,8 +8376,8 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 		rdev = conf->disks[raidkm_sh_pdisk(conf, sh, i)].replacement;
 		if (rdev && !test_bit(Faulty, &rdev->flags) &&
 		    rdev->recovery_offset >= sh->sector + RAID5_STRIPE_SECTORS(conf) &&
-		    !rdev_has_badblock(rdev, sh->sector,
-				       RAID5_STRIPE_SECTORS(conf)))
+		    !rk_has_badblock(rdev, sh->sector,
+				     RAID5_STRIPE_SECTORS(conf)))
 			set_bit(R5_ReadRepl, &dev->flags);
 		else {
 			if (rdev && !test_bit(Faulty, &rdev->flags))
@@ -8359,8 +8390,8 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 		if (rdev && test_bit(Faulty, &rdev->flags))
 			rdev = NULL;
 		if (rdev) {
-			is_bad = rdev_has_badblock(rdev, sh->sector,
-						   RAID5_STRIPE_SECTORS(conf));
+			is_bad = rk_has_badblock(rdev, sh->sector,
+						 RAID5_STRIPE_SECTORS(conf));
 			if (s->blocked_rdev == NULL
 			    && (test_bit(Blocked, &rdev->flags)
 				|| is_bad < 0)) {
@@ -9421,7 +9452,7 @@ static int raid5_read_one_chunk(struct mddev *mddev, struct bio *raid_bio)
 
 	atomic_inc(&rdev->nr_pending);
 
-	if (rdev_has_badblock(rdev, sector, bio_sectors(raid_bio))) {
+	if (rk_has_badblock(rdev, sector, bio_sectors(raid_bio))) {
 		rdev_dec_pending(rdev, mddev);
 		return 0;
 	}
@@ -10117,7 +10148,7 @@ static int raidkm_row_dread_one(struct mddev *mddev, struct bio *raid_bio)
 		if (i == target || !raidkm_row_member_ok(rdev, a0, a1))
 			continue;
 		atomic_inc(&rdev->nr_pending);
-		if (rdev_has_badblock(rdev, a0, a1 - a0)) {
+		if (rk_has_badblock(rdev, a0, a1 - a0)) {
 			rdev_dec_pending(rdev, mddev);
 			continue;
 		}
@@ -10278,7 +10309,7 @@ static int raidkm_row_dread_wide(struct mddev *mddev, struct bio *raid_bio)
 		if (i == target || !raidkm_row_member_ok(rdev, a0, a1))
 			continue;
 		atomic_inc(&rdev->nr_pending);
-		if (rdev_has_badblock(rdev, a0, a1 - a0)) {
+		if (rk_has_badblock(rdev, a0, a1 - a0)) {
 			rdev_dec_pending(rdev, mddev);
 			continue;
 		}
@@ -10658,7 +10689,7 @@ static int raidkm_row_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 			continue;	/* parity target: data rows only */
 		if (!rdev || test_bit(Faulty, &rdev->flags) ||
 		    !test_bit(In_sync, &rdev->flags) ||
-		    rdev_has_badblock(rdev, sector_nr, chunk_sectors))
+		    rk_has_badblock(rdev, sector_nr, chunk_sectors))
 			continue;
 		atomic_inc(&rdev->nr_pending);
 		rr->src[nsrc].rdev = rdev;
@@ -10668,7 +10699,7 @@ static int raidkm_row_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 	}
 	if (nsrc < k)
 		goto out_sources;
-	if (rdev_has_badblock(target, sector_nr, chunk_sectors))
+	if (rk_has_badblock(target, sector_nr, chunk_sectors))
 		goto out_sources;
 	/*
 	 * Pin the member being rebuilt for the duration of the write.  It is
@@ -10821,7 +10852,7 @@ static int raidkm_row_sync_chunk(struct mddev *mddev, sector_t sector_nr,
 		    !test_bit(In_sync, &rdev->flags) ||
 		    test_bit(Blocked, &rdev->flags) ||
 		    conf->disks[slot].replacement ||
-		    rdev_has_badblock(rdev, sector_nr, chunk_sectors))
+		    rk_has_badblock(rdev, sector_nr, chunk_sectors))
 			goto out_members;
 		atomic_inc(&rdev->nr_pending);
 		sm[i].rdev = rdev;
@@ -11059,7 +11090,7 @@ static int raidkm_dcl_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 		rdev = conf->disks[disk].rdev;
 		if (!rdev || test_bit(Faulty, &rdev->flags) ||
 		    !test_bit(In_sync, &rdev->flags) ||
-		    rdev_has_badblock(rdev, sector_nr, chunk_sectors))
+		    rk_has_badblock(rdev, sector_nr, chunk_sectors))
 			continue;
 		atomic_inc(&rdev->nr_pending);
 		rr->src[nsrc].rdev = rdev;
@@ -11069,7 +11100,7 @@ static int raidkm_dcl_rebuild_chunk(struct mddev *mddev, sector_t sector_nr,
 	}
 	if (nsrc < k)
 		goto out_sources;
-	if (rdev_has_badblock(target, sector_nr, chunk_sectors))
+	if (rk_has_badblock(target, sector_nr, chunk_sectors))
 		goto out_sources;
 	atomic_inc(&target->nr_pending);
 	pinned_target = true;
@@ -12836,7 +12867,7 @@ raidkm_row_write_prep(struct mddev *mddev, struct bio *raid_bio,
 		atomic_inc(&rdev->nr_pending);
 		w->mw[i].rdev = rdev;
 		w->mw[i].disk = idx;
-		if (rdev_has_badblock(rdev, msect, cs))
+		if (rk_has_badblock(rdev, msect, cs))
 			goto out_declined;
 	}
 
@@ -16329,7 +16360,7 @@ static int raidkm_dcl_copy_decode(struct r5conf *conf,
 		rdev = conf->disks[disk].rdev;
 		if (!rdev || test_bit(Faulty, &rdev->flags) ||
 		    !test_bit(In_sync, &rdev->flags) ||
-		    rdev_has_badblock(rdev, asect, len >> 9))
+		    rk_has_badblock(rdev, asect, len >> 9))
 			continue;
 		atomic_inc(&rdev->nr_pending);
 		ok = sync_page_io(rdev, asect, len, dec->pg[nsrc],

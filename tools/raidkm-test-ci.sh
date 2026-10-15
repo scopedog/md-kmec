@@ -238,6 +238,29 @@ SPLAT="$RK_SPLAT"			# raidkm-test-lib.sh
 
 xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 
+# A suite's kernel log, kept whole.  Suites clear the ring buffer between
+# their own checks (dmesg -C), so a snapshot taken after the suite holds only
+# what came after its last clear.  A /dev/kmsg reader (dmesg -w) keeps its own
+# position: started right after the runner's clear, it sees every line the
+# suite produces, whatever the suite clears.
+KLOG_PID=
+klog_start() {	# klog_start <file>
+	dmesg -w > "$1" 2>/dev/null &
+	KLOG_PID=$!
+}
+klog_stop() {	# klog_stop <file> <suite>
+	local tag="raidkm-test-ci: end of $2" i
+	echo "$tag" > /dev/kmsg 2>/dev/null
+	for i in $(seq 50); do			# the reader is behind until it shows the tag
+		grep -qF "$tag" "$1" && break
+		sleep 0.1
+	done
+	kill "$KLOG_PID" 2>/dev/null; wait "$KLOG_PID" 2>/dev/null; KLOG_PID=
+	# no reader (no dmesg -w): the snapshot, as before
+	grep -qF "$tag" "$1" || dmesg > "$1" 2>/dev/null
+}
+trap '[ -n "$KLOG_PID" ] && kill "$KLOG_PID" 2>/dev/null' EXIT
+
 declare -a R_NAME R_STATUS R_PASSED R_FAILED R_SECS R_NOTE
 dmesg -C 2>/dev/null
 total_start=$(date +%s)
@@ -262,12 +285,13 @@ for s in "${SUITES[@]}"; do
 	declared=${SUITE_TIMEOUTS[${s%%@*}]:-0}
 	[ "$declared" -gt "$limit" ] && limit=$declared
 	start=$(date +%s)
+	klog_start "$OUTPUT/$f.dmesg"
 	timeout --foreground --kill-after=60 "$limit" \
 		bash "$DIR/raidkm-test-${s%%@*}.sh" > "$OUTPUT/$f.log" 2>&1
 	rc=$?
 	secs=$(( $(date +%s) - start ))
 	[ -n "$pfile" ] && echo "$pold" > "$pfile"
-	dmesg > "$OUTPUT/$f.dmesg" 2>/dev/null
+	klog_stop "$OUTPUT/$f.dmesg" "$s"
 	dmesg -C 2>/dev/null
 	line=$(grep -E "==== .*: [0-9]+ passed, [0-9]+ failed(, [0-9]+ skipped)? ====" "$OUTPUT/$f.log" | tail -1)
 	passed=$(sed -n 's/.*: \([0-9]*\) passed.*/\1/p' <<< "$line")
