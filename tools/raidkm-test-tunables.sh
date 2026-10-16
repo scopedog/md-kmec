@@ -34,11 +34,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# the worker groups: one per possible node (alloc_thread_groups)
+# the worker groups: one per node ID up to the highest possible one
+# (alloc_thread_groups, nr_node_ids), not one per possible node -- they differ
+# on a sparse map ("0,2" is 3 groups); the map is a list ("0,2", "0-1,4-5")
 possible_nodes() {
-	local p
+	local p r hi=0
 	p=$(cat /sys/devices/system/node/possible 2>/dev/null) || { echo 1; return; }
-	case $p in *-*) echo $(( ${p#*-} - ${p%-*} + 1 )) ;; *) echo 1 ;; esac
+	for r in ${p//,/ }; do
+		r=${r#*-}
+		[ "$r" -gt "$hi" ] && hi=$r
+	done
+	echo $(( hi + 1 ))
 }
 suspends() { awk -v p="${PROBE#*/}" '$1 == p { print $2 }' "$TR/kprobe_profile"; }
 
@@ -46,7 +52,9 @@ rk_load_modules || exit 1
 rk_setup_brd 6 || exit 1
 mountpoint -q "$TR" || mount -t tracefs none "$TR" 2>/dev/null
 # a run killed before its EXIT trap (a suite timeout, a Ctrl-C) leaves the
-# probe registered, and the add below would fail with -EEXIST: drop it first
+# probe registered and enabled: removing an enabled probe fails (-EBUSY), and
+# the add below would then register a second one.  Disable, then drop it.
+[ -e "$TR/events/$PROBE/enable" ] && echo 0 > "$TR/events/$PROBE/enable" 2>/dev/null
 echo "-:$PROBE" >> "$TR/kprobe_events" 2>/dev/null
 if ! echo "p:$PROBE mddev_suspend" >> "$TR/kprobe_events" 2>/dev/null; then
 	rk_skip "no kprobe on mddev_suspend (kprobe_events unavailable)"

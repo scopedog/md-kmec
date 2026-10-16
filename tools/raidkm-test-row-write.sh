@@ -19,7 +19,7 @@
 #       rows: the parity stays consistent (scrub) and a final pass is right.
 #   T5  after row writes, a member fails (degraded reads decode from the parity
 #       the row path wrote), row writes decline while degraded, and a rebuild
-#       onto a spare leaves a consistent array.
+#       onto a spare leaves a consistent array with its row boundary unchanged.
 #   T6  a minimal rk_row_write_depth under many writers: most rows find no context
 #       and go to the stripe cache (write_nobuf moves); fio's own verify
 #       passes.
@@ -39,6 +39,13 @@
 #       row bios from huge pages keep their whole rows (one per bio, where a
 #       bio starting mid-row used to lose its row to the 1 MiB split); fio
 #       verify, scrub.
+#   T13 a chunk-size reshape (128K -> 64K through md's chunk_size and
+#       sync_action, as mdadm refuses it at this level): chunk_sectors,
+#       minimum_io_size and optimal_io_size follow the new chunk; the data
+#       reads back, the scrub is clean, whole rows still take the row path.
+#   T14 a grow that takes the row past the bio cap (8+2 -> 10+2): the
+#       boundary stays at the cap (max_hw_sectors, fixed at run time), not
+#       at the larger row, so bios are not cut at both; the data reads back.
 #
 # Usage: bash <this>    (CHUNK_KB default 128; RW_N/RW_M the classic geometry)
 set -u
@@ -77,6 +84,7 @@ row_stat() {	# never empty: an empty value would turn [ -gt ] into a green run
 knob()   { echo "$2" | sudo tee "$(SYS "$1")" >/dev/null 2>&1; }
 splats() { sudo dmesg | grep -cE "WARNING:|BUG:|KASAN:|blocked for more than"; }
 dropc()  { echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
+qlim()   { cat "/sys/block/$MDNAME/queue/$1"; }
 ROWB=0	# bytes per row, set by setup
 
 # setup <layout> <ndisks>: a fresh array with the row path on
@@ -142,11 +150,19 @@ for i in $(seq 0 19); do	# whole rows inside [s, s + 1 MiB)
 	s=$(( T2OFF + i * 1048576 )); a=$(( (s + ROWB - 1) / ROWB )); b=$(( (s + 1048576) / ROWB ))
 	[ "$b" -gt "$a" ] && WANT=$(( WANT + b - a ))
 done
-D0=$(row_stat write_done)
+fallbacks() { echo $(( $(row_stat write_nobuf) + $(row_stat write_busy) + $(row_stat write_declined) )); }
+D0=$(row_stat write_done); F0=$(fallbacks)
 put "$RK_TMP/B" "$T2OFF" 1M
-D1=$(row_stat write_done)
-[ "$((D1 - D0))" = "$WANT" ] && rk_pass "T2: the row path took exactly the $WANT whole row(s) inside the bios" \
-	|| rk_fail "T2: row path took $((D1 - D0)) row(s), $WANT whole rows inside the bios"
+D1=$(row_stat write_done); F1=$(fallbacks)
+# never more rows than the bios hold whole; fewer only with a counted fallback
+# (no context, a busy row, a decline: the stripe cache then writes it)
+if [ "$((D1 - D0))" -gt "$WANT" ]; then
+	rk_fail "T2: row path took $((D1 - D0)) row(s), more than the $WANT whole rows inside the bios"
+elif [ "$((D1 - D0))" = "$WANT" ] || [ "$F1" -gt "$F0" ]; then
+	rk_pass "T2: the row path took $((D1 - D0)) of the $WANT whole row(s) inside the bios ($((F1 - F0)) fallback(s))"
+else
+	rk_fail "T2: row path took $((D1 - D0)) row(s), $WANT whole rows inside the bios, no fallback counted"
+fi
 same "$RK_TMP/B" $(( ROWB + 64 * 1024 )) && rk_pass "T2: unaligned span right" \
 	|| rk_fail "T2: unaligned span WRONG"
 head -c "$(( ROWB + 64 * 1024 ))" "$RK_TMP/A" > "$RK_TMP/A.head"
@@ -212,6 +228,7 @@ same "$RK_TMP/D" 0 && rk_pass "T4: a pass written afterwards reads back right" |
 
 # ---- T5: degraded and rebuild ----------------------------------------------
 echo "=== T5: fail a member after row writes; rebuild onto a spare ==="
+CS0=$(qlim chunk_sectors)
 put "$RK_TMP/A" 0 1M
 rk_fail_disks "${MEMBERS[2]}"
 same "$RK_TMP/A" 0 && rk_pass "T5: degraded read decodes the row path's parity" \
@@ -227,6 +244,10 @@ rk_add_disks "${MEMBERS[10]}"
 rk_wait_full 2>/dev/null || rk_wait_idle
 grep -A1 "^$MDNAME" /proc/mdstat | grep -q "\[$(printf 'U%.0s' $(seq 1 "$N"))\]" && rk_pass "T5: rebuilt onto the spare" \
 	|| rk_fail "T5: array not back to $N/$N: $(grep -A1 "^$MDNAME" /proc/mdstat | tail -1)"
+# adding a member must not re-stack the limits under the row boundary (a
+# spare's own chunk_sectors would gcd into it): raidkm never re-stacks
+[ "$(qlim chunk_sectors)" = "$CS0" ] && rk_pass "T5: chunk_sectors $CS0 unchanged by the spare and the rebuild" \
+	|| rk_fail "T5: chunk_sectors $CS0 -> $(qlim chunk_sectors) after the spare and the rebuild"
 same "$RK_TMP/B" 0 && rk_pass "T5: data right after the rebuild" || rk_fail "T5: data WRONG after rebuild"
 D0=$(row_stat write_done)
 put "$RK_TMP/A" 0 1M
@@ -383,7 +404,6 @@ fi
 # pages (one bio each, as in T11): every bio holds one whole row, half of them
 # from a mid-row start.
 echo "=== T12: bios split at row boundaries (6+2, grown to 8+2) ==="
-qlim() { cat "/sys/block/$MDNAME/queue/$1"; }
 t12_write() {	# t12_write <tag>: 16 bios of 1.5 rows; one row each on the row path
 	local bs=$(( ROWB * 3 / 2 )) d0 d1
 	d0=$(row_stat write_done)
@@ -400,8 +420,10 @@ t12_write() {	# t12_write <tag>: 16 bios of 1.5 rows; one row each on the row pa
 		|| rk_fail "T12[$1]: row path took $((d1 - d0)) rows of 16 bios holding one whole row each"
 }
 if setup "${M}r" $(( N - 2 )); then
-	[ "$(qlim chunk_sectors)" = $(( ROWB / 512 )) ] && rk_pass "T12: chunk_sectors $(qlim chunk_sectors) = the $(( N - 2 - M ))+$M row" \
-		|| rk_fail "T12: chunk_sectors $(qlim chunk_sectors), row $(( ROWB / 512 )) sectors"
+	CAP=$(( $(qlim max_sectors_kb) * 2 ))
+	WANT=$(( ROWB / 512 < CAP ? ROWB / 512 : CAP ))
+	[ "$(qlim chunk_sectors)" = "$WANT" ] && rk_pass "T12: chunk_sectors $WANT (the $(( N - 2 - M ))+$M row $(( ROWB / 512 )), bio cap $CAP)" \
+		|| rk_fail "T12: chunk_sectors $(qlim chunk_sectors), want $WANT (row $(( ROWB / 512 )), bio cap $CAP)"
 	HP0=$(cat /proc/sys/vm/nr_hugepages)
 	echo 64 | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
 	HPOK=0; [ "$(awk '/HugePages_Free/{print $2}' /proc/meminfo)" -ge 8 ] && HPOK=1
@@ -410,13 +432,33 @@ if setup "${M}r" $(( N - 2 )); then
 	else
 		rk_skip_check "T12: no huge pages to write 1.5-row bios from"
 	fi
-	sudo "$MDADM" --add "$MD" "${MEMBERS[@]:$(( N - 2 )):2}" >/dev/null 2>&1
-	if sudo "$MDADM" --grow "$MD" --raid-devices="$N" --backup-file="$RK_TMP/t12.bak" >/dev/null 2>&1; then
+	# the two members still carry T11's superblock, and udev may have
+	# assembled them into an array of their own since: stop that, clear the
+	# superblock, then add them
+	for d in "${MEMBERS[@]:$(( N - 2 )):2}"; do
+		for h in /sys/block/"$(basename "$d")"/holders/md*; do
+			[ -e "$h" ] && sudo "$MDADM" --stop "/dev/$(basename "$h")" >/dev/null 2>&1
+		done
+		sudo "$MDADM" --zero-superblock "$d" >/dev/null 2>&1
+	done
+	if ! sudo "$MDADM" --add "$MD" "${MEMBERS[@]:$(( N - 2 )):2}" >/dev/null 2>&1; then
+		rk_fail "T12: add ${MEMBERS[*]:$(( N - 2 )):2} as spares for the grow"
+	elif sudo "$MDADM" --grow "$MD" --raid-devices="$N" --backup-file="$RK_TMP/t12.bak" >/dev/null 2>&1; then
 		sleep 1; rk_wait_idle
 		ROWB=$(( (N - M) * CHUNK_KB * 1024 ))
-		[ "$(qlim chunk_sectors)" = $(( ROWB / 512 )) ] && rk_pass "T12: after the grow chunk_sectors $(qlim chunk_sectors) = the $(( N - M ))+$M row" \
-			|| rk_fail "T12: after the grow chunk_sectors $(qlim chunk_sectors), row $(( ROWB / 512 )) sectors"
-		if [ "$HPOK" = 1 ]; then t12_write grown; fi
+		# the bio cap is fixed at run time: a row grown past it keeps the
+		# boundary at the cap, and no bio holds a whole row then
+		CAP=$(( $(qlim max_sectors_kb) * 2 ))
+		WANT=$(( ROWB / 512 < CAP ? ROWB / 512 : CAP ))
+		[ "$(qlim chunk_sectors)" = "$WANT" ] && rk_pass "T12: after the grow chunk_sectors $WANT (the $(( N - M ))+$M row $(( ROWB / 512 )), bio cap $CAP)" \
+			|| rk_fail "T12: after the grow chunk_sectors $(qlim chunk_sectors), want $WANT (row $(( ROWB / 512 )), bio cap $CAP)"
+		# a bio over the cap is split at the cap and the row, so its whole
+		# row still goes through -- unless the row itself is over the cap
+		if [ "$HPOK" = 1 ] && [ $(( ROWB / 512 )) -le "$CAP" ]; then
+			t12_write grown
+		elif [ "$HPOK" = 1 ]; then
+			rk_skip_check "T12[grown]: the row ($(( ROWB / 1024 )) KiB) is over the bio cap"
+		fi
 		scrub_clean && rk_pass "T12: scrub clean after the grow" || rk_fail "T12: parity mismatch after the grow"
 	else
 		rk_fail "T12: grow to $N devices"
@@ -424,6 +466,73 @@ if setup "${M}r" $(( N - 2 )); then
 	echo "$HP0" | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
 else
 	rk_fail "T12: create $(( N - 2 - M ))+$M"
+fi
+
+# ---- T13: a chunk-size reshape ------------------------------------------------
+# The live io_min is the old chunk after it, so the limits are recomputed from
+# the new geometry (raidkm_update_row_limits), not carried over.
+echo "=== T13: chunk-size reshape ${CHUNK_KB}K -> $((CHUNK_KB / 2))K ==="
+if [ "$CHUNK_KB" -lt 8 ]; then
+	rk_skip_check "T13: a ${CHUNK_KB}K chunk cannot be halved"
+elif setup "${M}r" "$N"; then
+	mk_pattern "$RK_TMP/E" 32
+	put "$RK_TMP/E" 0 1M
+	NEWC=$(( CHUNK_KB / 2 ))
+	if echo $(( NEWC * 1024 )) | sudo tee "$(SYS chunk_size)" >/dev/null 2>&1 &&
+	   echo reshape | sudo tee "$(SYS sync_action)" >/dev/null 2>&1; then
+		rk_wait_pass
+		ROWB=$(( (N - M) * NEWC * 1024 ))
+		lims="$(qlim chunk_sectors) $(qlim minimum_io_size) $(qlim optimal_io_size)"
+		[ "$lims" = "$(( ROWB / 512 )) $(( NEWC * 1024 )) $ROWB" ] \
+			&& rk_pass "T13: chunk_sectors, minimum_io_size, optimal_io_size follow the ${NEWC}K chunk ($lims)" \
+			|| rk_fail "T13: limits after the reshape '$lims', want '$(( ROWB / 512 )) $(( NEWC * 1024 )) $ROWB'"
+		same "$RK_TMP/E" 0 && rk_pass "T13: data reads back after the reshape" || rk_fail "T13: data WRONG after the reshape"
+		mk_pattern "$RK_TMP/F" 8
+		D0=$(row_stat write_done)
+		put "$RK_TMP/F" 0 "$ROWB"
+		D1=$(row_stat write_done)
+		[ "$((D1 - D0))" -ge $(( 8 * 1048576 / ROWB - 1 )) ] && rk_pass "T13: $((D1 - D0)) whole ${ROWB}-byte rows via the row path" \
+			|| rk_fail "T13: row path took $((D1 - D0)) rows of $(( 8 * 1048576 / ROWB ))"
+		scrub_clean && rk_pass "T13: scrub clean" || rk_fail "T13: parity mismatch after the reshape"
+	else
+		rk_skip_check "T13: md would not start a chunk-size reshape"
+	fi
+else
+	rk_fail "T13: create ${N}/${M}"
+fi
+
+# ---- T14: a grow past the bio cap ---------------------------------------------
+# raid5_set_limits() raises the bio cap to the row only at run time; a grow
+# that makes the row larger than it keeps the cap, and the boundary must not
+# go past it, or bios would be cut at both (cap, then row).
+echo "=== T14: grow $((N - M))+$M -> $((N + 2 - M))+$M: the boundary stays at the bio cap ==="
+if [ ${#MEMBERS[@]} -lt $(( N + 2 )) ]; then
+	rk_skip_check "T14: needs $(( N + 2 )) members"
+elif setup "${M}r" "$N"; then
+	mk_pattern "$RK_TMP/G" 16
+	put "$RK_TMP/G" 0 1M
+	CAP=$(( $(qlim max_hw_sectors_kb) * 2 ))
+	NEWROW=$(( (N + 2 - M) * CHUNK_KB * 2 ))
+	for d in "${MEMBERS[@]:$N:2}"; do
+		for h in /sys/block/"$(basename "$d")"/holders/md*; do
+			[ -e "$h" ] && sudo "$MDADM" --stop "/dev/$(basename "$h")" >/dev/null 2>&1
+		done
+		sudo "$MDADM" --zero-superblock "$d" >/dev/null 2>&1
+	done
+	if ! sudo "$MDADM" --add "$MD" "${MEMBERS[@]:$N:2}" >/dev/null 2>&1; then
+		rk_fail "T14: add ${MEMBERS[*]:$N:2} as spares for the grow"
+	elif sudo "$MDADM" --grow "$MD" --raid-devices=$(( N + 2 )) --backup-file="$RK_TMP/t14.bak" >/dev/null 2>&1; then
+		sleep 1; rk_wait_idle
+		WANT=$(( NEWROW < CAP ? NEWROW : CAP ))
+		[ "$(qlim chunk_sectors)" = "$WANT" ] \
+			&& rk_pass "T14: chunk_sectors $WANT (row $NEWROW, bio cap $CAP)" \
+			|| rk_fail "T14: chunk_sectors $(qlim chunk_sectors), want $WANT (row $NEWROW, bio cap $CAP)"
+		same "$RK_TMP/G" 0 && rk_pass "T14: data reads back after the grow" || rk_fail "T14: data WRONG after the grow"
+	else
+		rk_fail "T14: grow to $(( N + 2 )) devices"
+	fi
+else
+	rk_fail "T14: create ${N}/${M}"
 fi
 
 [ "$(splats)" = 0 ] && rk_pass "no WARN/BUG/KASAN/hung task" || rk_fail "$(splats) kernel splat line(s)"

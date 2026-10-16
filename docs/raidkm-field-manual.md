@@ -780,11 +780,13 @@ then available, which is the usual reason to convert.
 | `rk_dcl_reshape` | Declustered: reshape control/state | — |
 | `stripe_cache_active` | Read-only occupancy | — |
 
-Rounding caveat on `worker_thread_cnt`: the value is divided across
-`num_possible_nodes()` groups with *ceiling* division, so the realized total can
-exceed what you wrote — writing 5 on a 2-NUMA box yields 3 × 2 = 6, and the
-read-back reflects 6. Never silently less parallelism than requested;
-single-NUMA hosts are unaffected. Debug builds add `raidkm_reshape_inject`,
+Rounding caveat on `worker_thread_cnt`: the value is divided across the worker
+groups (one per node ID up to the highest possible node, `nr_node_ids`) with
+*ceiling* division, so the realized total can exceed what you wrote — writing 5
+on a 2-NUMA box yields 3 × 2 = 6, and the read-back reflects 6. Never silently
+less parallelism than requested; single-NUMA hosts are unaffected. On a
+possible-node map with holes (nodes 0 and 8, say) each hole still gets a group
+that never runs, and the read-back counts its workers. Debug builds add `raidkm_reshape_inject`,
 `raidkm_reshape_jtest`, `raidkm_reshape_maptest` and `raidkm_reshape_start`.
 
 ### module parameters — `raidkm.ko`

@@ -67,37 +67,6 @@
 #include "raid_km-log.h"
 #include "../isa-l/isa-l_ec.h"
 
-/*
- * rdev_has_badblock() with the member's bad-block writers held off.
- *
- * badblocks_check() walks the list without a lock and redoes the walk when
- * read_seqretry() says a writer changed it.  Since 7e76336e14de (6.15, and
- * RHEL 10's 6.12) a walk over a list that is being changed can trip
- * WARN_ON(sectors < len) in _badblocks_check() before it gets to the retry:
- * the answer after the retry is right, but the WARN taints the kernel and
- * panics a panic_on_warn host.  check and repair produce exactly that case,
- * a "read error corrected" clearing a range while other stripes of the same
- * member look it up.  Holding the seqlock's spinlock keeps badblocks_set()
- * and badblocks_clear() out for the walk; they take it with interrupts off
- * and take nothing under it, so any context may hold it here.  Only members
- * with a recorded bad block pay for the lock.
- */
-static inline int rk_has_badblock(struct md_rdev *rdev, sector_t s,
-				  int sectors)
-{
-	unsigned long flags;
-	int rv;
-
-	if (likely(!READ_ONCE(rdev->badblocks.count)))
-		return 0;
-	read_seqlock_excl_irqsave(&rdev->badblocks.lock, flags);
-	rv = rdev_has_badblock(rdev, s, sectors);
-	read_sequnlock_excl_irqrestore(&rdev->badblocks.lock, flags);
-	return rv;
-}
-/* every lookup goes through the lock above */
-#pragma GCC poison rdev_has_badblock is_badblock
-
 #define UNSUPPORTED_MDDEV_FLAGS	(1L << MD_FAILFAST_SUPPORTED)
 
 /*
@@ -17831,12 +17800,13 @@ raid5_rmw_level = __ATTR(rmw_level, S_IRUGO | S_IWUSR,
 /*
  * The tunings whose store suspends the array (stripe_size, skip_copy,
  * group_thread_cnt, worker_thread_cnt) answer a write of the value they
- * already have before the suspend.  (consistency_policy is not one: a write of
- * the current policy is refused, -EINVAL, as in stock raid5.)  Tuning tools rewrite every value on
- * every md change uevent (mdadm --readwrite, a writer closing the device), and
- * each suspend would drain the array's I/O for nothing.  Read as the show
- * functions read it; the store compares again under the reconfig mutex, so a
- * change racing with this one still lands.
+ * already have before the suspend.  Tuning tools rewrite every value on every
+ * md change uevent (mdadm --readwrite, a writer closing the device), and each
+ * suspend would drain the array's I/O for nothing.  consistency_policy still
+ * suspends first: like stock raid5, it refuses a write of the current policy
+ * (-EINVAL) only after the suspend, so a tool that rewrites it pays one.
+ * Read as the show functions read it; the store compares again under the
+ * reconfig mutex, so a change racing with this one still lands.
  */
 enum raid5_tunable {
 	R5T_STRIPE_SIZE,
@@ -18619,8 +18589,9 @@ raid5_group_thread_cnt = __ATTR(group_thread_cnt, S_IRUGO | S_IWUSR,
  * worker_thread_cnt: the same setting expressed as TOTAL worker threads,
  * which is the natural mental model for users ("I want N parallel workers").
  * Reads return worker_cnt_per_group * group_cnt; writes divide by the number
- * of groups (= num_possible_nodes(), what alloc_thread_groups() picks),
- * rounding up so the array gets AT LEAST the requested total.  This is a
+ * of groups (= nr_node_ids, what alloc_thread_groups() picks: the node-ID
+ * range, not num_possible_nodes(), which is smaller on a sparse possible
+ * map), rounding up so the array gets AT LEAST the requested total.  This is a
  * raidkm-specific alias for group_thread_cnt; both are R/W and refer to the
  * same underlying state.
  */
@@ -18654,11 +18625,7 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	if (new_total > 8192)
 		return -EINVAL;
 
-	nodes = num_possible_nodes();
-	/* Defensive: a running kernel always has node 0 in the possible map,
-	 * but a broken invariant upstream shouldn't OOPS us with a div-by-0. */
-	if (WARN_ON_ONCE(nodes == 0))
-		nodes = 1;
+	nodes = nr_node_ids;	/* the group count, as the show multiplies by */
 	if (new_total == 0)
 		new_per_group = 0;
 	else
@@ -20217,9 +20184,13 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	 * disabled (cnt=0), but a probe on raid6 over tmpfs loops showed +43%
 	 * write throughput at cnt=2 because the single raid5d kthread otherwise
 	 * caps at ~75% of one core. Auto-default targets TOTAL worker threads
-	 * ~= nproc/2 regardless of NUMA topology: alloc_thread_groups() creates
-	 * num_possible_nodes() groups each with wcnt workers, so we divide
-	 * nproc/2 by node count for the per-group value here. Floor of 2 per
+	 * ~= nproc/2 regardless of NUMA topology.  alloc_thread_groups() creates
+	 * nr_node_ids groups, but stripes are only queued to the group of a CPU's
+	 * node (worker_groups[cpu_to_node()]), so a node ID that is a hole in a
+	 * sparse possible map ("0,8": 9 groups, 2 nodes) has a group that never
+	 * works: divide nproc/2 by the possible nodes, not the group count, for a
+	 * schedulable total of ~nproc/2.  (worker_thread_cnt's store divides by
+	 * the group count instead: it inverts its show.) Floor of 2 per
 	 * group preserves the win on small hosts; users can override via the
 	 * default_group_thread_cnt module parameter (per group) or per-array
 	 * sysfs: worker_thread_cnt (total, recommended) or group_thread_cnt
@@ -20227,11 +20198,8 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	 */
 	{
 		int wcnt = default_group_thread_cnt;
-		unsigned int nodes = num_possible_nodes();
-		/* Defensive: a running kernel always has node 0 in the possible
-		 * map, but a broken invariant shouldn't OOPS us with a div-by-0. */
-		if (WARN_ON_ONCE(nodes == 0))
-			nodes = 1;
+		unsigned int nodes = num_possible_nodes();	/* see above */
+
 		if (wcnt < 0)
 			wcnt = max(num_online_cpus() / (2u * nodes), 2u);
 		if (!alloc_thread_groups(conf, wcnt, &group_cnt, &new_group)) {
@@ -20674,13 +20642,16 @@ static int only_parity(int raid_disk, int algo, int raid_disks, int max_degraded
  * raid_disks is the pool width N (every group plus the distributed
  * spares), so raid_disks - max_degraded is not the width of anything a
  * single write can span.  Reported to the block layer as optimal_io_size,
- * which mke2fs & co. turn into fs stride/stripe_width.
+ * which mke2fs & co. turn into fs stride/stripe_width.  raid_disks - m, not
+ * - max_degraded: across a parity change that is max(prev_m, m) until
+ * raid5_finish_reshape() collapses it, one short of k after a remove-parity,
+ * and io_opt, the bio cap's floor and the row boundary must agree.
  */
 static int raid5_stripe_data_disks(struct r5conf *conf)
 {
 	if (conf->dcl)
 		return conf->dcl->k;
-	return conf->raid_disks - conf->max_degraded;
+	return conf->raid_disks - conf->m;
 }
 
 /*
@@ -20712,9 +20683,39 @@ static int raid5_create_ctx_pool(struct r5conf *conf)
 }
 
 /*
+ * The row in sectors, the boundary bios are split at (lim.chunk_sectors).
+ * From the geometry, not from lim.io_opt: stacking makes that the lcm with a
+ * member's own io_opt (NVMe NOWS, dm, nested md), which is not the row.
+ */
+static unsigned int raidkm_row_sectors(struct r5conf *conf)
+{
+	return conf->chunk_sectors * raid5_stripe_data_disks(conf);
+}
+
+/*
+ * The largest bio the block layer will send us: what blk_validate_limits()
+ * makes max_sectors of -- max_hw_sectors, a member's transfer limit stacked
+ * in as max_dev_sectors, and the user's max_sectors_kb, the smallest set.
+ * Taken when the limits are set and when a reshape ends: a max_sectors_kb
+ * written on the array later is not followed (the queue has no hook for
+ * us), and a value below the row then gets bios cut at both.
+ */
+static unsigned int raidkm_bio_cap(const struct queue_limits *lim)
+{
+	unsigned int cap = lim->max_hw_sectors;
+
+	if (lim->max_dev_sectors)
+		cap = min(cap, lim->max_dev_sectors);
+	if (lim->max_user_sectors)
+		cap = min(cap, lim->max_user_sectors);
+	return cap;
+}
+
+/*
  * A reshape moved the row: mddev_update_io_opt() with the row boundary
- * raid5_set_limits() splits bios at (lim.chunk_sectors) moved along, or
- * bios would go on being split at the old row and miss the row path.
+ * raid5_set_limits() splits bios at moved along, or bios would go on being
+ * split at the old row and miss the row path.  io_min is recomputed too:
+ * after a chunk-size reshape the live one is the old chunk.
  */
 static void raidkm_update_row_limits(struct r5conf *conf)
 {
@@ -20727,8 +20728,26 @@ static void raidkm_update_row_limits(struct r5conf *conf)
 	if (mddev_suspend(mddev, false) < 0)
 		return;
 	lim = queue_limits_start_update(mddev->gendisk->queue);
+	lim.io_min = conf->chunk_sectors << 9;
 	lim.io_opt = lim.io_min * raid5_stripe_data_disks(conf);
-	lim.chunk_sectors = lim.io_opt >> 9;
+	/*
+	 * raid5_set_limits()'s rule again for the new row: a member's request
+	 * cap (max_user_sectors, stacked in at run time) below a row splits
+	 * every full-row write -- a cap that was at least the old row can be
+	 * below a grown one.
+	 */
+	if (lim.max_user_sectors && (lim.max_user_sectors << 9) < lim.io_opt)
+		lim.max_user_sectors = 0;
+	/*
+	 * No larger than the bio cap (raidkm_bio_cap()): raid5_set_limits()
+	 * raises max_hw_sectors to a row only at run time (the request
+	 * context's stripe bitmap is sized from it once,
+	 * raid5_create_ctx_pool()), so a reshape that grows the row past it
+	 * would get bios cut at both the cap and the row
+	 * (2048/512/2048/512 for a 2560-sector row) -- the row path cannot
+	 * take a row larger than a bio anyway until the array is restarted.
+	 */
+	lim.chunk_sectors = min(raidkm_row_sectors(conf), raidkm_bio_cap(&lim));
 	queue_limits_commit_update(mddev->gendisk->queue, &lim);
 	mddev_resume(mddev);
 }
@@ -20760,7 +20779,9 @@ static int raid5_set_limits(struct mddev *mddev)
 	stripe = roundup_pow_of_two(data_disks * (mddev->chunk_sectors << 9));
 
 	md_init_stacking_limits(&lim);
-	lim.io_min = mddev->chunk_sectors << 9;
+	/* the current chunk (conf's: the new one mid chunk-size reshape), as
+	 * the row boundary below uses */
+	lim.io_min = conf->chunk_sectors << 9;
 	lim.io_opt = lim.io_min * raid5_stripe_data_disks(conf);
 	lim.features |= BLK_FEAT_RAID_PARTIAL_STRIPES_EXPENSIVE;
 
@@ -20791,9 +20812,10 @@ static int raid5_set_limits(struct mddev *mddev)
 	 * stripe cache.  Split at rows, only the partial rows at a bio's ends
 	 * take the stripe cache.  Set after the stacking above: a member's own
 	 * boundary (an NVMe NOIOB, say) is in the member's sectors, not ours,
-	 * and would otherwise narrow this one to a fraction of a row.
+	 * and would otherwise narrow this one to a fraction of a row.  Capped
+	 * at the bio cap below, once that is final.
 	 */
-	lim.chunk_sectors = lim.io_opt >> 9;
+	lim.chunk_sectors = raidkm_row_sectors(conf);
 
 	/*
 	 * Zeroing is required for discard, otherwise data could be lost.
@@ -20835,6 +20857,17 @@ static int raid5_set_limits(struct mddev *mddev)
 	 */
 	if (lim.max_user_sectors && (lim.max_user_sectors << 9) < lim.io_opt)
 		lim.max_user_sectors = 0;
+
+	/*
+	 * The row boundary no larger than the bio cap, as in
+	 * raidkm_update_row_limits().  max_hw_sectors is at least io_opt, the
+	 * row, but the cap can still be lower: a member's transfer limit
+	 * (max_dev_sectors) stacks in below it, and the stacking above zeroes
+	 * io_opt when it is not a multiple of a member's physical block size,
+	 * leaving max_hw_sectors at the fixed RAID5_MAX_REQ_STRIPES floor --
+	 * a larger row would get bios cut at both.
+	 */
+	lim.chunk_sectors = min(lim.chunk_sectors, raidkm_bio_cap(&lim));
 
 	/* No restrictions on the number of segments in the request */
 	lim.max_segments = USHRT_MAX;

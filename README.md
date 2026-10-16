@@ -960,8 +960,8 @@ On large-IU flash:
 #### Worker threads
 
 raidkm already auto-enables raid5 **worker groups**: total worker threads default
-to `max(num_online_cpus()/2, 2)`, distributed across `num_possible_nodes()` groups
-(the kernel creates one worker group per NUMA node).  The single `raid5d` kthread
+to about `max(num_online_cpus()/2, 2)`, split across the NUMA nodes (one worker
+group per node ID; only the groups of nodes with CPUs get work).  The single `raid5d` kthread
 would otherwise cap stripe handling at ~one core; worker groups are on out of the
 box — the benchmark above was measured with them — so there is no large "free"
 win sitting unused.  The one knob worth revisiting per host:
@@ -979,13 +979,16 @@ win sitting unused.  The one knob worth revisiting per host:
   group × 2 groups); raising to 32 puts it at one worker per core.  To override:
   `echo 4 | sudo tee /sys/block/md70/md/worker_thread_cnt`.
 
-  *Rounding:* the written value is divided across `num_possible_nodes()` groups
-  with ceiling division, so the **actual** worker thread count may be higher than
-  what you wrote when the total isn't evenly divisible by the node count.  E.g.,
-  writing 5 on a 2-NUMA box yields 3 per group × 2 groups = 6 workers; the
+  *Rounding:* the written value is divided across the worker groups — one per
+  node ID up to the highest possible node (`nr_node_ids`) — with ceiling
+  division, so the **actual** worker thread count may be higher than what you
+  wrote when the total isn't evenly divisible by the group count.  E.g., writing
+  5 on a 2-NUMA box (nodes 0-1) yields 3 per group × 2 groups = 6 workers; the
   read-back reflects the realized total (6), not what you wrote (5).  This never
   happens on single-NUMA hosts.  The choice to round up rather than down ensures
-  you never silently get less parallelism than requested.
+  you never silently get less parallelism than requested.  On a possible-node
+  map with holes (e.g. nodes 0 and 8) a hole still gets a group, which never
+  runs: the read-back counts its workers too.
 - **`group_thread_cnt`** (`/sys/block/mdX/md/group_thread_cnt`, or the
   `default_group_thread_cnt` module param at load).  Stock-mdraid-compatible
   view: **threads per worker group** (total = `group_thread_cnt × num_groups`).

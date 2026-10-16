@@ -127,7 +127,7 @@ run() {
 	echo "$1" > "$(SYS sync_action)"
 	# md starts the pass from its own thread, which on a busy array can be
 	# later than a look at /proc/mdstat: wait on sync_action
-	rk_wait_pass
+	rk_wait_pass "$1"
 	cat "$(SYS mismatch_cnt)"
 }
 reassemble() {	# stop and assemble: nothing stays cached, the array is clean

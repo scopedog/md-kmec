@@ -1607,4 +1607,36 @@ int raidkm_dcl_test_chain_root(struct r5conf *conf, sector_t row, int X);
 /* P0 reshape geometry-select consistency sweep over the OLD address space
  * (raid_km.c; notes/declustered-reshape-design.md §8 Phase P0) */
 int raidkm_dcl_test_reshape(struct r5conf *conf, u64 old_rows, u64 *bad);
+/*
+ * rdev_has_badblock() with the member's bad-block writers held off.
+ *
+ * badblocks_check() walks the list without a lock and redoes the walk when
+ * read_seqretry() says a writer changed it.  Since 7e76336e14de (6.15, and
+ * RHEL 10's 6.12) a walk over a list that is being changed can trip
+ * WARN_ON(sectors < len) in _badblocks_check() before it gets to the retry:
+ * the answer after the retry is right, but the WARN taints the kernel and
+ * panics a panic_on_warn host.  check and repair produce exactly that case,
+ * a "read error corrected" clearing a range while other stripes of the same
+ * member look it up.  Holding the seqlock's spinlock keeps badblocks_set()
+ * and badblocks_clear() out for the walk; they take it with interrupts off
+ * and take nothing under it, so any context may hold it here.  Only members
+ * with a recorded bad block pay for the lock.
+ */
+static inline int rk_has_badblock(struct md_rdev *rdev, sector_t s,
+				  int sectors)
+{
+	unsigned long flags;
+	int rv;
+
+	if (likely(!READ_ONCE(rdev->badblocks.count)))
+		return 0;
+	read_seqlock_excl_irqsave(&rdev->badblocks.lock, flags);
+	rv = rdev_has_badblock(rdev, s, sectors);
+	read_sequnlock_excl_irqrestore(&rdev->badblocks.lock, flags);
+	return rv;
+}
+/* every lookup, in every object that includes this after md.h, goes
+ * through the lock above */
+#pragma GCC poison rdev_has_badblock is_badblock
+
 #endif

@@ -371,8 +371,17 @@ rk_readback() {
 # on a busy array can come after rk_wait_idle's first look: rk_wait_idle alone
 # then returns at once, and the caller reads the mismatch_cnt of a pass that
 # has not run yet.
-rk_wait_pass() {
+rk_wait_pass() {	# rk_wait_pass [<the action written>]
 	local i
+	# A written resync only sets MD_RECOVERY_NEEDED, which sync_action shows
+	# as idle until md's thread starts the pass (check/repair show at once):
+	# see a resync start before waiting for it to end.
+	if [ "${1:-}" = resync ]; then
+		for i in $(seq 1 100); do
+			[ "$(cat "/sys/block/$MDNAME/md/sync_action" 2>/dev/null)" != idle ] && break
+			sleep 0.05
+		done
+	fi
 	for i in $(seq 1 2400); do
 		case $(cat "/sys/block/$MDNAME/md/sync_action" 2>/dev/null) in
 		check|repair|resync|recover|reshape) sleep 0.25 ;;
@@ -428,25 +437,44 @@ rk_geom() { grep -A1 "$MDNAME" /proc/mdstat | tail -1 | grep -o '\[[0-9]*/[0-9]*
 #                  under the same fault-injection load reproduces it, and
 #                  upstream suppresses it there; RHEL 10.2 kernels predate that.
 RK_DMESG_KNOWN='at kernel/dma/debug[.]c:[0-9]+ add_dma_entry'
+# Known only when no reliable raidkm frame is in the block's call trace:
+#   _badblocks_check  block/badblocks.c WARN_ON(sectors < len) (7e76336e14de,
+#                  6.15; RHEL 10's 6.12): the lockless lookup walks a bad-block
+#                  list a writer is changing and WARNs before its seqlock retry
+#                  (the answer after the retry is right).  Stock md's lookups
+#                  (the raid6 control arrays some suites run) are exposed;
+#                  raidkm's take the list's lock (rk_has_badblock), so the same
+#                  WARN with a reliable [raidkm] frame (not a "? " one) means
+#                  a lookup that bypassed it and still fails.  RHEL 10.2
+#                  prints "at <file>:<line> <func>", Ubuntu 26.04
+#                  "<file>:<line> at <func>".
+RK_DMESG_KNOWN_STOCK='block/badblocks[.]c:[0-9]+.*_badblocks_check'
 
 # Kernel reports that fail a suite (raidkm-test-ci.sh scans each suite's log
 # with this; suites that judge their own dmesg windows use rk_dmesg_splats).
 RK_SPLAT='BUG: KASAN|KASAN:|possible circular locking|inconsistent lock state|WARNING: possible|BUG: sleeping function|ODEBUG:|suspicious RCU usage|BUG: spinlock|bad unlock balance|held lock freed|WARNING: CPU|BUG: unable|Oops|kernel BUG|task .* blocked for more than'
 
-# Filter a kernel log on stdin: drop every WARN block matching RK_DMESG_KNOWN.
-# The number of blocks dropped goes to the file named by $1, if given.
+# Filter a kernel log on stdin: drop every WARN block matching RK_DMESG_KNOWN,
+# and every one matching RK_DMESG_KNOWN_STOCK with no [raidkm] frame.  The
+# number of blocks dropped goes to the file named by $1, if given.
 rk_dmesg_filter_known() {
-	awk -v known="$RK_DMESG_KNOWN" -v countfile="${1:-}" '
-		function flush(keep) { if (keep) printf "%s", blk; blk = ""; inblk = 0; hit = 0 }
+	awk -v known="$RK_DMESG_KNOWN" -v stock="$RK_DMESG_KNOWN_STOCK" \
+	    -v countfile="${1:-}" '
+		function known_blk() { return hit || (shit && !ours) }
+		function flush(keep) { if (keep) printf "%s", blk; blk = ""; inblk = 0; hit = shit = ours = 0 }
 		/-+\[ cut here \]-+/ { if (inblk) flush(1); inblk = 1; blk = $0 "\n"; next }
 		inblk {
 			blk = blk $0 "\n"
 			if ($0 ~ known) hit = 1
-			if ($0 ~ /---\[ end trace/) { if (hit) n++; flush(!hit) }
+			if (stock != "" && $0 ~ stock) shit = 1
+			# a reliable raidkm frame: not a "? " one, which the
+			# unwinder only found as a stale address on the stack
+			if ($0 ~ /\[raidkm\]/ && $0 !~ /(^|\]) +\? /) ours = 1
+			if ($0 ~ /---\[ end trace/) { k = known_blk(); if (k) n++; flush(!k) }
 			next
 		}
 		{ print }
-		END { if (inblk) { if (hit) n++; flush(!hit) } if (countfile != "") print n + 0 > countfile }'
+		END { if (inblk) { k = known_blk(); if (k) n++; flush(!k) } if (countfile != "") print n + 0 > countfile }'
 }
 
 # Count the RK_SPLAT lines of a kernel log file, known artifacts excluded; the

@@ -6,7 +6,7 @@
 #
 #   T1  happy path m=3->2 (rotating) via mdadm --grow --remove-parity:
 #       completes online, data byte-exact, capacity unchanged, settled scrub
-#       clean, raid_disks collapsed.
+#       clean, raid_disks collapsed, queue chunk_sectors still the k-chunk row.
 #   T2  decode oracle at the NEW m: fail m-1 members -> reconstruct; freed
 #       member -> spare -> removable; survivors-only reassemble persists.
 #   T3  same happy path on PARITY_N (uniform COW covers both layouts).
@@ -16,7 +16,8 @@
 #   T7  csum: remove-parity on a --checksum array -> zero mismatches on full
 #       re-read + the csum layout bit SURVIVES (--examine crc32c) — proves
 #       the m-only layout-word rule + band re-key.
-#   T8  crash: --stop mid-walk -> reassemble -> journal recovery resumes ->
+#   T8  crash: --stop mid-walk -> reassemble (queue chunk_sectors within the
+#       bio cap) -> journal recovery resumes ->
 #       completes; data + settled scrub + decode.
 #
 # Env: RP_N (default 7 -> k=4 at m=3), PATMB, SYNC_MAX_KB.
@@ -81,6 +82,18 @@ verify_after() {	# verify_after <tag> <want_m> <want_n>
 	nd=$(sudo "$MDADM" --detail "$MD" | sed -n 's/.*Raid Devices : \([0-9]*\).*/\1/p')
 	[ "$nd" = "$want_n" ] && rk_pass "$tag: raid_disks now $want_n" \
 			      || rk_fail "$tag: raid_disks=$nd (want $want_n)"
+	# the row is k chunks before and after: bios still split at it (queue
+	# chunk_sectors), not at k-1 chunks from the old max_degraded.  (Or at
+	# the bio cap if the row were larger; on brd it is not: the cap follows
+	# io_opt, the row.  row-write T14 is what covers a capped boundary.)
+	local cs row cap want
+	cs=$(( $(cat /sys/block/$MDNAME/md/chunk_size) / 512 ))
+	row=$(( (want_n - want_m) * cs ))
+	cap=$(( $(cat /sys/block/$MDNAME/queue/max_hw_sectors_kb) * 2 ))
+	want=$(( row < cap ? row : cap ))
+	[ "$(cat /sys/block/$MDNAME/queue/chunk_sectors)" = "$want" ] &&
+		rk_pass "$tag: chunk_sectors $want (row of $((want_n - want_m)) data chunks $row, bio cap $cap)" ||
+		rk_fail "$tag: chunk_sectors $(cat /sys/block/$MDNAME/queue/chunk_sectors), want $want (row $row, bio cap $cap)"
 	mm=$(scrub_settled)
 	[ "$mm" = 0 ] && rk_pass "$tag: settled scrub clean" \
 		      || rk_fail "$tag: scrub mismatch_cnt=$mm"
@@ -219,6 +232,12 @@ if remove_parity; then
 	sudo dmesg | grep -qiE "reshape.*(recover|resum)|resuming reshape|md: reshape" &&
 		rk_pass "T8: reshape resumed on reassemble" ||
 		rk_fail "T8: no reshape resume evidence in dmesg"
+	# started mid-walk: the boundary is the k-chunk row and within the bio
+	# cap (both from the current geometry, raid_disks - m)
+	cs=$(cat /sys/block/$MDNAME/queue/chunk_sectors)
+	cap=$(( $(cat /sys/block/$MDNAME/queue/max_hw_sectors_kb) * 2 ))
+	[ "$cs" -le "$cap" ] && rk_pass "T8: mid-walk chunk_sectors $cs within the bio cap $cap" ||
+		rk_fail "T8: mid-walk chunk_sectors $cs over the bio cap $cap"
 	echo 2000000 | sudo tee /sys/block/$MDNAME/md/sync_speed_max >/dev/null
 	wait_reshape_done || { rk_fail "T8: resumed reshape did not finish"; rk_summary; exit 1; }
 	verify_after "T8" 2 "$((N-1))"

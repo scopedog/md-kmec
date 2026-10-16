@@ -64,13 +64,19 @@
 # Needs: root, bash, the raidkm and isal_lib modules (build tree or packaged),
 # the brd module, and about 2 GiB of free memory for the ramdisks.
 #
-# Output (DIR): <suite>.log and <suite>.dmesg per suite, summary.txt, results.xml
-# (JUnit), env.txt.  Exit status: 0 only when every suite passed or was skipped
-# with a clean kernel log; 1 on any failure; 2 on a pre-flight refusal.
+# Output (DIR): <suite>.log, <suite>.dmesg (the suite's whole kernel log) and
+# <suite>.tail.dmesg (what the suite did not clear itself: the verdict's log)
+# per suite, summary.txt, results.xml (JUnit), env.txt.  Exit status: 0 only
+# when every suite passed or was skipped with a clean kernel log; 1 on any
+# failure; 2 on a pre-flight refusal.
 #
 # Kernel log: known platform artifacts (RK_DMESG_KNOWN in raidkm-test-lib.sh,
-# today the dma-debug cacheline EEXIST false positive) are left out of the
-# verdict and counted in the suite's note instead.
+# today the dma-debug cacheline EEXIST false positive; RK_DMESG_KNOWN_STOCK,
+# the badblocks.c WARN when no reliable raidkm frame is in its trace) are left
+# out of the verdict and counted in the suite's note instead.  Warnings the
+# suite cleared itself are not in the verdict either (a suite that clears has
+# judged them, or wraps a harness that does): the note counts them, from the
+# whole log.
 #
 
 set -u
@@ -242,22 +248,44 @@ xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\
 # their own checks (dmesg -C), so a snapshot taken after the suite holds only
 # what came after its last clear.  A /dev/kmsg reader (dmesg -w) keeps its own
 # position: started right after the runner's clear, it sees every line the
-# suite produces, whatever the suite clears.
-KLOG_PID=
-klog_start() {	# klog_start <file>
-	dmesg -w > "$1" 2>/dev/null &
-	KLOG_PID=$!
-}
-klog_stop() {	# klog_stop <file> <suite>
-	local tag="raidkm-test-ci: end of $2" i
-	echo "$tag" > /dev/kmsg 2>/dev/null
-	for i in $(seq 50); do			# the reader is behind until it shows the tag
-		grep -qF "$tag" "$1" && break
+# suite produces, whatever the suite clears -- once it has opened /dev/kmsg,
+# which is why the suite starts only after the reader has shown a start tag.
+KLOG_PID= KLOG_OK=0
+klog_tag() {	# klog_tag <file> <tag>: true once the reader wrote the tag
+	local i
+	for i in $(seq 50); do
+		grep -qF "$2" "$1" && return 0
+		kill -0 "$KLOG_PID" 2>/dev/null || return 1	# the reader is gone
 		sleep 0.1
 	done
+	return 1
+}
+klog_start() {	# klog_start <file> <suite>
+	local tag="raidkm-test-ci: start of $2"
+	# dmesg -w writes each line as it comes, a file included (util-linux
+	# 2.40.2: a tag written to /dev/kmsg is in the file 0.3 s later), so no
+	# tail is left in a buffer when the reader is stopped
+	dmesg -w > "$1" 2>/dev/null &
+	KLOG_PID=$!
+	echo "$tag" > /dev/kmsg 2>/dev/null
+	KLOG_OK=0; klog_tag "$1" "$tag" && KLOG_OK=1
+}
+klog_stop() {	# klog_stop <file> <suite>
+	local tag="raidkm-test-ci: end of $2" ended=1
+	echo "$tag" > /dev/kmsg 2>/dev/null
+	[ "$KLOG_OK" = 1 ] && ! klog_tag "$1" "$tag" && ended=0
+	# stop the reader before writing to its file: it writes through its own
+	# fd, and would write its last lines over a note appended meanwhile
 	kill "$KLOG_PID" 2>/dev/null; wait "$KLOG_PID" 2>/dev/null; KLOG_PID=
-	# no reader (no dmesg -w): the snapshot, as before
-	grep -qF "$tag" "$1" || dmesg > "$1" 2>/dev/null
+	# nothing captured (no dmesg -w, no readable /dev/kmsg): the snapshot,
+	# as before -- never in place of a capture that has lines
+	if [ ! -s "$1" ]; then
+		dmesg > "$1" 2>/dev/null
+	elif [ "$KLOG_OK" != 1 ]; then
+		echo "raidkm-test-ci: the kernel log reader did not show the start tag; the start of this log may be missing" >> "$1"
+	elif [ "$ended" = 0 ]; then
+		echo "raidkm-test-ci: the kernel log reader did not reach the end tag; the end of this log may be missing" >> "$1"
+	fi
 }
 trap '[ -n "$KLOG_PID" ] && kill "$KLOG_PID" 2>/dev/null' EXIT
 
@@ -285,13 +313,17 @@ for s in "${SUITES[@]}"; do
 	declared=${SUITE_TIMEOUTS[${s%%@*}]:-0}
 	[ "$declared" -gt "$limit" ] && limit=$declared
 	start=$(date +%s)
-	klog_start "$OUTPUT/$f.dmesg"
+	klog_start "$OUTPUT/$f.dmesg" "$s"
 	timeout --foreground --kill-after=60 "$limit" \
 		bash "$DIR/raidkm-test-${s%%@*}.sh" > "$OUTPUT/$f.log" 2>&1
 	rc=$?
 	secs=$(( $(date +%s) - start ))
 	[ -n "$pfile" ] && echo "$pold" > "$pfile"
 	klog_stop "$OUTPUT/$f.dmesg" "$s"
+	# the verdict's log: what the suite did not clear itself.  A suite that
+	# clears its kernel log (dmesg -C, or a harness it wraps) has judged what
+	# came before; <suite>.dmesg keeps all of it to read.
+	dmesg > "$OUTPUT/$f.tail.dmesg" 2>/dev/null
 	dmesg -C 2>/dev/null
 	line=$(grep -E "==== .*: [0-9]+ passed, [0-9]+ failed(, [0-9]+ skipped)? ====" "$OUTPUT/$f.log" | tail -1)
 	passed=$(sed -n 's/.*: \([0-9]*\) passed.*/\1/p' <<< "$line")
@@ -299,7 +331,7 @@ for s in "${SUITES[@]}"; do
 	# checks the environment could not express (rk_skip_check): reported so a
 	# green tier still says what it did not get to try
 	cskip=$(sed -n 's/.*[^0-9]\([0-9]*\) skipped.*/\1/p' <<< "$line")
-	splats=$(rk_dmesg_splats "$OUTPUT/$f.dmesg" "$OUTPUT/$f.known")
+	splats=$(rk_dmesg_splats "$OUTPUT/$f.tail.dmesg" "$OUTPUT/$f.known")
 	known=$(cat "$OUTPUT/$f.known" 2>/dev/null); rm -f "$OUTPUT/$f.known"
 	note=""
 	status=pass
@@ -316,8 +348,11 @@ for s in "${SUITES[@]}"; do
 		status=fail; note="$failed failed"
 	fi
 	if [ "${splats:-0}" != 0 ]; then
-		status=fail; note="${note:+$note; }$splats kernel warning line(s) in $f.dmesg"
+		status=fail; note="${note:+$note; }$splats kernel warning line(s) in $f.tail.dmesg"
 	fi
+	# the whole log: what the suite cleared is no verdict, but say it is there
+	cleared=$(( $(rk_dmesg_splats "$OUTPUT/$f.dmesg") - ${splats:-0} ))
+	[ "$cleared" -gt 0 ] && note="${note:+$note; }$cleared kernel warning line(s) before the suite's own clears, in $f.dmesg"
 	[ "${known:-0}" != 0 ] && note="${note:+$note; }$known known artifact report(s) ignored"
 	[ "${cskip:-0}" != 0 ] && note="${note:+$note; }${cskip} check(s) skipped"
 	[ "$status" = fail ] && nfail=$((nfail + 1))
@@ -362,7 +397,7 @@ fi
 			  echo "---- last 40 lines of $n.log ----"
 			  tail -40 "$OUTPUT/$n.log"
 			  echo "---- kernel warnings ----"
-			  rk_dmesg_filter_known < "$OUTPUT/$n.dmesg" | grep -E "$SPLAT" | head -20; } | xml_escape
+			  rk_dmesg_filter_known < "$OUTPUT/$n.tail.dmesg" | grep -E "$SPLAT" | head -20; } | xml_escape
 			echo "      </failure>"
 		fi
 		echo "      <system-out>${R_PASSED[$i]} passed, ${R_FAILED[$i]} failed; log $OUTPUT/$n.log</system-out>"
@@ -374,7 +409,7 @@ fi
 
 echo
 cat "$OUTPUT/summary.txt"
-echo "Results: $OUTPUT (summary.txt, results.xml, <suite>.log, <suite>.dmesg)"
+echo "Results: $OUTPUT (summary.txt, results.xml, <suite>.log, <suite>.dmesg, <suite>.tail.dmesg)"
 # A tier where every suite skipped exits 0 on the letter of "nothing failed",
 # which is exactly how a mis-specified rig (too few RK_DEVS, a module that will
 # not load) passes CI without running a line of raidkm.  Say so and fail.
