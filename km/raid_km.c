@@ -12657,23 +12657,37 @@ static void raidkm_row_write_done(struct work_struct *work)
 	raidkm_row_write_unlock(conf, w);
 	if (nfail > w->m)
 		raid_bio->bi_status = BLK_STS_IOERR;	/* beyond the parity */
-	/* a failed member leaves the array degraded, and md then keeps the
-	 * bit set: the region is resynced when the member comes back */
-	if (w->bitmap)
-		raidkm_bitmap_endwrite(mddev, w->msect, w->chunk_sectors,
-				       !nfail);
 	/*
 	 * A failed member is now a bad block or a failed disk -- in memory.
 	 * As the stripe path holds a stripe's bios while MD_SB_CHANGE_PENDING
 	 * is set, the caller's write is not acknowledged before that is on
 	 * disk: after a crash the member must not come back looking in sync
 	 * with the old contents of a chunk the caller was told is written.
+	 *
+	 * With a bitmap every row waits, not only a failed one, and before
+	 * the bitmap is told: md's end_write moves events_cleared up to
+	 * mddev->events whenever the array is not degraded, and a member
+	 * whose superblock write is failing still counts as in sync until
+	 * super_written() fails it.  A clear in that window leaves the member
+	 * behind events_cleared, and its re-add is refused for good -- a full
+	 * rebuild.  handle_stripe() keeps a stripe's clean-up behind the same
+	 * flag.
 	 */
-	if (nfail) {
+	if (nfail)
 		md_wakeup_thread(mddev->thread);
+	if (nfail || w->bitmap)
 		wait_event(mddev->sb_wait,
 			   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags));
-	}
+	/*
+	 * By now a member that failed is either a failed disk -- the array is
+	 * degraded and md keeps the bit set, the region is resynced when the
+	 * member comes back -- or has the chunk in its on-disk bad-block list.
+	 * The degraded state is all md goes by: the compat shims drop the
+	 * success argument (md's end_write hook has none).
+	 */
+	if (w->bitmap)
+		raidkm_bitmap_endwrite(mddev, w->msect, w->chunk_sectors,
+				       !nfail);
 
 	/*
 	 * The context goes back to the pool (this work item may be queued

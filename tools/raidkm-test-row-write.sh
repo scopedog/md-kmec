@@ -46,6 +46,11 @@
 #   T14 a grow that takes the row past the bio cap (8+2 -> 10+2): the
 #       boundary stays at the cap (max_hw_sectors, fixed at run time), not
 #       at the larger row, so bios are not cut at both; the data reads back.
+#   T15 a member lost under row writes on an array with a bitmap, its
+#       superblock write failing late (dm-delay over an error device) while
+#       rows keep finishing on a slow healthy member: the member comes back
+#       through --re-add (a bitmap resync, not a full rebuild) and the parity
+#       is clean afterwards.
 #
 # Usage: bash <this>    (CHUNK_KB default 128; RW_N/RW_M the classic geometry)
 set -u
@@ -62,9 +67,14 @@ MEMBERS=()
 cleanup() {
 	[ -n "${BGPID:-}" ] && kill "$BGPID" 2>/dev/null
 	sudo "$MDADM" --stop "$MD" 2>/dev/null
-	local d
+	local d t p
 	for d in "${MEMBERS[@]:-}"; do
 		[ -n "$d" ] && sudo "$MDADM" --zero-superblock "$d" 2>/dev/null
+	done
+	for p in 1 2; do	# T15's dead member is a delay over rkrwerr: two passes
+		for t in $(dmsetup ls 2>/dev/null | awk '/^rkrw/ {print $1}'); do
+			dmsetup remove "$t" 2>/dev/null
+		done
 	done
 }
 trap cleanup EXIT
@@ -534,6 +544,108 @@ elif setup "${M}r" "$N"; then
 else
 	rk_fail "T14: create ${N}/${M}"
 fi
+
+# ---- T15: a member lost while its superblock write fails ------------------------
+# A member dies under row writes.  Its first failed row records a bad block,
+# which asks for a superblock write (MD_SB_CHANGE_PENDING, events + 1); that
+# write fails on the dead member, and only then is the member failed.  A row
+# that ends its bitmap write inside that window -- the array still not
+# degraded -- moves events_cleared past the member's events, and the member's
+# re-add is refused for good (a full rebuild).  Here the dead member's
+# metadata writes fail only after a second (dm-delay over an error device) and
+# member 0's writes take 50 ms, so rows keep finishing through the window.
+# Without the wait in raidkm_row_write_done() 10 of 12 rounds were refused
+# (four runs, each failed); with it none.
+t15() {
+local i sz doff x r t0 saved=("${MEMBERS[@]}") dm=() ok=0 bad=() rig=()
+modprobe dm-delay 2>/dev/null
+if ! dmsetup targets 2>/dev/null | grep -q '^delay'; then
+	rk_skip_check "T15: no dm-delay target on this kernel"
+	return
+fi
+rk_stop
+for i in $(seq 0 $(( N - 1 ))); do
+	"$MDADM" --zero-superblock "${saved[$i]}" 2>/dev/null
+	dd if=/dev/zero of="${saved[$i]}" bs=1M count=4 status=none 2>/dev/null
+done
+rk_udev_quiesce
+sz=$(blockdev --getsz "${saved[0]}")
+dmsetup create rkrwerr --table "0 $sz error" || { rk_fail "T15: error device"; return; }
+for i in $(seq 0 $(( N - 1 ))); do
+	dmsetup create "rkrw$i" --table "0 $sz linear ${saved[$i]} 0" ||
+		{ rk_fail "T15: dm-linear setup"; break; }
+	dm+=("/dev/mapper/rkrw$i")
+done
+udevadm settle 2>/dev/null
+MEMBERS=("${dm[@]}")
+if [ "${#dm[@]}" = "$N" ] &&
+   RK_CREATE_EXTRA="--bitmap=internal --bitmap-chunk=4M" setup "${M}r" "$N"; then
+	doff=$("$MDADM" -E "${dm[1]}" | sed -n 's/.*Data Offset : \([0-9]*\) sectors.*/\1/p')
+	# the slow healthy member, now that the create's resync is over
+	if [ -z "$doff" ] ||
+	   ! dmsetup load rkrw0 --table "0 $sz delay ${saved[0]} 0 0 ${saved[0]} 0 50" ||
+	   ! dmsetup resume rkrw0; then
+		rk_fail "T15: rig: data offset '$doff' from mdadm -E, or member 0's delay table"
+	else
+	for x in 3 6 9; do
+		[ "$x" -lt "$N" ] || continue
+		sleep 6		# a quiet array: the bitmap catches up
+		fio --name=rows --filename="$MD" --rw=write --bs="$ROWB" --direct=1 \
+		    --ioengine=libaio --iodepth=16 --time_based --runtime=60 \
+		    --output="$RK_TMP/fio-t15.out" >/dev/null 2>&1 &
+		BGPID=$!
+		sleep 2
+		printf '0 %s delay /dev/mapper/rkrwerr 0 0 /dev/mapper/rkrwerr 0 1000\n%s %s error\n' \
+			"$doff" "$doff" $(( sz - doff )) | dmsetup load "rkrw$x" &&
+			dmsetup resume "rkrw$x" || rig+=("member $x: dead table not loaded")
+		t0=$SECONDS
+		while [ "$(cat "$(SYS degraded)")" = 0 ] && [ $(( SECONDS - t0 )) -lt 20 ]; do
+			sleep 0.2
+		done
+		kill "$BGPID" 2>/dev/null; wait "$BGPID" 2>/dev/null; BGPID=
+		dmsetup load "rkrw$x" --table "0 $sz linear ${saved[$x]} 0" &&
+			dmsetup resume "rkrw$x" || rig+=("member $x: linear table not restored")
+		if [ "$(cat "$(SYS degraded)")" = 0 ]; then
+			rig+=("member $x: not failed within 20 s")
+			continue
+		fi
+		for r in $(seq 50); do
+			"$MDADM" "$MD" --remove "${dm[$x]}" >/dev/null 2>&1 && break
+			sleep 0.2
+		done
+		if "$MDADM" "$MD" --re-add "${dm[$x]}" >/dev/null 2>&1; then
+			ok=$(( ok + 1 ))
+		else
+			bad+=("member $x: events $("$MDADM" -E "${dm[$x]}" | sed -n 's/.* Events : //p'), bitmap $("$MDADM" -X "${dm[1]}" | sed -n 's/^ *Events Cleared : /events_cleared /p')")
+			"$MDADM" "$MD" --add "${dm[$x]}" >/dev/null 2>&1
+		fi
+		sleep 1; rk_wait_full 2>/dev/null || rk_wait_idle
+	done
+	# a round whose member never failed says nothing about the re-add
+	[ "${#rig[@]}" = 0 ] || rk_fail "T15: rig, not a re-add verdict: ${rig[*]}"
+	if [ "${#bad[@]}" -gt 0 ]; then
+		rk_fail "T15: re-add refused ${#bad[@]} times (${bad[*]}), accepted $ok"
+	elif [ "$ok" -gt 0 ]; then
+		rk_pass "T15: $ok lost members came back through --re-add"
+	fi
+	[ "$(cat "$(SYS degraded)")" = 0 ] && scrub_clean &&
+		rk_pass "T15: back in sync, scrub clean" ||
+		rk_fail "T15: degraded $(cat "$(SYS degraded)") or parity mismatch after the resyncs"
+	fi
+else
+	rk_fail "T15: setup"
+fi
+rk_stop
+for i in "${dm[@]}"; do
+	"$MDADM" --zero-superblock "$i" 2>/dev/null
+	dmsetup remove "$(basename "$i")" 2>/dev/null
+done
+dmsetup remove rkrwerr 2>/dev/null
+MEMBERS=("${saved[@]}")
+rk_udev_quiesce
+}
+echo "=== T15: a member lost while its superblock write fails: re-add through the bitmap ==="
+t15
 
 [ "$(splats)" = 0 ] && rk_pass "no WARN/BUG/KASAN/hung task" || rk_fail "$(splats) kernel splat line(s)"
 rk_summary
