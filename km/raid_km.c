@@ -6408,17 +6408,23 @@ static bool stripe_bio_overlaps(struct stripe_head *sh, struct bio *bi,
 	return false;
 }
 
-static void __add_stripe_bio(struct stripe_head *sh, struct bio *bi,
+/*
+ * Link @bi into @sh's device @dd_idx.  Called and returns with
+ * sh->stripe_lock held.  True = the first write to that device, which the
+ * caller hands to raidkm_stripe_bitmap_start once every bio of its request
+ * is linked.
+ */
+static bool __add_stripe_bio(struct stripe_head *sh, struct bio *bi,
 			     int dd_idx, int forwrite, int previous)
 {
 	struct r5conf *conf = sh->raid_conf;
 	struct bio **bip;
-	int firstwrite = 0;
+	bool firstwrite = false;
 
 	if (forwrite) {
 		bip = &sh->dev[dd_idx].towrite;
 		if (!*bip)
-			firstwrite = 1;
+			firstwrite = true;
 	} else {
 		bip = &sh->dev[dd_idx].toread;
 	}
@@ -6455,30 +6461,62 @@ static void __add_stripe_bio(struct stripe_head *sh, struct bio *bi,
 		 (*bip)->bi_iter.bi_sector, sh->sector, dd_idx,
 		 sh->dev[dd_idx].sector);
 
-	if (conf->mddev->bitmap && firstwrite) {
-		/* Cannot hold spinlock over bitmap_startwrite,
-		 * but must ensure this isn't added to a batch until
-		 * we have added to the bitmap and set bm_seq.
-		 * So set STRIPE_BITMAP_PENDING to prevent
-		 * batching.
-		 * If multiple __add_stripe_bio() calls race here they
-		 * much all set STRIPE_BITMAP_PENDING.  So only the first one
-		 * to complete "bitmap_startwrite" gets to set
-		 * STRIPE_BIT_DELAY.  This is important as once a stripe
-		 * is added to a batch, STRIPE_BIT_DELAY cannot be changed
-		 * any more.
-		 */
-		set_bit(STRIPE_BITMAP_PENDING, &sh->state);
-		spin_unlock_irq(&sh->stripe_lock);
+	return firstwrite;
+}
+
+/*
+ * The write-intent bitmap for @nfirst first writes to @sh's devices, called
+ * with sh->stripe_lock held once the request's bios are all linked.
+ *
+ * Where md core counts writes in the bitmap (RAIDKM_MD_COUNTS_BITMAP: once
+ * per bio, before it gets here -- md_clone_bio -> raidkm_bitmap_sector, as
+ * upstream raid5 since cd5fc6533818), the stripe only has to wait for the
+ * bits to reach the disk before its member writes go out.
+ *
+ * Where it does not (an md core from before that rework), the stripe path
+ * counts them, one per device, and must drop the lock for bitmap_startwrite
+ * -- but only here, after every link.  It used to drop it in
+ * __add_stripe_bio, device by device, inside add_all_stripe_bios: after the
+ * overlap checks and between the links.  A bio for a device not yet linked
+ * could then pass its own check and go in first: two bios on one page, and
+ * the clean event (r5_next_bio stops at a bio running past the page) never
+ * completed the small one behind a full-stripe write.  STRIPE_BITMAP_PENDING
+ * keeps the stripe out of a batch meanwhile; if several requests race here
+ * they all set it, and only the first to finish bitmap_startwrite sets
+ * STRIPE_BIT_DELAY -- once the stripe is in a batch, STRIPE_BIT_DELAY cannot
+ * change any more.
+ */
+static void raidkm_stripe_bitmap_start(struct r5conf *conf,
+				       struct stripe_head *sh, int nfirst)
+	__must_hold(&sh->stripe_lock)
+{
+	if (!conf->mddev->bitmap || !nfirst)
+		return;
+#ifndef RAIDKM_MD_COUNTS_BITMAP
+	set_bit(STRIPE_BITMAP_PENDING, &sh->state);
+	spin_unlock_irq(&sh->stripe_lock);
+	while (nfirst--)	/* one per device: the clean event ends each */
 		raidkm_bitmap_startwrite(conf->mddev, sh->sector,
-					RAID5_STRIPE_SECTORS(conf));
-		spin_lock_irq(&sh->stripe_lock);
-		clear_bit(STRIPE_BITMAP_PENDING, &sh->state);
-		if (!sh->batch_head) {
-			sh->bm_seq = conf->seq_flush+1;
-			set_bit(STRIPE_BIT_DELAY, &sh->state);
-		}
+					 RAID5_STRIPE_SECTORS(conf));
+	spin_lock_irq(&sh->stripe_lock);
+	clear_bit(STRIPE_BITMAP_PENDING, &sh->state);
+#endif
+	if (!sh->batch_head) {
+		sh->bm_seq = conf->seq_flush+1;
+		set_bit(STRIPE_BIT_DELAY, &sh->state);
 	}
+}
+
+/* ... and its end, for one device of @sh whose writes are returned */
+static inline void raidkm_stripe_bitmap_end(struct r5conf *conf,
+					    struct stripe_head *sh)
+{
+#ifndef RAIDKM_MD_COUNTS_BITMAP
+	if (conf->mddev->bitmap)
+		raidkm_bitmap_endwrite(conf->mddev, sh->sector,
+				       RAID5_STRIPE_SECTORS(conf),
+				       !test_bit(STRIPE_DEGRADED, &sh->state));
+#endif
 }
 
 /*
@@ -6497,7 +6535,9 @@ static bool add_stripe_bio(struct stripe_head *sh, struct bio *bi,
 		return false;
 	}
 
-	__add_stripe_bio(sh, bi, dd_idx, forwrite, previous);
+	raidkm_stripe_bitmap_start(sh->raid_conf, sh,
+				   __add_stripe_bio(sh, bi, dd_idx, forwrite,
+						    previous));
 	spin_unlock_irq(&sh->stripe_lock);
 	return true;
 }
@@ -6544,7 +6584,7 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 	BUG_ON(sh->batch_head);
 	for (i = disks; i--; ) {
 		struct bio *bi;
-		int bitmap_end = 0;
+		bool bitmap_end = false;
 
 		if (test_bit(R5_ReadError, &sh->dev[i].flags)) {
 			struct md_rdev *rdev =
@@ -6571,7 +6611,7 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 		sh->overwrite_disks = 0;
 		spin_unlock_irq(&sh->stripe_lock);
 		if (bi)
-			bitmap_end = 1;
+			bitmap_end = true;
 
 		log_stripe_write_finished(sh);
 
@@ -6586,10 +6626,9 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 			bio_io_error(bi);
 			bi = nextbi;
 		}
-		if (bitmap_end && conf->mddev->bitmap)
-			raidkm_bitmap_endwrite(conf->mddev,
-					sh->sector, RAID5_STRIPE_SECTORS(conf), false);
-		bitmap_end = 0;
+		if (bitmap_end)
+			raidkm_stripe_bitmap_end(conf, sh);
+		bitmap_end = false;
 		/* and fail all 'written' */
 		bi = sh->dev[i].written;
 		sh->dev[i].written = NULL;
@@ -6598,7 +6637,8 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 			sh->dev[i].page = sh->dev[i].orig_page;
 		}
 
-		if (bi) bitmap_end = 1;
+		if (bi)
+			bitmap_end = true;
 		while (bi && bi->bi_iter.bi_sector <
 		       sh->dev[i].sector + RAID5_STRIPE_SECTORS(conf)) {
 			struct bio *bi2 = r5_next_bio(conf, bi, sh->dev[i].sector);
@@ -6632,9 +6672,8 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 				bi = nextbi;
 			}
 		}
-		if (bitmap_end && conf->mddev->bitmap)
-			raidkm_bitmap_endwrite(conf->mddev,
-					sh->sector, RAID5_STRIPE_SECTORS(conf), false);
+		if (bitmap_end)
+			raidkm_stripe_bitmap_end(conf, sh);
 		/* If we were in the middle of a write the parity block might
 		 * still be locked - so just clear all R5_LOCKED flags
 		 */
@@ -7292,11 +7331,7 @@ returnbi:
 					bio_endio(wbi);
 					wbi = wbi2;
 				}
-				if (conf->mddev->bitmap)
-					raidkm_bitmap_endwrite(
-						conf->mddev, sh->sector,
-						RAID5_STRIPE_SECTORS(conf),
-						!test_bit(STRIPE_DEGRADED, &sh->state));
+				raidkm_stripe_bitmap_end(conf, sh);
 				if (head_sh->batch_head) {
 					sh = list_first_entry(&sh->batch_list,
 							      struct stripe_head,
@@ -12282,22 +12317,33 @@ again:
  * rows cannot all be claimed at once, or with no context free, goes to the
  * stripe cache whole (raidkm_row_write_bio).
  *
- * Kept narrow on purpose -- everything else goes to the stripe cache: a
- * healthy array only (no degraded, recovering or replacement member), no
- * reshape, no sync pass running (raid5_sync_request waits out row writes in
- * flight: see the fence below), skip_copy on (the caller's pages are both the
- * parity source and the data written, which is only safe with the stable
- * pages skip_copy asks the block layer for), and no journal, PPL or
- * declustered layout.  A write-intent bitmap is kept as the stripe path keeps
- * it (raidkm_row_write_go / _submit / _done), and so is a native checksum:
- * the CRC of every block the row writes, data and parity, is stored before
- * any member write goes out, as ops_run_io() stores it at write issue.
+ * A degraded array keeps the row path: a member that is gone (no rdev, or
+ * Faulty) is not written, as ops_run_io() writes nothing to it, and the row
+ * is written to the others -- parity comes from the caller's k data chunks,
+ * all of which are in the bio whichever member is missing.  Its CRCs are
+ * stored all the same, as ops_run_io() stores them before it looks at the
+ * rdev: a degraded read verifies the chunk it rebuilds against them.  The
+ * write-intent bitmap keeps the row's bits while the array is degraded (md's
+ * end_write), so a re-added member is resynced over it.
+ *
+ * Kept narrow on purpose -- everything else goes to the stripe cache: no
+ * recovering or replacement member, no reshape, no sync pass running
+ * (raid5_sync_request waits out row writes in flight: see the fence below,
+ * which a recovery onto a spare runs into too), skip_copy on (the caller's
+ * pages are both the parity source and the data written, which is only safe
+ * with the stable pages skip_copy asks the block layer for), and no journal,
+ * PPL or declustered layout.  A write-intent bitmap is kept as the stripe
+ * path keeps it -- md core counts the caller's bio, the row flushes the bits
+ * before its member writes (_submit) and completes behind a pending
+ * superblock update (_done) -- and so is a native checksum: the CRC of every
+ * block the row writes, data and parity, is stored before any member write
+ * goes out, as ops_run_io() stores it at write issue.
  */
 struct raidkm_row_wctx;
 
 struct raidkm_row_wmember {
 	struct raidkm_row_wctx	*w;
-	struct md_rdev		*rdev;
+	struct md_rdev		*rdev;		/* NULL = gone, not written */
 	int			disk;		/* its slot: native-checksum key */
 	int			failed;		/* its write returned an error */
 };
@@ -12315,6 +12361,8 @@ struct raidkm_row_wctx {
 	atomic_t		pending;
 	/* fixed when built; a context of another geometry is rebuilt */
 	int			k, m;
+	int			nmissing;	/* members not written: gone */
+	int			last;		/* the last member written */
 	unsigned int		chunk_sectors;
 	atomic64_t		*wslot;		/* the row's lock slot, NULL = not locked */
 	u64			row;
@@ -12475,7 +12523,11 @@ static void raidkm_row_encode(struct r5conf *conf, unsigned int len, int k,
 		ec_encode_data_base(len, k, m, conf->ec_g_tbls_base, src, dst);
 }
 
-/* may @bi go to the row path at all?  (Per row, the members decide too.) */
+/*
+ * May @bi go to the row path at all?  A degraded array may: per row, the
+ * members decide (raidkm_row_write_prep), and they are the authority on how
+ * many are gone.
+ */
 static bool raidkm_row_write_ok(struct mddev *mddev, struct r5conf *conf,
 				struct bio *bi)
 {
@@ -12485,7 +12537,7 @@ static bool raidkm_row_write_ok(struct mddev *mddev, struct r5conf *conf,
 	       !IS_ENABLED(CONFIG_HIGHMEM) &&	/* parity reads page_address() */
 	       conf->skip_copy && !conf->dcl &&
 	       !raid5_has_log(conf) && !raid5_has_ppl(conf) &&
-	       !mddev->degraded && conf->reshape_progress == MaxSector &&
+	       conf->reshape_progress == MaxSector &&
 	       conf->chunk_sectors &&
 	       conf->raid_disks <= RAIDKM_MAX_STRIPE_DISKS &&
 	       !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
@@ -12631,6 +12683,8 @@ static void raidkm_row_write_done(struct work_struct *work)
 	for (i = 0; i < w->k + w->m; i++) {
 		struct md_rdev *rdev = w->mw[i].rdev;
 
+		if (!rdev)
+			continue;	/* gone: not written */
 		if (READ_ONCE(w->mw[i].failed)) {
 			/*
 			 * What raid5_end_write_request() and handle_stripe()
@@ -12655,7 +12709,7 @@ static void raidkm_row_write_done(struct work_struct *work)
 	atomic_dec(&w->bucket->inflight);
 	/* ... and the stripe cache may have it back */
 	raidkm_row_write_unlock(conf, w);
-	if (nfail > w->m)
+	if (nfail + w->nmissing > w->m)
 		raid_bio->bi_status = BLK_STS_IOERR;	/* beyond the parity */
 	/*
 	 * A failed member is now a bad block or a failed disk -- in memory.
@@ -12665,29 +12719,37 @@ static void raidkm_row_write_done(struct work_struct *work)
 	 * with the old contents of a chunk the caller was told is written.
 	 *
 	 * With a bitmap every row waits, not only a failed one, and before
-	 * the bitmap is told: md's end_write moves events_cleared up to
-	 * mddev->events whenever the array is not degraded, and a member
-	 * whose superblock write is failing still counts as in sync until
-	 * super_written() fails it.  A clear in that window leaves the member
-	 * behind events_cleared, and its re-add is refused for good -- a full
-	 * rebuild.  handle_stripe() keeps a stripe's clean-up behind the same
-	 * flag.
+	 * the bitmap is told -- below, or by md core when the caller's bio
+	 * completes (md_end_clone_io) after the bio_endio: md's end_write
+	 * moves events_cleared up to mddev->events whenever the array is not
+	 * degraded, and a member whose superblock write is failing still
+	 * counts as in sync until super_written() fails it.  A clear in that
+	 * window leaves the member behind events_cleared, and its re-add is
+	 * refused for good -- a full rebuild.  handle_stripe() keeps a
+	 * stripe's clean-up behind the same flag.
+	 *
+	 * So does a row that left out a gone member, bitmap or not: the member
+	 * may have failed a moment ago (md_error sets MD_SB_CHANGE_PENDING),
+	 * and until the superblock says so it would come back from a crash in
+	 * sync, holding the old chunk.  The stripe path holds the stripe while
+	 * the flag is set; once the member's loss is on disk the wait is free.
 	 */
 	if (nfail)
 		md_wakeup_thread(mddev->thread);
-	if (nfail || w->bitmap)
+	if (nfail || w->nmissing || w->bitmap)
 		wait_event(mddev->sb_wait,
 			   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags));
 	/*
 	 * By now a member that failed is either a failed disk -- the array is
 	 * degraded and md keeps the bit set, the region is resynced when the
 	 * member comes back -- or has the chunk in its on-disk bad-block list.
-	 * The degraded state is all md goes by: the compat shims drop the
-	 * success argument (md's end_write hook has none).
+	 * The degraded state is all md's end_write goes by.
 	 */
+#ifndef RAIDKM_MD_COUNTS_BITMAP	/* else md core ends it with the bio */
 	if (w->bitmap)
 		raidkm_bitmap_endwrite(mddev, w->msect, w->chunk_sectors,
 				       !nfail);
+#endif
 
 	/*
 	 * The context goes back to the pool (this work item may be queued
@@ -12714,21 +12776,24 @@ static void raidkm_row_write_submit(struct work_struct *work)
 	 * Locals: a member that completes inside submit_bio_noacct() (a
 	 * bio-based member does) can finish the row and free @w before the
 	 * loop looks at it again -- nothing below reads @w after the last
-	 * submit.
+	 * submit, which is why the loop stops at the last member written
+	 * rather than looking past it for a gone one.
 	 */
-	const int k = w->k, n = w->k + w->m;
+	const int k = w->k, last = w->last;
 	struct blk_plug plug;
 	int i;
 
 	/* the bitmap bits for this row are on disk before its data is */
 	if (w->bitmap)
 		mddev->bitmap_ops->unplug(mddev, true);
-	atomic_set(&w->pending, n);
+	atomic_set(&w->pending, w->k + w->m - w->nmissing);
 	blk_start_plug(&plug);
-	for (i = 0; i < n; i++) {
+	for (i = 0; i <= last; i++) {
 		struct md_rdev *rdev = w->mw[i].rdev;
 		struct bio *bi;
 
+		if (!rdev)
+			continue;	/* gone: not written */
 		if (i < k) {
 			/* a data chunk: the caller's own pages */
 			bi = bio_alloc_clone(rdev->bdev, raid_bio, GFP_NOIO,
@@ -12830,26 +12895,44 @@ raidkm_row_write_prep(struct mddev *mddev, struct bio *raid_bio,
 	w->base = base;
 
 	/* the members, by generator row: data index d at slot pd+m+d, parity
-	 * index p at pd+p -- all healthy, all taking the whole chunk */
+	 * index p at pd+p -- each one in sync and taking the whole chunk, or
+	 * gone and not written at all */
 	for (i = 0; i < k + m; i++) {
 		w->mw[i].w = w;
 		w->mw[i].failed = 0;
 		w->mw[i].rdev = NULL;
 	}
+	w->nmissing = 0;
+	w->last = -1;
 	for (i = 0; i < k + m; i++) {
 		int idx = i < k ? (pd + m + i) % n : (pd + i - k) % n;
 		struct md_rdev *rdev = conf->disks[idx].rdev;
 
-		/* Blocked: the stripe path waits for it to be unblocked
-		 * (md_wait_for_blocked_rdev) before writing to it */
-		if (!rdev || test_bit(Faulty, &rdev->flags) ||
-		    !test_bit(In_sync, &rdev->flags) ||
-		    test_bit(Blocked, &rdev->flags) ||
-		    conf->disks[idx].replacement)
+		/* the CRC key, written or not */
+		w->mw[i].disk = idx;
+		/* a replacement takes the slot's writes up to its
+		 * recovery_offset, gone member or not: the stripe path's
+		 * business (ops_run_io), even with no recovery running */
+		if (conf->disks[idx].replacement)
+			goto out_declined;
+		/* gone: ops_run_io() leaves out a missing or Faulty member,
+		 * and so does the row -- up to m of them */
+		if (!rdev || test_bit(Faulty, &rdev->flags)) {
+			if (++w->nmissing > m)
+				goto out_declined;
+			continue;
+		}
+		/* there but not (all) in sync -- a spare being recovered,
+		 * which only the stripe path knows to write up to its
+		 * recovery_offset -- or Blocked: the stripe path waits for it
+		 * to be unblocked (md_wait_for_blocked_rdev) before writing to
+		 * it */
+		if (!test_bit(In_sync, &rdev->flags) ||
+		    test_bit(Blocked, &rdev->flags))
 			goto out_declined;
 		atomic_inc(&rdev->nr_pending);
 		w->mw[i].rdev = rdev;
-		w->mw[i].disk = idx;
+		w->last = i;
 		if (rk_has_badblock(rdev, msect, cs))
 			goto out_declined;
 	}
@@ -12961,15 +13044,19 @@ static void raidkm_row_write_go(struct mddev *mddev,
 				      w->pbuf[i].addr, len);
 
 	/*
-	 * Write-intent bitmap: count the row as the stripe path counts each
-	 * stripe (startwrite in __add_stripe_bio), for the chunk's member
-	 * range.  The bit must be on disk before any member write goes out:
-	 * the submit worker flushes the bitmap first, where the stripe path
-	 * parks the stripe on bitmap_list until raid5d does.
+	 * Write-intent bitmap: md core counted the caller's bio already, over
+	 * the member rows it covers (md_clone_bio -> raidkm_bitmap_sector);
+	 * where it does not, the row is counted here, for the chunk's member
+	 * range, as the stripe path counts each stripe.  The bit must be on
+	 * disk before any member write goes out: the submit worker flushes
+	 * the bitmap first, where the stripe path parks the stripe on
+	 * bitmap_list until raid5d does.
 	 */
 	w->bitmap = !!mddev->bitmap;
+#ifndef RAIDKM_MD_COUNTS_BITMAP
 	if (w->bitmap)
 		raidkm_bitmap_startwrite(mddev, w->msect, w->chunk_sectors);
+#endif
 	md_write_inc(mddev, raid_bio);
 	bio_inc_remaining(raid_bio);
 	w->opf = REQ_OP_WRITE |
@@ -12982,6 +13069,8 @@ static void raidkm_row_write_go(struct mddev *mddev,
 	 * off a row another submitter claimed while that one waits on ours --
 	 * would keep both rows' writes from ever leaving.  A worker sends them.
 	 */
+	if (w->nmissing)	/* @w may be reused once the submit is queued */
+		atomic64_inc(&conf->row_write_degraded);
 	queue_work(raidkm_row_wq, &w->submit);
 	atomic64_inc(&conf->row_write_done);
 }
@@ -13255,30 +13344,57 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 {
 	struct r5conf *conf = mddev->private;
 	sector_t logical_sector, last_sector;
+	sector_t first_stripe, last_stripe;
 	struct stripe_head *sh;
+	struct bvec_iter bi_iter;
+	struct bio *orig_bi = bi;
 	int stripe_sectors;
 
-	/* We need to handle this when io_uring supports discard/trim */
-	if (WARN_ON_ONCE(bi->bi_opf & REQ_NOWAIT))
+	/*
+	 * We need to handle this when io_uring supports discard/trim.  The bio
+	 * is ended on either way out: the caller does not end it, and one left
+	 * hanging pins the array (active_io) as well as its submitter.
+	 */
+	if (WARN_ON_ONCE(bi->bi_opf & REQ_NOWAIT)) {
+		bio_wouldblock_error(bi);
 		return;
+	}
 
-	if (mddev->reshape_position != MaxSector)
-		/* Skip discard while reshape is happening */
+	if (mddev->reshape_position != MaxSector) {
+		/* Skip discard while reshape is happening: it is only a hint */
+		bio_endio(bi);
 		return;
-
-	logical_sector = bi->bi_iter.bi_sector & ~((sector_t)RAID5_STRIPE_SECTORS(conf)-1);
-	last_sector = bio_end_sector(bi);
-
-	bi->bi_next = NULL;
+	}
 
 	stripe_sectors = conf->chunk_sectors *
 		(conf->raid_disks - conf->max_degraded);
-	logical_sector = DIV_ROUND_UP_SECTOR_T(logical_sector,
-					       stripe_sectors);
-	sector_div(last_sector, stripe_sectors);
+	first_stripe = DIV_ROUND_UP_SECTOR_T(bi->bi_iter.bi_sector,
+					     stripe_sectors);
+	last_stripe = bio_end_sector(bi);
+	sector_div(last_stripe, stripe_sectors);
 
-	logical_sector *= conf->chunk_sectors;
-	last_sector *= conf->chunk_sectors;
+	if (first_stripe >= last_stripe) {
+		bio_endio(bi);
+		return;
+	}
+
+	/*
+	 * Account the full stripes the discard covers -- and with that, where
+	 * md core counts writes in the bitmap, count them there (md_clone_bio).
+	 * The iterator goes back to the whole request for its completion.  As
+	 * upstream 74ddbf98e2db ("md/raid5: account discard IO").
+	 */
+	bi_iter = bi->bi_iter;
+	bi->bi_iter.bi_sector = first_stripe * stripe_sectors;
+	bi->bi_iter.bi_size = ((last_stripe - first_stripe) *
+			       stripe_sectors) << 9;
+	md_account_bio(mddev, &bi);
+	orig_bi->bi_iter = bi_iter;
+	bi->bi_iter = bi_iter;
+	bi->bi_next = NULL;
+
+	logical_sector = first_stripe * conf->chunk_sectors;
+	last_sector = last_stripe * conf->chunk_sectors;
 
 	for (; logical_sector < last_sector;
 	     logical_sector += RAID5_STRIPE_SECTORS(conf)) {
@@ -13326,10 +13442,12 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 		}
 		spin_unlock_irq(&sh->stripe_lock);
 		if (conf->mddev->bitmap) {
+#ifndef RAIDKM_MD_COUNTS_BITMAP	/* else md core counted the discard */
 			for (d = 0; d < conf->raid_disks - conf->max_degraded;
 			     d++)
 				raidkm_bitmap_startwrite(mddev, sh->sector,
 					RAID5_STRIPE_SECTORS(conf));
+#endif
 			sh->bm_seq = conf->seq_flush + 1;
 			set_bit(STRIPE_BIT_DELAY, &sh->state);
 		}
@@ -13443,7 +13561,7 @@ static int add_all_stripe_bios(struct r5conf *conf,
 		struct stripe_request_ctx *ctx, struct stripe_head *sh,
 		struct bio *bi, int forwrite, int previous)
 {
-	int dd_idx;
+	int dd_idx, nfirst = 0;
 
 	spin_lock_irq(&sh->stripe_lock);
 
@@ -13493,10 +13611,12 @@ static int add_all_stripe_bios(struct r5conf *conf,
 		    dev->sector >= ctx->last_sector)
 			continue;
 
-		__add_stripe_bio(sh, bi, dd_idx, forwrite, previous);
+		nfirst += __add_stripe_bio(sh, bi, dd_idx, forwrite, previous);
 		clear_bit((dev->sector - ctx->first_sector) >>
 			  RAID5_STRIPE_SHIFT(conf), ctx->sectors_to_do);
 	}
+	/* every device linked: only now may the lock drop */
+	raidkm_stripe_bitmap_start(conf, sh, nfirst);
 
 	spin_unlock_irq(&sh->stripe_lock);
 	return 1;
@@ -13701,6 +13821,79 @@ static sector_t raid5_bio_lowest_chunk_sector(struct r5conf *conf,
 		return r_sector;
 	return r_sector + sectors_per_chunk - chunk_offset;
 }
+
+#ifdef RAIDKM_MD_COUNTS_BITMAP
+/* the member sector where the chunk row holding array sector @logical starts */
+static sector_t raidkm_bitmap_row(struct r5conf *conf, sector_t logical,
+				  int previous)
+{
+	unsigned int cs = previous ? conf->prev_chunk_sectors :
+				     conf->chunk_sectors;
+	sector_t m;
+	int dd_idx;
+
+	if (conf->dcl) {
+		/* the map asked for, not the one the frontier picks now */
+		struct dcl_geom *ge = previous ? READ_ONCE(conf->prev_dcl) :
+						 conf->dcl;
+		struct dcl_addr a;
+
+		if (!ge)
+			ge = conf->dcl;
+		m = logical;
+		sector_div(m, cs);
+		dcl_forward(ge, m, &a);
+		return a.row * cs;
+	}
+	m = raid5_compute_sector(conf, logical, previous, &dd_idx, NULL);
+	return round_down(m, cs);
+}
+
+/*
+ * pers->bitmap_sector: the member sectors the write-intent bitmap counts
+ * for the array write [*offset, *offset + *sectors).  md core counts each
+ * write bio once over this range when it arrives (md_clone_bio) and ends
+ * the count when the bio completes (md_end_clone_io) -- or is handed back
+ * for a retry (md_free_cloned_bio) -- with the range it stored, so the two
+ * always match; the stripe path and the row path keep no count of their own,
+ * as upstream raid5 since cd5fc6533818.  The 6.12 stable kernels do this
+ * only for a personality that sets this hook; RHEL 10.2 does it for all.
+ *
+ * The range is whole chunk rows: every member row a chunk of the write
+ * lands in.  Logical chunks fill rows in order in every raidkm layout --
+ * chunk / k in the classic ones, chunk / (ngroups * k) declustered
+ * (dcl_forward) -- so under one map the first and the last sector bound it,
+ * a discard of any size included.  While a reshape runs, a write behind the
+ * frontier is done under the new map, and so is one inside it (it waits for
+ * the reshape to pass); only one ahead of it may still be done under the old
+ * map, or under the new one if the frontier passes it first, so both bound
+ * it and the range is their hull, as raid5_bitmap_sector's (which looks at
+ * the start alone; a range across the frontier is ahead at its other end).
+ * Where a grow or a g-changing reshape puts a chunk on rows far apart in the
+ * two maps, the rows in between are dirtied too.
+ */
+static void raidkm_bitmap_sector(struct mddev *mddev, sector_t *offset,
+				 unsigned long *sectors)
+{
+	struct r5conf *conf = mddev->private;
+	sector_t start = *offset, last = *offset + *sectors - 1;
+	sector_t lo, hi;
+
+	if (!*sectors)
+		return;
+	lo = raidkm_bitmap_row(conf, start, 0);
+	hi = raidkm_bitmap_row(conf, last, 0) + conf->chunk_sectors;
+	if (unlikely(conf->reshape_progress != MaxSector) &&
+	    (get_reshape_loc(mddev, conf, start) == LOC_AHEAD_OF_RESHAPE ||
+	     get_reshape_loc(mddev, conf, last) == LOC_AHEAD_OF_RESHAPE)) {
+		lo = min(lo, raidkm_bitmap_row(conf, start, 1));
+		hi = max(hi, raidkm_bitmap_row(conf, last, 1) +
+			     conf->prev_chunk_sectors);
+	}
+	*offset = lo;
+	*sectors = hi - lo;
+}
+#endif /* RAIDKM_MD_COUNTS_BITMAP */
 
 static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 {
@@ -19598,7 +19791,7 @@ raidkm_row_stats_show(struct mddev *mddev, char *page)
 	conf = mddev->private;
 	if (conf)
 		ret = sprintf(page,
-			      "dread_done %lld\ndread_bypass %lld\ndread_raced %lld\ndread_declined %lld\ndread_csum_bad %lld\nrebuild_done %lld\nrebuild_declined %lld\nrebuild_csum_bad %lld\ndread_wide %lld\nrebuild_band_nomem %lld\nrebuild_stripe_chunks %lld\nrebuild_set_workers %d\nrebuild_set_page_bufs %d\nrebuild_unclaimed %lld\nrebuild_head_wait_ms %lld\nrebuild_retries %lld\nrebuild_head_timeouts %lld\ndelayed_parked %lld\ndelayed_aged %lld\nsync_token_regrant %lld\noverlap_slow %lld\nwrite_done %lld\nwrite_busy %lld\nwrite_nobuf %lld\nwrite_declined %lld\nwrite_errors %lld\nsync_done %lld\nsync_declined %lld\nsync_csum_bad %lld\nsync_stripe_chunks %lld\nsync_mismatch_blocks %lld\nsync_parity_writes %lld\n",
+			      "dread_done %lld\ndread_bypass %lld\ndread_raced %lld\ndread_declined %lld\ndread_csum_bad %lld\nrebuild_done %lld\nrebuild_declined %lld\nrebuild_csum_bad %lld\ndread_wide %lld\nrebuild_band_nomem %lld\nrebuild_stripe_chunks %lld\nrebuild_set_workers %d\nrebuild_set_page_bufs %d\nrebuild_unclaimed %lld\nrebuild_head_wait_ms %lld\nrebuild_retries %lld\nrebuild_head_timeouts %lld\ndelayed_parked %lld\ndelayed_aged %lld\nsync_token_regrant %lld\noverlap_slow %lld\nwrite_done %lld\nwrite_busy %lld\nwrite_nobuf %lld\nwrite_declined %lld\nwrite_errors %lld\nsync_done %lld\nsync_declined %lld\nsync_csum_bad %lld\nsync_stripe_chunks %lld\nsync_mismatch_blocks %lld\nsync_parity_writes %lld\nwrite_degraded %lld\n",
 			      (long long)atomic64_read(&conf->row_dread_done),
 			      (long long)atomic64_read(&conf->row_dread_bypass),
 			      (long long)atomic64_read(&conf->row_dread_raced),
@@ -19631,7 +19824,8 @@ raidkm_row_stats_show(struct mddev *mddev, char *page)
 			      (long long)atomic64_read(&conf->row_sync_csum_bad),
 			      (long long)atomic64_read(&conf->row_sync_stripe_chunks),
 			      (long long)atomic64_read(&conf->row_sync_mismatch_blocks),
-			      (long long)atomic64_read(&conf->row_sync_parity_writes));
+			      (long long)atomic64_read(&conf->row_sync_parity_writes),
+			      (long long)atomic64_read(&conf->row_write_degraded));
 	spin_unlock(&mddev->lock);
 	return ret;
 }
@@ -20414,13 +20608,14 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 			mutex_init(&conf->dcl_retire_mutex);
 			/*
 			 * Write-intent bitmap: SUPPORTED (internal).  The
-			 * stripe write tracking (raidkm_bitmap_startwrite /
-			 * _endwrite on sh->sector) and the sync skip/gate
-			 * calls in raid5_sync_request both use the per-device
-			 * stripe-sector domain, which is exactly the domain
-			 * the declustered row iteration uses — one row's
-			 * ngroups group-stripes share sh->sector, and the
-			 * bitmap's per-chunk counter absorbs the multiple
+			 * write tracking (md core over the member rows
+			 * raidkm_bitmap_sector maps a write to, or the stripe
+			 * path's own count on sh->sector) and the sync
+			 * skip/gate calls in raid5_sync_request both use the
+			 * per-device stripe-sector domain, which is exactly
+			 * the domain the declustered row iteration uses — one
+			 * row's ngroups group-stripes share sh->sector, and
+			 * the bitmap's per-chunk counter absorbs the multiple
 			 * writers.  Spare population / copy-from-spare stay
 			 * mark-journaled via the rkdcl block, independent of
 			 * the bitmap.  File-backed bitmaps are untested with
@@ -23090,6 +23285,9 @@ static struct md_personality raid_km_personality =
 	.owner		= THIS_MODULE,
 #endif
 	.make_request	= raid5_make_request,
+#ifdef RAIDKM_MD_COUNTS_BITMAP
+	.bitmap_sector	= raidkm_bitmap_sector,
+#endif
 	.run		= raid5_run,
 	.start		= raid5_start,
 	.free		= raid5_free,

@@ -36,6 +36,11 @@
 #       c) with a data member failed, the row layer's degraded read -- which
 #          verifies the survivors, parity included -- serves the rewritten
 #          rows without refusing any, so the parity CRCs were replaced too.
+#   T7  full-row writes on the DEGRADED --checksum array (T6c's member still
+#       failed): the row path takes them (write_degraded moves) without
+#       writing the gone member; the row layer's degraded read serves them
+#       from verified survivors; after a rebuild onto the spare a healthy
+#       read raises no mismatch and the scrub is clean.
 #
 # Usage: bash <this>     (MEMBERS/geometry via RC_N, RC_M; see raidkm-test-lib.sh)
 set -u
@@ -367,5 +372,44 @@ D1=$(row_stat dread_done); C1=$(row_stat dread_csum_bad)
 [ "$D1" -gt "$D0" ] && [ "$C1" = "$C0" ] \
 	&& rk_pass "T6c: the row layer decoded from verified survivors, parity included (dread_done $D0 -> $D1, dread_csum_bad $C0)" \
 	|| rk_fail "T6c: survivors failed their CRCs after row writes (dread_done $D0 -> $D1, dread_csum_bad $C0 -> $C1)"
+
+# ---- T7: full-row writes while degraded -------------------------------------
+echo "=== T7: full-row writes on the degraded --checksum array ==="
+mk_chunk_tokens t7
+truncate -s "${SPANKB}K" "$RK_TMP/pat"
+PRE=$(md5sum "$RK_TMP/pat" | cut -d' ' -f1)
+sudo dmesg -C >/dev/null 2>&1
+W0=$(row_stat write_done); G0=$(row_stat write_degraded)
+sudo dd if="$RK_TMP/pat" of="$MD" bs="${ROWKB}k" count=$(( SPANKB / ROWKB )) \
+	oflag=direct status=none
+W1=$(row_stat write_done); G1=$(row_stat write_degraded)
+[ "$((G1 - G0))" -gt 0 ] && [ "$((G1 - G0))" = "$((W1 - W0))" ] \
+	&& rk_pass "T7: whole rows took the row path while degraded (write_degraded $G0 -> $G1)" \
+	|| rk_fail "T7: degraded row writes: write_done $W0 -> $W1, write_degraded $G0 -> $G1 (declined $(row_stat write_declined), busy $(row_stat write_busy))"
+D0=$(row_stat dread_done); C0=$(row_stat dread_csum_bad)
+POST=$(span_md5)
+D1=$(row_stat dread_done); C1=$(row_stat dread_csum_bad)
+[ "$POST" = "$PRE" ] && rk_pass "T7: degraded read of rows written while degraded is right" \
+			|| rk_fail "T7: degraded read of rows written while degraded: $(bad_read "$POST")"
+[ "$D1" -gt "$D0" ] && [ "$C1" = "$C0" ] \
+	&& rk_pass "T7: decoded from verified survivors (dread_done $D0 -> $D1, dread_csum_bad $C0)" \
+	|| rk_fail "T7: survivors failed their CRCs (dread_done $D0 -> $D1, dread_csum_bad $C0 -> $C1)"
+S=$(storms)
+[ "$S" = 0 ] && rk_pass "T7: no csum mismatch while degraded" \
+	     || rk_fail "T7: $S csum mismatches reading rows written while degraded"
+rk_remove_disks "$FAILDEV"
+sudo "$MDADM" --zero-superblock "${MEMBERS[$N]}" >/dev/null 2>&1
+rk_add_disks "${MEMBERS[$N]}"		# the spare
+rk_wait_full
+sudo dmesg -C >/dev/null 2>&1
+POST=$(span_md5)
+[ "$POST" = "$PRE" ] && rk_pass "T7: rows written while degraded read back right after the rebuild" \
+			|| rk_fail "T7: after the rebuild: $(bad_read "$POST")"
+S=$(storms)
+[ "$S" = 0 ] && rk_pass "T7: no csum mismatch on a healthy read after the rebuild" \
+	     || rk_fail "T7: $S csum mismatches on a healthy read after the rebuild"
+MM=$(rk_scrub)
+[ "$MM" = 0 ] && rk_pass "T7: scrub clean after the rebuild" \
+	      || rk_fail "T7: scrub mismatch_cnt=$MM after the rebuild"
 
 rk_summary

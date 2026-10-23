@@ -549,7 +549,8 @@ enum {
 	STRIPE_BATCH_READY,
 	STRIPE_BATCH_ERR,
 	STRIPE_BITMAP_PENDING,	/* Being added to bitmap, don't add
-				 * to batch yet.
+				 * to batch yet (only where raidkm counts
+				 * the bitmap itself: raidkm_stripe_bitmap_start)
 				 */
 	STRIPE_LOG_TRAPPED,	/* trapped into log (see raid5-cache.c)
 				 * this bit is used in two scenarios:
@@ -951,6 +952,7 @@ struct r5conf {
 	atomic64_t		row_write_nobuf;	/* no context to spare: stripe cache */
 	atomic64_t		row_write_declined;	/* bio not eligible: stripe cache */
 	atomic64_t		row_write_errors;	/* member writes that failed */
+	atomic64_t		row_write_degraded;	/* rows written with a member gone */
 	atomic_t		pending_full_writes; /* full write backlog */
 	int			bypass_count; /* bypassed prereads */
 	int			bypass_threshold; /* preread nice */

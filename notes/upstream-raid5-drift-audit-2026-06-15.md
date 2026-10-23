@@ -48,9 +48,19 @@ Triaged:
   — 10 guard sites). **Note:** upstream fixed it *inside* md-bitmap; RHEL 10.2's 6.12 lacks
   that backport, so raidkm's call-site guards are the correct workaround for our target.
 
+### Correction (2026-10-22): `9c89f604476c` + `cd5fc6533818` were a fix after all
+Moving the bitmap count out of the stripe path (cd5fc6533818, with
+pers->bitmap_sector from 9c89f604476c) also removed a lost-write race: the old
+`__add_stripe_bio` dropped `sh->stripe_lock` for `bitmap_startwrite` between the
+device links of one request, so a small write could link under a full-stripe one
+and was never completed (or tripped its `BUG_ON` on GCP NVMe).  raidkm now takes
+that model (`raidkm_bitmap_sector`) where md core counts the bitmap; see the
+commit "md core counts the write-intent bitmap".  The rest of this bucket was
+filed by the same reasoning, so treat "API churn" as unverified for it.
+
 ### Not worth chasing in a 6.12-pinned fork (refactors / API churn / features)
-~30 commits: the bitmap_ops vtable rework (`08c50142a128`, `4f0e7d0e03b7`, `9c89f604476c`,
-`cd5fc6533818`), `md_submodule_head` switch, `recovery_cp`→`resync_offset` rename,
+~30 commits: the bitmap_ops vtable rework (`08c50142a128`, `4f0e7d0e03b7`; for
+`9c89f604476c`, `cd5fc6533818` see the correction above), `md_submodule_head` switch, `recovery_cp`→`resync_offset` rename,
 mddev_flags merges, block-layer plumbing (logical block size, `bio_submit_split_bioset`,
 `max_hw_wzeroes`), treewide `kmalloc_obj`/GFP churn, etc. These are API restructurings for
 post-6.12 kernels, not fixes — chasing them in the fork is churn with no correctness payoff.

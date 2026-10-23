@@ -18,15 +18,18 @@
 #   T4  4 KiB writes, row writes and stripe-cache reads racing over the same
 #       rows: the parity stays consistent (scrub) and a final pass is right.
 #   T5  after row writes, a member fails (degraded reads decode from the parity
-#       the row path wrote), row writes decline while degraded, and a rebuild
-#       onto a spare leaves a consistent array with its row boundary unchanged.
+#       the row path wrote); whole rows keep taking the row path while
+#       degraded (write_degraded moves) and read back right; they decline
+#       while a spare is being recovered; the rebuild leaves a consistent
+#       array with its row boundary unchanged.
 #   T6  a minimal rk_row_write_depth under many writers: most rows find no context
 #       and go to the stripe cache (write_nobuf moves); fio's own verify
 #       passes.
 #   T7  a scrub running while row writes are issued: row writes stand aside
 #       for the pass, and the parity is consistent afterwards.
 #   T8  m=3 (Vandermonde) and m=4 (Cauchy) generators, and the parity-last
-#       layout: data right, scrub clean.
+#       layout: data right, scrub clean; with two members failed, row writes
+#       still run and read back right.
 #   T9  control: rk_row_write=0 leaves write_done still, so T1's counter is a
 #       real signal.
 #   T10 an internal write-intent bitmap: row writes count in it (dirty bits
@@ -51,6 +54,20 @@
 #       rows keep finishing on a slow healthy member: the member comes back
 #       through --re-add (a bitmap resync, not a full rebuild) and the parity
 #       is clean afterwards.
+#   T16 degraded, with a bitmap: a row write drops the stripe cache's page
+#       of the gone member (rebuilt by a degraded read through the cache), so
+#       neither a later read nor a read-modify-write of the stripe uses the
+#       old block; 4 KiB writes, row writes and reads race while degraded;
+#       rows written while the member was gone are resynced onto it by a
+#       --re-add (a healthy read is right, scrub clean).
+#   T17 a second member lost under degraded row writes, its writes failing
+#       (dm error): rows whose writes fail on it, with one member already
+#       gone, still complete (m=2); the data reads back right.
+#   T18 the stripe path with a bitmap (row path off): 4 KiB random writes
+#       against 1 MiB full-stripe writes, healthy then degraded -- every
+#       write completes.  The bitmap accounting once dropped the stripe lock
+#       between the devices of one request, and a small write linked under a
+#       full-stripe one was never completed.
 #
 # Usage: bash <this>    (CHUNK_KB default 128; RW_N/RW_M the classic geometry)
 set -u
@@ -66,6 +83,8 @@ MEMBERS=()
 
 cleanup() {
 	[ -n "${BGPID:-}" ] && kill "$BGPID" 2>/dev/null
+	# T10 trusts discard on brd only: never leave that on for the host
+	[ -n "${DSAFE0:-}" ] && echo "$DSAFE0" | sudo tee "$DSAFE" >/dev/null 2>&1
 	sudo "$MDADM" --stop "$MD" 2>/dev/null
 	local d t p
 	for d in "${MEMBERS[@]:-}"; do
@@ -155,11 +174,17 @@ echo "=== T2: spans starting and ending mid-row ==="
 # data must be right, and the parity.
 mk_pattern "$RK_TMP/B" 20
 T2OFF=$(( ROWB + 64 * 1024 ))	# starts 64K into a row
-WANT=0
-for i in $(seq 0 19); do	# whole rows inside [s, s + 1 MiB)
-	s=$(( T2OFF + i * 1048576 )); a=$(( (s + ROWB - 1) / ROWB )); b=$(( (s + 1048576) / ROWB ))
-	[ "$b" -gt "$a" ] && WANT=$(( WANT + b - a ))
-done
+# whole_rows <offset> <MiB>: the whole rows inside the 1 MiB bios `put ... 1M`
+# writes from <offset> -- what the row path can take of it
+whole_rows() {
+	local i s a b n=0
+	for i in $(seq 0 $(( $2 - 1 ))); do
+		s=$(( $1 + i * 1048576 )); a=$(( (s + ROWB - 1) / ROWB )); b=$(( (s + 1048576) / ROWB ))
+		[ "$b" -gt "$a" ] && n=$(( n + b - a ))
+	done
+	echo "$n"
+}
+WANT=$(whole_rows "$T2OFF" 20)
 fallbacks() { echo $(( $(row_stat write_nobuf) + $(row_stat write_busy) + $(row_stat write_declined) )); }
 D0=$(row_stat write_done); F0=$(fallbacks)
 put "$RK_TMP/B" "$T2OFF" 1M
@@ -243,14 +268,35 @@ put "$RK_TMP/A" 0 1M
 rk_fail_disks "${MEMBERS[2]}"
 same "$RK_TMP/A" 0 && rk_pass "T5: degraded read decodes the row path's parity" \
 	|| rk_fail "T5: degraded read WRONG"
-D0=$(row_stat write_done)
+D0=$(row_stat write_done); G0=$(row_stat write_degraded); F0=$(fallbacks)
 put "$RK_TMP/B" 0 1M
-[ "$(row_stat write_done)" = "$D0" ] && rk_pass "T5: row writes decline while degraded" \
-	|| rk_fail "T5: row path ran on a degraded array ($D0 -> $(row_stat write_done))"
+D1=$(row_stat write_done); G1=$(row_stat write_degraded); F1=$(fallbacks)
+ROWS=$(whole_rows 0 20)
+# every row write here is a degraded one; fewer than all the rows only with
+# a counted fallback (a busy row, no context: the stripe cache writes it)
+if [ "$((G1 - G0))" != "$((D1 - D0))" ] || [ "$((G1 - G0))" = 0 ]; then
+	rk_fail "T5: degraded: write_done $D0 -> $D1, write_degraded $G0 -> $G1"
+elif [ "$((G1 - G0))" -ge "$ROWS" ] || [ "$F1" -gt "$F0" ]; then
+	rk_pass "T5: $((G1 - G0)) of $ROWS rows via the row path while degraded ($((F1 - F0)) fallback(s))"
+else
+	rk_fail "T5: $((G1 - G0)) of $ROWS rows via the row path while degraded, no fallback counted"
+fi
 same "$RK_TMP/B" 0 && rk_pass "T5: degraded writes right" || rk_fail "T5: degraded write WRONG"
 rk_remove_disks "${MEMBERS[2]}"
 sudo "$MDADM" --zero-superblock "${MEMBERS[2]}" 2>/dev/null
+rk_throttle 20000
 rk_add_disks "${MEMBERS[10]}"
+if rk_wait_recovery_active; then
+	# the spare is in sync only up to recovery_offset: the stripe path's
+	# business, and the recovery pass fences row writes anyway
+	D0=$(row_stat write_done)
+	put "$RK_TMP/B" 0 1M		# the same bytes: the checks below hold
+	[ "$(row_stat write_done)" = "$D0" ] && rk_pass "T5: row writes decline while the spare recovers" \
+		|| rk_log "T5: $(( $(row_stat write_done) - D0 )) row writes during the recovery (it may have ended early)"
+else
+	rk_log "T5: recovery not seen in flight; the decline during it is not checked"
+fi
+rk_unthrottle
 rk_wait_full 2>/dev/null || rk_wait_idle
 grep -A1 "^$MDNAME" /proc/mdstat | grep -q "\[$(printf 'U%.0s' $(seq 1 "$N"))\]" && rk_pass "T5: rebuilt onto the spare" \
 	|| rk_fail "T5: array not back to $N/$N: $(grep -A1 "^$MDNAME" /proc/mdstat | tail -1)"
@@ -332,6 +378,12 @@ for geo in "3r 11" "4r 12" "2 10"; do
 		rk_fail_disks "${MEMBERS[0]}" "${MEMBERS[1]}"
 		same "$RK_TMP/A" 0 && rk_pass "T8[$1]: two members failed, data decodes right" \
 			|| rk_fail "T8[$1]: double-degraded read WRONG"
+		G0=$(row_stat write_degraded)
+		put "$RK_TMP/B" 0 1M
+		[ "$(row_stat write_degraded)" -gt "$G0" ] && rk_pass "T8[$1]: row writes with two members gone" \
+			|| rk_fail "T8[$1]: no row write with two members gone (declined $(row_stat write_declined))"
+		same "$RK_TMP/B" 0 && rk_pass "T8[$1]: rows written with two members gone read back right" \
+			|| rk_fail "T8[$1]: rows written with two members gone WRONG"
 	else
 		rk_fail "T8[$1]: create"
 	fi
@@ -344,6 +396,9 @@ done
 # anything (daemon_sleep 5 s, two passes), the members' bitmaps show dirty
 # chunks -- set by the row path, since nothing else wrote.
 echo "=== T10: internal write-intent bitmap ==="
+DSAFE=/sys/module/raidkm/parameters/devices_handle_discard_safely
+DSAFE0=$(cat "$DSAFE" 2>/dev/null)
+echo Y | sudo tee "$DSAFE" >/dev/null 2>&1	# brd discards safely: let T10 discard
 if RK_CREATE_EXTRA="--bitmap=internal --bitmap-chunk=4M" setup "${M}r" "$N"; then
 	sleep 12	# let the create's own bits clear
 	D0=$(row_stat write_done)
@@ -355,9 +410,31 @@ if RK_CREATE_EXTRA="--bitmap=internal --bitmap-chunk=4M" setup "${M}r" "$N"; the
 		|| rk_fail "T10: bitmap shows ${DIRTY:-?} dirty chunks after row writes"
 	same "$RK_TMP/A" 0 && rk_pass "T10: data right" || rk_fail "T10: data WRONG"
 	scrub_clean && rk_pass "T10: scrub clean" || rk_fail "T10: parity mismatch"
+	# every count md core started is ended: on a healthy, idle array the
+	# bits clear (two daemon passes, daemon_sleep 5 s) -- after row writes,
+	# 4 KiB stripe-path writes and a discard of whole rows
+	for r in $(seq 0 15); do
+		dd if=/dev/urandom of="$RK_TMP/blk" bs=4096 count=1 status=none
+		put "$RK_TMP/blk" $(( r * ROWB + 3 * 4096 )) 4096
+	done
+	put "$RK_TMP/A" 0 1M
+	if sudo blkdiscard -o $(( 32 * ROWB )) -l $(( 8 * ROWB )) "$MD" 2>/dev/null; then
+		rk_pass "T10: a discard of whole rows went through"
+	else
+		rk_log "T10: the array refused the discard (no discard support)"
+	fi
+	t0=$SECONDS
+	while :; do
+		DIRTY=$(sudo "$MDADM" -X "${MEMBERS[0]}" 2>/dev/null | sed -n 's/.* \([0-9]*\) dirty.*/\1/p' | head -1)
+		[ "${DIRTY:-1}" = 0 ] || [ $(( SECONDS - t0 )) -ge 40 ] && break
+		sleep 2
+	done
+	[ "${DIRTY:-?}" = 0 ] && rk_pass "T10: every bit cleared once idle ($(( SECONDS - t0 )) s): starts and ends balance" \
+		|| rk_fail "T10: ${DIRTY:-?} bitmap chunk(s) still dirty 40 s after the writes: a count was never ended"
 else
 	rk_fail "T10: create with an internal bitmap"
 fi
+[ -n "$DSAFE0" ] && echo "$DSAFE0" | sudo tee "$DSAFE" >/dev/null 2>&1
 
 # ---- T11: rows over 1 MiB ---------------------------------------------------
 # 10+2 at CHUNK_KB: a row of 10 chunks (1.25 MiB at 128K).  The array takes
@@ -636,16 +713,209 @@ else
 	rk_fail "T15: setup"
 fi
 rk_stop
+udevadm settle 2>/dev/null	# udev still holding one fails its remove
 for i in "${dm[@]}"; do
 	"$MDADM" --zero-superblock "$i" 2>/dev/null
-	dmsetup remove "$(basename "$i")" 2>/dev/null
+	dmsetup remove --retry "$(basename "$i")" 2>/dev/null
 done
-dmsetup remove rkrwerr 2>/dev/null
+dmsetup remove --retry rkrwerr 2>/dev/null
 MEMBERS=("${saved[@]}")
 rk_udev_quiesce
 }
 echo "=== T15: a member lost while its superblock write fails: re-add through the bitmap ==="
 t15
+
+# ---- T16: degraded, with a bitmap -------------------------------------------
+# A gone member is not written by a row write, but the stripe cache may hold
+# a page for it: a degraded read through the cache (rk_row_dread 0) rebuilds
+# the gone block from the others and keeps it, up to date.  The row write
+# must drop that page as it drops the others (raidkm_row_write_lock), or the
+# cache serves the old block to the next read of it, and a reconstruct-write
+# of the stripe encodes it into the new parity.  Then the races of T4, degraded,
+# and a --re-add: what the row path wrote while the member was gone must be
+# on it after the bitmap resync, which a healthy read of every chunk shows.
+t16() {
+local gone r c off g0 g1 nrows k=$(( N - M ))
+if ! RK_CREATE_EXTRA="--bitmap=internal --bitmap-chunk=4M" setup "${M}r" "$N"; then
+	rk_fail "T16: create with an internal bitmap"
+	return
+fi
+if [ "$(whole_rows 0 16)" = 0 ]; then
+	# a row over 1 MiB: dd's 1 MiB bios never hold one, the checks would
+	# pass with no row write at all
+	rk_skip_check "T16: rows of $((ROWB / 1024)) KiB exceed a 1 MiB bio"
+	return
+fi
+put "$RK_TMP/A" 0 1M
+gone=${MEMBERS[3]}
+rk_fail_disks "$gone"
+rk_remove_disks "$gone"
+nrows=$(( 16 * 1048576 / ROWB ))	# the rows primed
+mk_pattern "$RK_TMP/C1" 16; mk_pattern "$RK_TMP/C2" 16
+put "$RK_TMP/C1" 0 1M
+knob rk_row_dread 0	# degraded reads through the stripe cache
+for r in $(seq 0 $((nrows - 1))); do	# leave the gone block cached
+	dd if=/dev/urandom of="$RK_TMP/blk" bs=4096 count=1 status=none
+	put "$RK_TMP/blk" $(( r * ROWB + 1 * CHUNK_KB * 1024 + 2 * 4096 )) 4096
+	for c in $(seq 0 $(( k - 1 ))); do	# block 2 of every chunk: the gone one too
+		sudo dd if="$MD" of=/dev/null bs=4096 count=1 iflag=direct,skip_bytes \
+			skip=$(( r * ROWB + c * CHUNK_KB * 1024 + 2 * 4096 )) status=none 2>/dev/null
+	done
+done
+g0=$(row_stat write_degraded)
+put "$RK_TMP/C2" 0 1M
+g1=$(row_stat write_degraded)
+[ "$((g1 - g0))" -ge "$(whole_rows 0 16)" ] && rk_pass "T16: the rewrite took the row path while degraded ($((g1 - g0)) rows)" \
+	|| rk_fail "T16: the degraded rewrite did not take the row path ($g0 -> $g1): the test proves nothing"
+cp "$RK_TMP/C2" "$RK_TMP/C3"
+for r in $(seq 0 $((nrows - 1))); do
+	off=$(( r * ROWB + 3 * CHUNK_KB * 1024 + 2 * 4096 ))
+	dd if=/dev/urandom of="$RK_TMP/blk" bs=4096 count=1 status=none
+	put "$RK_TMP/blk" "$off" 4096
+	dd if="$RK_TMP/blk" of="$RK_TMP/C3" bs=4096 seek="$off" oflag=seek_bytes conv=notrunc status=none
+done
+same "$RK_TMP/C3" 0 && rk_pass "T16: degraded read through the stripe cache right (no stale page of the gone member)" \
+	|| rk_fail "T16: degraded read through the stripe cache WRONG: it kept the gone member's old block over a row write"
+knob rk_row_dread 1	# decoded from the members: what is on disk
+same "$RK_TMP/C3" 0 && rk_pass "T16: degraded read through the row layer right (the parity on disk is right)" \
+	|| rk_fail "T16: degraded read through the row layer WRONG: a stale cached block went into the parity"
+
+g0=$(row_stat write_degraded)
+sudo fio --output="$RK_TMP/t16.fio" --filename="$MD" --direct=1 --ioengine=libaio \
+	--time_based --runtime=15 --group_reporting --size=$(( 8 * ROWB )) \
+	--name=small --rw=randwrite --bs=4k --iodepth=16 --numjobs=2 \
+	--name=rows --rw=randwrite --bs=1M --blockalign="$ROWB" --iodepth=4 --numjobs=2 \
+	--name=reads --rw=randread --bs=8k --blockalign=4k --offset=4k --iodepth=8 --numjobs=1 \
+	>/dev/null 2>&1
+g1=$(row_stat write_degraded)
+[ "$((g1 - g0))" -gt 0 ] && rk_pass "T16: degraded row writes ran in the mix ($((g1 - g0)) rows)" \
+	|| rk_fail "T16: no degraded row write ran in the mix"
+
+mk_pattern "$RK_TMP/F" 32
+g0=$(row_stat write_degraded)
+put "$RK_TMP/F" 0 1M
+g1=$(row_stat write_degraded)
+[ "$((g1 - g0))" -gt 0 ] && rk_pass "T16: $((g1 - g0)) rows written with the member gone" \
+	|| rk_fail "T16: no row written with the member gone"
+same "$RK_TMP/F" 0 && rk_pass "T16: degraded read right" || rk_fail "T16: degraded read WRONG"
+if ! sudo "$MDADM" "$MD" --re-add "$gone" >/dev/null 2>&1; then
+	rk_fail "T16: --re-add of the gone member refused"
+	return
+fi
+sleep 1; rk_wait_full 2>/dev/null || rk_wait_idle
+[ "$(cat "$(SYS degraded)")" = 0 ] && rk_pass "T16: back in sync after the re-add" \
+	|| rk_fail "T16: degraded $(cat "$(SYS degraded)") after the re-add"
+same "$RK_TMP/F" 0 && rk_pass "T16: healthy read right: the rows written while gone were resynced onto the member" \
+	|| rk_fail "T16: healthy read WRONG after the re-add: the bitmap resync missed rows written while the member was gone"
+scrub_clean && rk_pass "T16: scrub clean" || rk_fail "T16: parity mismatch after the re-add"
+}
+echo "=== T16: degraded with a bitmap: cached pages, races, re-add ==="
+t16
+
+# ---- T17: a second member lost under degraded row writes ----------------------
+# One member gone, then another one's writes fail (dm error): each row write
+# that fails on it has m - 1 = 1 gone member plus 1 failed write, within the
+# parity, so the caller's write completes; md records bad blocks or fails the
+# member (its superblock write fails too).  The data must read back right
+# from what is left.
+t17() {
+local i sz x=$(( N - 1 )) rc e0 g0 saved=("${MEMBERS[@]}") dm=()
+if [ "$M" -lt 2 ] || [ "$N" -lt 5 ]; then	# member 3 goes, the last one fails
+	rk_skip_check "T17: needs m >= 2 and 5 members"
+	return
+fi
+rk_stop
+for i in $(seq 0 $(( N - 1 ))); do
+	"$MDADM" --zero-superblock "${saved[$i]}" 2>/dev/null
+	dd if=/dev/zero of="${saved[$i]}" bs=1M count=4 status=none 2>/dev/null
+done
+rk_udev_quiesce
+sz=$(blockdev --getsz "${saved[0]}")
+for i in $(seq 0 $(( N - 1 ))); do
+	dmsetup create "rkrw17_$i" --table "0 $sz linear ${saved[$i]} 0" ||
+		{ rk_fail "T17: dm-linear setup"; break; }
+	dm+=("/dev/mapper/rkrw17_$i")
+done
+udevadm settle 2>/dev/null
+MEMBERS=("${dm[@]}")
+if [ "${#dm[@]}" = "$N" ] && setup "${M}r" "$N"; then
+	put "$RK_TMP/A" 0 1M
+	rk_fail_disks "${dm[3]}"
+	# keep the array active: an idle one goes clean, and its next write's
+	# superblock update would fail the member before any row write met it
+	knob safe_mode_delay 600
+	put "$RK_TMP/A" 0 1M
+	e0=$(row_stat write_errors); g0=$(row_stat write_degraded)
+	if dmsetup load "rkrw17_$x" --table "0 $sz error" && dmsetup resume "rkrw17_$x"; then
+		put "$RK_TMP/B" 0 1M; rc=$?
+		[ "$rc" = 0 ] && rk_pass "T17: the writes completed with one member gone and another failing" \
+			|| rk_fail "T17: write returned an error (dd rc $rc) with one member gone and another failing"
+		[ "$(row_stat write_errors)" -gt "$e0" ] && [ "$(row_stat write_degraded)" -gt "$g0" ] \
+			&& rk_pass "T17: degraded row writes met the failing member (write_errors $e0 -> $(row_stat write_errors))" \
+			|| rk_fail "T17: the failing member was not met by a degraded row write (write_errors $e0 -> $(row_stat write_errors), write_degraded $g0 -> $(row_stat write_degraded))"
+		same "$RK_TMP/B" 0 && rk_pass "T17: data right from what is left (degraded $(cat "$(SYS degraded)"))" \
+			|| rk_fail "T17: data WRONG after the second loss"
+	else
+		rk_fail "T17: rig: error table not loaded on member $x"
+	fi
+else
+	rk_fail "T17: setup"
+fi
+rk_stop
+udevadm settle 2>/dev/null
+for i in "${dm[@]}"; do
+	"$MDADM" --zero-superblock "$i" 2>/dev/null
+	dmsetup remove --retry "$(basename "$i")" 2>/dev/null
+done
+MEMBERS=("${saved[@]}")
+rk_udev_quiesce
+}
+echo "=== T17: a second member lost under degraded row writes ==="
+t17
+
+# ---- T18: small writes against full-stripe writes, bitmap, stripe path --------
+# __add_stripe_bio used to drop the stripe lock for bitmap_startwrite at each
+# device's first write, inside add_all_stripe_bios -- after the overlap
+# checks, between the links.  A 4 KiB write could then pass its check on a
+# device a 1 MiB write had not linked yet, and the 1 MiB bio was linked on
+# top of it: the clean event's r5_next_bio stopped at the bio running past
+# the page and never completed the 4 KiB one.  On this rig fio wedged within
+# its first 15 s every time (32 writes in flight for good).  Now md core
+# counts the bitmap (raidkm_bitmap_sector) and the lock stays held.  A
+# wedged array cannot be stopped, so a hang ends the suite here.
+t18() {	# t18 <tag>: the mix, under a deadline
+	local rc inf
+	timeout -s KILL 120 fio --output="$RK_TMP/t18-$1.fio" --filename="$MD" --direct=1 \
+		--ioengine=libaio --time_based --runtime=20 --group_reporting \
+		--size=$(( 8 * ROWB )) \
+		--name=small --rw=randwrite --bs=4k --iodepth=16 --numjobs=2 \
+		--name=rows --rw=randwrite --bs=1M --blockalign="$ROWB" --iodepth=4 --numjobs=2 \
+		>/dev/null 2>&1
+	rc=$?
+	inf=$(awk '{print $2}' "/sys/block/$MDNAME/inflight")
+	if [ "$rc" = 0 ] && [ "$inf" = 0 ]; then
+		rk_pass "T18[$1]: every write of the mix completed"
+		return 0
+	fi
+	rk_fail "T18[$1]: fio rc $rc, $inf writes still in flight: writes lost in the stripe cache"
+	trap - EXIT	# the array cannot be stopped now
+	rk_summary
+	exit 1
+}
+echo "=== T18: 4 KiB against full-stripe writes, bitmap, stripe path ==="
+if RK_CREATE_EXTRA="--bitmap=internal --bitmap-chunk=4M" setup "${M}r" "$N"; then
+	knob rk_row_write 0
+	t18 healthy
+	rk_fail_disks "${MEMBERS[3]}"
+	t18 degraded
+	rk_remove_disks "${MEMBERS[3]}"
+	sudo "$MDADM" --zero-superblock "${MEMBERS[3]}" 2>/dev/null
+	rk_add_disks "${MEMBERS[3]}"
+	sleep 1; rk_wait_full 2>/dev/null || rk_wait_idle
+	scrub_clean && rk_pass "T18: scrub clean after the rebuild" || rk_fail "T18: parity mismatch"
+else
+	rk_fail "T18: create with an internal bitmap"
+fi
 
 [ "$(splats)" = 0 ] && rk_pass "no WARN/BUG/KASAN/hung task" || rk_fail "$(splats) kernel splat line(s)"
 rk_summary
