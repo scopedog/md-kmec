@@ -118,6 +118,8 @@ These are load-bearing for the design and not up for negotiation:
 | `mdadm --grow --raid-devices=<N-1>` to REMOVE a data disk (shrink-data, online, m fixed) | ✅ done (2026-07-30) — the inverse of `--add-data`, via the same journaled per-band COW engine walked **backwards** (the narrower geometry packs data deeper per disk, so the walk starts at the end; every home write lands strictly below the still-live old rows — no backup file, no `data_offset` shift). One disk per invocation (v1). **Array-size-first**: shrink the filesystem, clamp with `--grow --array-size=<kb>` (mdadm computes and prints the exact value on refusal), then `--grow --raid-devices=<N-1>`; the freed member becomes a spare (remove + `--zero-superblock` before reuse). Crash-safe: a mid-shrink stop/power-loss recovers by plain `--assemble` (the journal resumes the descending walk). Native-checksum arrays included (band verify-src + CRC re-key). Both layouts, m=2/3 validated: data byte-exact, scrub clean, decode oracle at m, concurrent fio randwrite+verify across the moving frontier, crash/resume ×2. The declustered analogue — pool shrink by one group (`--grow --raid-devices=<N-g>`) and spare-count increase — shipped 2026-07-31 via the same backward engine (gates: `tools/raidkm-test-declustered-shrink*.sh`). Gates: `tools/raidkm-test-shrink{,-crash}.sh` |
 | **Declustered parity — wide-pool layout with distributed spare** (`--layout=declustered`) | ✅ done (2026-07-16) — narrow *k+m* groups scattered over an N-disk pool by a seeded, rotation-expanded balanced permutation (clean-room, dRAID-*lineage* combinatorics — Holland & Gibson design theory, **no OpenZFS/CDDL code**), with **distributed spare** columns instead of a dedicated hot spare. Capacity balance is **exact by construction** and the rebuild read/write load is rotation-symmetric, so a failed disk's reconstruction spreads across every survivor. **Headline: rebuilding a failed 16 GB member on an 80-disk pool (g=13) took 44.9 s vs 785.1 s for a classic 78+2 array — 17.5×** (it also beats a narrow 11+2 classic, because the distributed spare removes the single-writer bottleneck). Geometry via `--group-width=g [--spare-columns=s] [--dcl-nbase=n] [--dcl-seed=x]`; the permutation seed + geometry live in a per-member on-disk **rkdcl** metadata block (4 KiB tail reserve, crc + generation), the kernel regenerates the identical permutation from the seed. Constraint C1 `(N−s) mod g == 0` (mdadm validates + suggests a legal `s`). Declustering is *m-agnostic* — validated m=2..5 on real NVMe (incl. the single-group-row `ngroups=1` edge). **Native per-block checksums compose** (see the next row), and **online pool expansion** (`mdadm --grow --raid-devices=N'`) widens the pool via a journaled crash-recoverable COW reshape (m=2/3 validated: data intact, scrub clean, degraded-read EC-correct, crash/power-loss/torn-write recovered); the per-group geometry reshapes (`--add-parity` / `--add-data` / `--spare-columns=s'`) run **online** too, serving the un-migrated region with old-geometry stripes (native-checksum arrays included); **capacity-shrinking reshapes** — pool shrink by one group (`--grow --raid-devices=<N-g>`) and spare-count increase — run online via the same engine walked **backwards**, gated array-size-first; v1 still excludes a file-backed bitmap (refused, not run wrong). See *Declustered parity* below |
 | **Declustered population + rebalance — rebuild into / migrate out of the distributed spare** | ✅ done (2026-07-17) — when a member fails, **population** reconstructs its content into the distributed spare columns as a raidkm-owned sync action (`echo <idx> > /sys/block/mdN/md/rk_dcl_populate`, or automatic with `rk_dcl_auto=1`), advancing a crash-safe journaled prefix mark (rkdcl v2, FUA+PREFLUSH every 16 MiB). **Sequential multi-assignment** (up to `s` failed disks, one populating at a time) uses **chained redirects** — a spare column can rotate onto another failed disk, so the slot→disk map resolves through the active assignments; the on-disk journal is **adaptive v2/v3** (a published v2 module fails *closed* rather than silently dropping an assignment). Adding a replacement **rebalances** by **copy-from-spare** (16-worker parallel copy straight from the already-populated spare — no GF decode, array never degraded during it; per-band quiesce + offset-split, strict-journaled per band) instead of a decode rebuild, falling back to the validated decode leg on any persistent copy fault. With **native checksums** enabled the copy **migrates** each block's CRC from the spare disk's key to the replacement's alongside the bytes, so integrity is preserved end-to-end (a torn/rotted copy is caught on first read and healed by decode). Power-loss crash matrices (dm-flakey) green for population, second-population, and mid-copy resume. Hardened by **two adversarial multi-agent reviews** (16 findings fixed: journal quorum, arm-publication barriers, auto-arm rescan, a copy-abort progress-contract data-loss bug, wedge-to-decode fallbacks). Validated under KASAN + on stock-RHEL real NVMe. See *Declustered parity* below |
+| **Row state map** — rebuild, resync and check skip the rows that hold no data (`mdadm --create … --row-map`) | ✅ done (2026-10-31) — 2 bits per row (unwritten / needs sync / written) in a sealed reserve at every member's tail, written to every member and to a replacement before its rebuild; a new array needs **no initial resync**; a partial write into an unwritten row is written by a forced reconstruct-write, the rest of the row synced by the next resync or repair; a whole-row discard returns a row to unwritten.  A damaged map page loads as "needs sync" (never skipped).  Gate `tools/raidkm-test-rowmap.sh` (33 checks, with negative controls).  Not with native checksums, declustered, PPL/journal, reshape or metadata 1.0 (refused).  See *Row state map and native snapshots* below |
+| **Native read-only snapshots** (`mdadm --create … --snapshots=<reserve %>`, `mdadm --snapshot`) | ✅ done (2026-11-01) — copy-on-write per row inside the array: no thin pool, no second metadata device.  Up to 64 snapshots in a linear chain, each a read-only block device `/dev/mdXs<id>`; a create freezes a mounted filesystem for its point in time.  **Crash safe**: every change goes to a journal on every member before the write that needed a copy is acknowledged; checkpoints and a replay at assemble bring the snapshots back after a stop, crash or power cut.  Power-cut matrix (dm-log-writes, every snapshot's md5 as the oracle, degraded included): **323 passed, 0 failed** on RHEL 9.7, 109/0 on 9.8.  A full reserve fails the write with ENOSPC and leaves the snapshots intact.  4 KiB first pass after a snapshot ~10% ahead of dm-thin, 1 MiB ~35% ahead, same member bytes.  Gates `tools/raidkm-test-snap.sh` (36 checks), `tools/raidkm-test-snap-persist.sh` (31).  See *Row state map and native snapshots* below |
 
 ### How level 71 is integrated into raid5.c
 
@@ -1174,6 +1176,18 @@ under the churn, a REAL corruption of a block whose CRC page was evicted is stil
 healed after re-fault, and a final scrub reports zero mismatches. This is the standing gate for
 the demand-paged cache and the inline-verify engine.
 
+**Row state map and snapshot suites.** `tools/raidkm-test-rowmap.sh` (row map:
+states, persistence, rebuild/resync/check skipping, discard, a dirty degraded
+start refused; negative controls `RM_NO_RCW=1` / `RM_NO_RECSKIP=1` must fail),
+`tools/raidkm-test-snap.sh` (snapshot content across a chain and its destroys,
+a snapshot of a mounted ext4 under load, the copy paths' corner cases, a
+listing past one sysfs page; `SNAP_PERF=1` adds the first/second-pass
+numbers) and `tools/raidkm-test-snap-persist.sh` (stop and assemble, journal
+replay without a checkpoint, ring wraps, degraded and rebuilt members, damaged
+metadata copies, a full reserve, an auto-read-only array).  All take `MDADM=`
+(the fork, branch `raidkm-level71`); the snapshot suites also take
+`RAIDKM_KO=` / `ISAL_KO=`.
+
 **Real-NVMe re-gate (2026-07-15).** The native-checksum stack was re-gated on real
 4K-logical-block NVMe (8× GCP local SSD) under a KASAN + lockdep kernel: the
 functional (12/12), csum-thrash, and self-heal (60/60) suites all run clean with
@@ -1193,8 +1207,10 @@ md-kmec/
 ├── compat/
 │   ├── compat-rhel10.h  # RHEL 10.x personality-API shim (force-included by the build)
 │   ├── compat-rhel9.h   # RHEL 9.x shim (md_submodule head-style personality)
+│   ├── compat-rhel98.h  # RHEL 9.8 shim (9.8 moved struct mddev)
 │   └── compat-vanilla.h # mainline-kernel shim
 ├── md-rhel9/            # vendored RHEL 9.x md headers (ABI matches in-kernel md-mod)
+├── md-rhel98/           # vendored RHEL 9.8 md headers
 ├── md-vanilla/          # vendored mainline md headers
 ├── tools/
 │   ├── raidkm-test.sh               # run the full test suite (functional/degraded/grow)
@@ -1242,15 +1258,21 @@ md-kmec/
 │   │                                    # declustered populate/copyback); null_blk rig
 │   │                                    # or --devs; --checksum prices native CRC
 │   ├── raidkm-member-stats.sh         # sourced helper: member request counters
+│   ├── raidkm-test-rowmap.sh          # row state map (states, skips, persistence, discard)
+│   ├── raidkm-test-snap.sh            # native snapshots: content, freeze, copy-path cases
+│   ├── raidkm-test-snap-persist.sh    # native snapshots across stop, replay, degraded, rebuild
 │   └── raidkm-create.sh               # sysfs array creation; needs adapting
 │                                    # to "raidkm" name / level 71
 └── km/
-    ├── Kbuild           # builds raidkm.ko = raid_km.o + raid_km-cache.o + raid_km-ppl.o
+    ├── Kbuild           # builds raidkm.ko = raid_km.o + raid_km-cache.o + raid_km-ppl.o + ...
     ├── raid_km.c        # fork of mdraid/md/raid5.c with effective_level dispatch
     ├── raid_km.h        # fork of raid5.h (RAID_KM_LEVEL, is_raid6_math, effective_level)
     ├── raid_km-cache.c  # fork of raid5-cache.c (journal, dormant unless attached)
     ├── raid_km-ppl.c    # fork of raid5-ppl.c (partial parity log, ditto)
     ├── raid_km-log.h    # fork of raid5-log.h
+    ├── raid_km-rowmap.c # row state map (raid_km_rowmap.h)
+    ├── raid_km-snap.c   # native snapshots: copy-on-write, snapshot disks, commands (raid_km_snap.h)
+    ├── raid_km-snapmeta.c # snapshot metadata: journal, checkpoints, load + replay
     └── raid0.h          # fork (for the takeover stubs to link)
 ```
 
@@ -1284,12 +1306,14 @@ kernel's personality API (`register_md_submodule` etc.) unchanged:
 | `TARGET`  | Selected when     | md headers   | Notes |
 |-----------|-------------------|--------------|-------|
 | `rhel10`  | `.el10` release   | built mdraid tree | flat `md_personality` with `.level` |
-| `rhel9`   | `.el9` release    | `md-rhel9/`  | `md_submodule_head`-style personality (level comes from `head.id`) |
+| `rhel9`   | `.el9` release    | `md-rhel9/` (9.7 and earlier), `md-rhel98/` on a `.el9_8` release | `md_submodule_head`-style personality (level comes from `head.id`); 9.8 moved `struct mddev`, so 9.8 gets its own headers and `compat-rhel98.h` |
+| `rhel98`  | never (forced)    | `md-rhel98/` | for a 9.8-based kernel whose release does not say `.el9_8` (CentOS Stream 9, a local build) |
 | `vanilla` | anything else     | `md-vanilla/` | mainline |
 
-Override the auto-detection with `make TARGET=rhel9` (useful when building
-against a KDIR whose release string doesn't carry the distro suffix, e.g. a
-locally-built debug kernel).
+Override the auto-detection with `make TARGET=rhel9` (or `TARGET=rhel98`)
+when building against a KDIR whose release string doesn't carry the distro
+suffix, e.g. a locally-built debug kernel.  The build's `struct mddev` ABI
+check follows the header set actually picked.
 
 RHEL 9 support is **production-grade**: the full 12-suite matrix (functional,
 declustered create/io/degraded/csum/populate/rebalance/autoarm/multi/crash,
@@ -1319,8 +1343,8 @@ co-dependent — features land across both repos together (level-71
 create / assemble / grow, and the PPL consistency policy).  Build and
 run them as a **matched pair**: the mdadm fork that goes with this
 tree is branch **`raidkm-level71`**, currently at commit
-**`24e99c1b`** ("raidkm: --grow --remove-parity + fix add-parity
-dropping the csum layout bit").  When you advance one repo, rebuild the other from
+**`b46435d5`** ("raidkm: --snapshots=<reserve %> and mdadm --snapshot
+(native snapshots P2)").  When you advance one repo, rebuild the other from
 its matching commit.  The fork will be wired in as a git submodule once it has a
 published remote (`scopedog/mdadm`); until then it lives in
 the sibling [`mdadm`](../mdadm) checkout and the pairing is tracked
@@ -1523,6 +1547,127 @@ mdadm --grow /dev/md70 --add-parity /dev/ram5   # m=2 → m=3 (rotating), online
 
 To add a **hot spare** (not part of the array yet), use MANAGE-mode `--add`
 without `--grow`: `mdadm /dev/md70 --add /dev/ram5`.
+
+## Row state map and native snapshots
+
+Both are **create options** and opt-in: an array created without them is
+unchanged, and neither can be added to an existing array.  A *row* is one
+chunk on every data member — k × chunk of data (8+2 with 128 KiB chunks:
+1 MiB rows).
+
+### Row state map (`--row-map`)
+
+raidkm keeps 2 bits per row in a small reserve at each member's tail:
+
+| State | Meaning | Effect |
+|---|---|---|
+| unwritten | no data yet (a new array, or a row discarded whole) | rebuild, resync and check skip it; its parity is not trusted |
+| needs sync | written since unwritten, by a write smaller than the row | its stripes are written by a forced reconstruct-write; the next resync or repair syncs the rest, then it is written |
+| written | a normal row | normal |
+
+A new array starts all unwritten, so it needs **no initial resync**
+(`--assume-clean` is refused: the new map would mark data already on the
+members as unused, and a rebuild would skip it).  A write covering a whole row makes
+it written at once.  A map change reaches the disk before the write that
+needed it does (the bitmap's own delay mechanism); the other changes are
+written lazily.  The map is on every member, and a replacement member gets
+it before its rebuild starts, so it survives replacing every original
+member.  Each 4 KiB map page is sealed (CRC-32C + array id + generation);
+load takes the newest valid copy, and a damaged page loads as "needs sync"
+— rebuilt, never skipped.
+
+```sh
+mdadm --create /dev/md70 --level=raidkm --parity-count=2 --chunk=128 \
+      --raid-devices=10 --row-map /dev/sd[b-k]
+cat /sys/block/md70/md/rk_rowmap     # rows per state, skipped_rows, flushes, ...
+```
+
+`--examine` prints a `Row Map : on` line (and `Snapshots : on` on a snapshot
+array).  Refused with the row map (v1): native checksums, declustered parity, PPL / the raidkm journal, any reshape or
+resize, and metadata 1.0 (superblock at the device end).
+
+### Native snapshots (`--snapshots=<reserve %>`)
+
+```sh
+mdadm --create /dev/md70 --level=raidkm --parity-count=2 --chunk=128 \
+      --raid-devices=10 --snapshots=20 /dev/sd[b-k]
+```
+
+`--snapshots=N` (1–90, required: there is no default) implies `--row-map`
+and keeps N% of the rows as a **reserve**; the array exports the other
+(100 − N)% (the *origin*).  After a snapshot, the first write to a row the
+snapshot still shares moves the row: a whole-row write goes to a free
+reserve row as it is (the bio is remapped, no copy), a partial write is
+merged into a copy of the old row on a worker.  The old row then belongs to
+the snapshot; later writes to that row go straight through.  Destroying a
+snapshot hands its rows to the next older snapshot that still needs them,
+or frees them (and marks them unwritten in the row map).
+
+Snapshots form a **linear chain** (each one shares with the origin as it
+was at its create), up to **64** per array.  Each is a read-only block
+device `/dev/mdXs<id>` (ids count up from 1).  A create freezes a mounted
+filesystem on the array (as `dmsetup suspend` does for LVM), waits for the
+writes in flight, takes the snapshot and thaws it.
+
+| Command | Effect |
+|---|---|
+| `mdadm --snapshot <array> --create <name> [--attr k=v]... [--tag <t>]` | take a snapshot, with attributes (`--tag t` stores `magic=t-ss`) |
+| `mdadm --snapshot <array> --destroy <name>` | remove it (refused while it is open) |
+| `mdadm --snapshot <array> --rename <old> <new>` | rename it |
+| `mdadm --snapshot <array> --set <name> k=v...` | add or replace attributes |
+| `mdadm --snapshot <array> --list [<name>] [--export]` | `name= id= ctime= dev= exc=` (rows held) plus the attributes, oldest first |
+| `mdadm --snapshot <array> --exists <name>` | exit 0 if it exists, 1 if not |
+| `mdadm --snapshot <array> --checkpoint` | write a checkpoint now |
+
+Names are `[A-Za-z0-9._-]`, 1–63 characters; attributes are `key=value`
+pairs, up to 1 KiB per snapshot.  Exit codes: 0 ok, 1 no such snapshot,
+16 busy, 17 exists, 22 bad argument, 5 anything else.
+
+```sh
+mdadm --snapshot /dev/md70 --create nightly-1 --attr owner=ops
+mdadm --snapshot /dev/md70 --list
+#   name=nightly-1 id=1 ctime=1793500000 dev=/dev/md70s1 exc=0 owner=ops
+mount -o ro /dev/md70s1 /mnt/snap
+cat /sys/block/md70/md/rk_snap                # reserve, copy and journal counters
+cat /sys/block/md70s1/rk_snap/{name,id,ctime,attrs,exc}
+```
+
+**Crash safety.**  The metadata is a reverse map — for every physical row,
+its owner (origin or one snapshot) and the origin row it holds, 8 bytes per
+row — kept on **every member** after the row map, beside a 64-slot
+snapshot table and a 4 MiB journal ring.  Each change (a row moved, a
+create, a destroy, a rename, an attribute) is a journal record; records go
+in group commits (flush every member, then the records with FUA to every
+member), and a write that needed a copy is acknowledged only after its
+record is durable.  Checkpoints write the changed map pages into the copy
+that is not current, then the table, then the header, so a torn checkpoint
+never loses a mapping.  Assemble takes the newest valid header across the
+in-sync members, loads the map, checks it for consistency and replays the
+journal.  A rebuilt member gets the metadata with its rebuild.
+
+**Space.**  On each member: 16 bytes per row (two map copies) plus about
+4 MiB (headers, table, page maps, journal) — 20 TB members with 128 KiB
+chunks: 2.4 GB per member, 0.012%.  In memory: 4 bytes per origin row, plus a few bytes for each
+row a snapshot holds.  When the reserve is full, a write that needs a copy
+fails with **ENOSPC**; the snapshots stay intact, and destroying one
+gives its rows back.
+
+**Not yet** (refused, not run wrong): native checksums, declustered parity,
+PPL / the raidkm journal, reshape or grow.  Discards on a snapshot array are
+ignored (a row may be shared).  The origin map is in memory, not demand
+paged; snapshots are read-only, and there is no external metadata device.
+
+**Cost.**  RAM-backed 8+2, 128 KiB chunks, RHEL 9.8 (the CPU path, not
+device timing), first write pass over the origin after a snapshot:
+
+| Workload | dm-thin (block = row) | raidkm native |
+|---|---|---|
+| 4 KiB random write, first pass | 10.7 K IOPS | 11.7 K IOPS |
+| 1 MiB sequential write, first pass | 2.3 GiB/s | 3.1 GiB/s |
+
+Member bytes per user byte are the same (34.6 read / 43 written at 4 KiB:
+each first write copies a 1 MiB row).  Later passes run as without a
+snapshot.
 
 ## Declustered parity
 

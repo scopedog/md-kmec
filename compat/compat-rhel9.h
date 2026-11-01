@@ -50,4 +50,15 @@
  */
 #define raid6_get_zero_page()	((void *)page_address(ZERO_PAGE(0)))
 
+/*
+ * el9_7 declares bio_add_folio_nofail() in <linux/bio.h> but does not
+ * export it (5.14.0-611.55.1 Module.symvers): a raidkm.ko that calls it
+ * fails to load ("Unknown symbol").  Upstream's body is exactly this, and
+ * __bio_add_page() is exported.  bio.h first, so its declaration is not
+ * hit by the macro (it has include guards).
+ */
+#include <linux/bio.h>
+#define bio_add_folio_nofail(bio, folio, len, off)			\
+	__bio_add_page((bio), &(folio)->page, (len), (off))
+
 #endif /* MD_COMPAT_RHEL9_H */

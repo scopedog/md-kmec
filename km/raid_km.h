@@ -75,6 +75,16 @@ static inline bool is_raid6_math(int level)
  *               carries k = g - m data columns regardless of N, which is what
  *               raid5_stripe_data_disks() reports as io_opt.
  *
+ *   bit  11     RAIDKM_LAYOUT_ROWMAP — row state map: a tail reserve on every
+ *               member (mdadm --row-map) holding a 2-bit state per row, so
+ *               rebuild, resync and check skip rows that hold no data.  See
+ *               raid_km_rowmap.h.
+ *
+ *   bit  12     RAIDKM_LAYOUT_SNAP — native snapshots (mdadm --snapshots=<pct>,
+ *               needs the row map): a second tail reserve after the row map
+ *               holds the snapshot metadata, and the array exports only the
+ *               origin rows; the rest is the reserve.  See raid_km_snap.h.
+ *
  * Stored verbatim in the superblock layout field, so the choice persists
  * across assemble.  A plain `--layout=m` (no high bits) is PARITY_N, keeping
  * every existing array bit-for-bit compatible.
@@ -83,13 +93,16 @@ static inline bool is_raid6_math(int level)
 #define RAIDKM_LAYOUT_ROTATING	0x0100
 #define RAIDKM_LAYOUT_CSUM	0x0200
 #define RAIDKM_LAYOUT_DCL	0x0400
+#define RAIDKM_LAYOUT_ROWMAP	0x0800
+#define RAIDKM_LAYOUT_SNAP	0x1000
 #define RAIDKM_LAYOUT_DCL_G(l)	(((l) >> 16) & 0xff)
 #define RAIDKM_LAYOUT_DCL_S(l)	(((l) >> 24) & 0x7f)
 /* bits [30:16] carry g and the spare-column count, valid ONLY with DCL set */
 #define RAIDKM_LAYOUT_DCL_FIELDS 0x7fff0000
 /* bits that carry meaning; anything else set is rejected at create time */
 #define RAIDKM_LAYOUT_KNOWN	(RAIDKM_LAYOUT_M_MASK | RAIDKM_LAYOUT_ROTATING | \
-				 RAIDKM_LAYOUT_CSUM)
+				 RAIDKM_LAYOUT_CSUM | RAIDKM_LAYOUT_ROWMAP | \
+				 RAIDKM_LAYOUT_SNAP)
 
 static inline int raidkm_layout_m(int layout)
 {
@@ -1136,6 +1149,8 @@ struct r5conf {
 	bool			dcl_auto;	/* arm population on member
 						 * failure (sysfs rk_dcl_auto,
 						 * default off, not persisted) */
+	struct raidkm_rowmap	*rowmap;	/* RAIDKM_LAYOUT_ROWMAP, else NULL */
+	struct raidkm_snap	*snap;		/* native snapshots (LAYOUT_SNAP) */
 	struct raidkm_csum_cache *csum;	/* demand-paged region-page cache;
 					 * non-NULL == native checksum on */
 	bool			csum_disk;

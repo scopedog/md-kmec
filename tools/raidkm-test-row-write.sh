@@ -812,6 +812,19 @@ scrub_clean && rk_pass "T16: scrub clean" || rk_fail "T16: parity mismatch after
 echo "=== T16: degraded with a bitmap: cached pages, races, re-add ==="
 t16
 
+# no superblock update pending or in flight: array_state is not write-pending
+# and the event count holds still for a second (at most ~10 s)
+sb_settle() {
+	local i e p=""
+	for i in $(seq 1 20); do
+		e=$("$MDADM" --detail "$MD" 2>/dev/null | awk '/Events :/ {print $3}')
+		if ! grep -q write-pending "$(SYS array_state)" && [ -n "$e" ] && [ "$e" = "$p" ]; then
+			return 0
+		fi
+		p=$e; sleep 0.5
+	done
+}
+
 # ---- T17: a second member lost under degraded row writes ----------------------
 # One member gone, then another one's writes fail (dm error): each row write
 # that fails on it has m - 1 = 1 gone member plus 1 failed write, within the
@@ -845,6 +858,11 @@ if [ "${#dm[@]}" = "$N" ] && setup "${M}r" "$N"; then
 	# superblock update would fail the member before any row write met it
 	knob safe_mode_delay 600
 	put "$RK_TMP/A" 0 1M
+	# the superblock update that records the first loss must be on disk
+	# before the second member's writes fail: if it comes after, it meets
+	# the error table first and md fails the member before any row write
+	# does (seen on RHEL 9.8: super_written error, then the failure)
+	sb_settle
 	e0=$(row_stat write_errors); g0=$(row_stat write_degraded)
 	if dmsetup load "rkrw17_$x" --table "0 $sz error" && dmsetup resume "rkrw17_$x"; then
 		put "$RK_TMP/B" 0 1M; rc=$?

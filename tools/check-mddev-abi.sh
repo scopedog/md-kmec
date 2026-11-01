@@ -45,18 +45,31 @@ if [ "$BTF" = "/sys/kernel/btf/vmlinux" ] && [ "$KVER" != "$(uname -r)" ]; then
 fi
 
 # --- expected layout (keep in sync with km/raid_km.c BUILD_BUG_ON) -----------
-# Target selected from the kernel release: ".el9" => RHEL 9.7, other ".el" =>
-# RHEL 10.2, else mainline/Debian.
-case "$KVER" in
-*.el9*)	abi_target=rhel9 ;;
-*.el*)	abi_target=rhel10 ;;
-*)	abi_target=vanilla ;;
-esac
+# The header set the Makefile chose (ABI_TARGET, so a TARGET= override is
+# checked against what is really compiled), else from the kernel release:
+# ".el9_8" => RHEL 9.8, ".el9" => RHEL 9.7, other ".el" => RHEL 10.2, else
+# mainline/Debian.
+abi_target=${ABI_TARGET:-}
+if [ -z "$abi_target" ]; then
+	case "$KVER" in
+	*.el9_8*) abi_target=rhel98 ;;
+	*.el9*)	abi_target=rhel9 ;;
+	*.el*)	abi_target=rhel10 ;;
+	*)	abi_target=vanilla ;;
+	esac
+fi
 if [ "$abi_target" = vanilla ]; then
 	exp_size=2336					# mainline / Debian 6.12
 	mddev_fields="gendisk=120 level=256 reshape_position=344 recovery_active=584"
 	exp_rdev_meta_bdev=				# (not pinned for vanilla)
 	exp_bitmap_start_sync=120			# bitmap_operations vtable slot (Debian 6.12.90)
+elif [ "$abi_target" = rhel98 ]; then
+	exp_size=2192					# RHEL 9.8 builtin md (5.14.0-687.x.el9_8)
+	mddev_fields="gendisk=120 dm_gendisk=128 level=264 reshape_position=352 \
+	              sync_io_depth=488 normal_io_events=600 recovery_active=608 \
+	              resync_offset=640 cluster_ops=2152"
+	exp_rdev_meta_bdev=40
+	exp_bitmap_start_sync=
 elif [ "$abi_target" = rhel9 ]; then
 	exp_size=2744					# RHEL 9.7 builtin md (5.14-el9, 6.12-era backport)
 	mddev_fields="gendisk=120 level=256 reshape_position=344 recovery_active=584 \

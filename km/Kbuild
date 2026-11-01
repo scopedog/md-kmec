@@ -18,4 +18,4 @@ endif
 
 obj-m            += raidkm.o
 raidkm-y         := raid_km.o raid_km-cache.o raid_km-ppl.o raid_km-reshape.o \
-                    raid_km-dcl.o
+                    raid_km-dcl.o raid_km-rowmap.o raid_km-snap.o raid_km-snapmeta.o

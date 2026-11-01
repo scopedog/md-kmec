@@ -1,0 +1,23 @@
+# RHEL 9.8 private md headers (drivers/md/)
+#
+# EXACT copy of the RHEL 9.8 kernel's drivers/md/ headers, extracted from
+# kernel-5.14.0-687.39.1+2.1.el9_8_ciq.src.rpm (linux-5.14.0-687.39.1.el9_8
+# tarball).  Same vendoring rule as md-rhel9/ and md-vanilla/: always the
+# *target kernel's* exact drivers/md/, never an approximation.
+#
+# Deltas vs md-rhel9/ (9.7), all in md core's own layout:
+#   md.h        struct mddev: dm_gendisk after gendisk (every later offset
+#               moves by 8), sync_io_depth, normal_io_events; recovery_cp
+#               renamed resync_offset; MD_DO_DELETE gone from mddev_flags;
+#               md_rdev.last_events unsigned long; md_sync_acct() gone
+#               (gendisk->sync_io removed)
+#   md-bitmap.h bitmap_operations: create(mddev), start_write/end_write
+#               (void, renamed from startwrite/endwrite); the counter
+#               macros moved out
+#   raid1.h     raid1 private (raidkm does not use it)
+#   md-cluster.h raid5.h raid10.h  unchanged
+#
+# raidkm on RHEL 9.8 builds against these via TARGET=rhel9 on a .el9_8
+# kernel (the Makefile picks md-rhel98/ + compat/compat-rhel98.h).
+#
+# Files: md.h md-bitmap.h md-cluster.h raid1.h raid5.h raid10.h

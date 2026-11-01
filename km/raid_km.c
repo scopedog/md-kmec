@@ -62,6 +62,8 @@
 #include "md.h"
 #include "raid_km.h"
 #include "raid_km_dcl.h"
+#include "raid_km_rowmap.h"
+#include "raid_km_snap.h"
 #include "raid0.h"
 #include "md-bitmap.h"
 #include "raid_km-log.h"
@@ -92,6 +94,22 @@ static void __maybe_unused raidkm_mddev_abi_checks(void)
 	 * from the same headers and config as that kernel, so its layout moves
 	 * identically and the binding stays correct by construction.  Skip the
 	 * pins; check-mddev-abi.sh skips for the same reason. */
+#elif defined(RAIDKM_TARGET_RHEL98)
+	/* RHEL 9.8 builtin md core (5.14.0-687.x.el9_8): dm_gendisk after
+	 * gendisk moves everything later by 8, as RHEL 10.2; recovery_cp is
+	 * resync_offset (compat-rhel98.h).  Verified via pahole on the
+	 * running 5.14.0-687.61.1.el9_8 BTF (2026-10-31). */
+	BUILD_BUG_ON(sizeof(struct mddev)			!= 2192);
+	BUILD_BUG_ON(offsetof(struct mddev, gendisk)		!= 120);
+	BUILD_BUG_ON(offsetof(struct mddev, dm_gendisk)		!= 128);
+	BUILD_BUG_ON(offsetof(struct mddev, level)		!= 264);
+	BUILD_BUG_ON(offsetof(struct mddev, reshape_position)	!= 352);
+	BUILD_BUG_ON(offsetof(struct mddev, sync_io_depth)	!= 488);
+	BUILD_BUG_ON(offsetof(struct mddev, normal_io_events)	!= 600);
+	BUILD_BUG_ON(offsetof(struct mddev, recovery_active)	!= 608);
+	BUILD_BUG_ON(offsetof(struct mddev, resync_offset)	!= 640);
+	BUILD_BUG_ON(offsetof(struct mddev, cluster_ops)	!= 2152);
+	BUILD_BUG_ON(offsetof(struct md_rdev, meta_bdev)	!= 40);
 #elif defined(RAIDKM_TARGET_RHEL9)
 	/* RHEL 9.7 builtin md core (5.14.0-611.x.el9_7 — 6.12-era md
 	 * backport).  Offsets match the mainline 6.12 layout for everything
@@ -6538,6 +6556,8 @@ static bool add_stripe_bio(struct stripe_head *sh, struct bio *bi,
 	raidkm_stripe_bitmap_start(sh->raid_conf, sh,
 				   __add_stripe_bio(sh, bi, dd_idx, forwrite,
 						    previous));
+	if (forwrite && sh->raid_conf->rowmap)
+		raidkm_rowmap_stripe_start(sh->raid_conf, sh);
 	spin_unlock_irq(&sh->stripe_lock);
 	return true;
 }
@@ -6784,7 +6804,8 @@ static int need_this_block(struct stripe_head *sh, struct stripe_head_state *s,
 	struct r5dev *fdev[2] = { &sh->dev[s->failed_num[0]],
 				  &sh->dev[s->failed_num[1]] };
 	int i;
-	bool force_rcw = (sh->raid_conf->rmw_level == PARITY_DISABLE_RMW);
+	bool force_rcw = (sh->raid_conf->rmw_level == PARITY_DISABLE_RMW) ||
+			 raidkm_rowmap_force_rcw(sh->raid_conf, sh->sector);
 
 
 	if (test_bit(R5_LOCKED, &dev->flags) ||
@@ -7461,7 +7482,9 @@ static int handle_stripe_dirtying(struct r5conf *conf,
 	 */
 	if (conf->rmw_level == PARITY_DISABLE_RMW ||
 	    (recovery_cp < MaxSector && sh->sector >= recovery_cp &&
-	     s->failed == 0)) {
+	     s->failed == 0) ||
+	    /* the row map does not trust this row's parity (U/N/S) */
+	    raidkm_rowmap_force_rcw(conf, sh->sector)) {
 		/* Calculate the real rcw later - for now make it
 		 * look like rcw is cheaper
 		 */
@@ -8423,6 +8446,12 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 			set_bit(R5_Insync, &dev->flags);
 		else if (sh->sector + RAID5_STRIPE_SECTORS(conf) <= rdev->recovery_offset)
 			/* in sync if before recovery_offset */
+			set_bit(R5_Insync, &dev->flags);
+		else if (conf->rowmap &&
+			 raidkm_rowmap_rec_skipped(conf, sh->sector))
+			/* a row this recovery skipped as unused: in sync, so
+			 * a write into it keeps the parity matching the
+			 * member (raidkm_rowmap_rec_skipped()) */
 			set_bit(R5_Insync, &dev->flags);
 		else if (test_bit(R5_UPTODATE, &dev->flags) &&
 			 test_bit(R5_Expanded, &dev->flags))
@@ -12786,6 +12815,8 @@ static void raidkm_row_write_submit(struct work_struct *work)
 	/* the bitmap bits for this row are on disk before its data is */
 	if (w->bitmap)
 		mddev->bitmap_ops->unplug(mddev, true);
+	/* ... and so is its row map state */
+	raidkm_rowmap_wait_row(w->conf, w->msect);
 	atomic_set(&w->pending, w->k + w->m - w->nmissing);
 	blk_start_plug(&plug);
 	for (i = 0; i <= last; i++) {
@@ -13378,6 +13409,16 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 		return;
 	}
 
+	/* row map: whole rows discarded are U (content undefined), and the
+	 * members see the discard only when they can take one */
+	if (conf->rowmap) {
+		raidkm_rowmap_note_discard(conf, first_stripe, last_stripe);
+		if (!conf->rowmap->member_discard) {
+			bio_endio(bi);
+			return;
+		}
+	}
+
 	/*
 	 * Account the full stripes the discard covers -- and with that, where
 	 * md core counts writes in the bitmap, count them there (md_clone_bio).
@@ -13617,6 +13658,9 @@ static int add_all_stripe_bios(struct r5conf *conf,
 	}
 	/* every device linked: only now may the lock drop */
 	raidkm_stripe_bitmap_start(conf, sh, nfirst);
+	/* the row map's change for this row is on disk first, as the bits */
+	if (forwrite && conf->rowmap)
+		raidkm_rowmap_stripe_start(conf, sh);
 
 	spin_unlock_irq(&sh->stripe_lock);
 	return 1;
@@ -13918,6 +13962,12 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 		/* ret == -EAGAIN, fallback */
 	}
 
+	/* native snapshots: origin rows -> physical rows, and the first write
+	 * to a row a snapshot shares is redirected (raid_km-snap.c) */
+	if (smp_load_acquire(&conf->snap) &&
+	    raidkm_snap_map_bio(conf, &bi) == RK_SNAP_DONE)
+		return true;
+
 	md_write_start(mddev, bi);
 	/*
 	 * If array is degraded, better not do chunk aligned read because
@@ -13984,6 +14034,12 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 		return true;
 	}
 	md_account_bio(mddev, &bi);
+
+	/* row map: a row this write is the first to touch since U changes
+	 * state here, before any of its stripes or row writes can go out */
+	if (rw == WRITE && conf->rowmap)
+		raidkm_rowmap_note_write(conf, bi->bi_iter.bi_sector,
+					 bio_sectors(bi));
 
 	/* a bio of whole rows may go to the row layer, all of it -- before
 	 * the stripe path's context is set up, which it does not need */
@@ -16991,6 +17047,33 @@ static sector_t raidkm_row_bitmap_run_end(struct mddev *mddev,
 	return conf->row_bm_clean ? s : max_sector;
 }
 
+/*
+ * The row map skipped [s, s + n): rows that need no pass.  md's bitmap learns
+ * that a region is in sync only from start_sync() and the end_sync() that
+ * follows (cond_end_sync, close_sync at the end of the pass), so a bitmap
+ * chunk made of skipped rows only kept its NEEDED bit for good: a new array
+ * stayed all dirty, and every resync after an unclean stop covered every
+ * written row.  Tell the bitmap, as the stripe path does for each stripe it
+ * syncs: with the array staying degraded start_sync() keeps the bit.  A chunk
+ * the skip only partly covers is synced in its other rows anyway (start_sync
+ * still reports it as needing a sync).  Not for check, which clears nothing.
+ */
+static void raidkm_rowmap_bitmap_skipped(struct mddev *mddev, sector_t s,
+					 sector_t n)
+{
+	struct r5conf *conf = mddev->private;
+	sector_t end = s + n, blocks;
+	bool degraded;
+
+	if (!mddev->bitmap || test_bit(MD_RECOVERY_CHECK, &mddev->recovery))
+		return;
+	degraded = raidkm_still_degraded(conf);
+	while (s < end) {
+		mddev->bitmap_ops->start_sync(mddev, s, &blocks, degraded);
+		s += max_t(sector_t, blocks, RAID5_STRIPE_SECTORS(conf));
+	}
+}
+
 static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 				   sector_t max_sector, int *skipped)
 {
@@ -17030,6 +17113,8 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	if (sector_nr >= max_sector) {
 		/* just being told to finish up .. nothing much to do */
 		int cpop, cst;
+
+		raidkm_rowmap_pass_end(mddev, max_sector);
 
 		raidkm_row_rb_set_free(conf);	/* this pass's rebuild buffers */
 		conf->row_bm_from = conf->row_bm_to = 0;	/* and its bitmap look-ahead */
@@ -17198,6 +17283,18 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	 * to resync, then assert that we are finished, because there is
 	 * nothing we can do.
 	 */
+	/* row map: rows that hold no data (and, for check, rows not yet
+	 * synced) need no pass */
+	if (conf->rowmap) {
+		sector_t rv = raidkm_rowmap_sync_skip(mddev, sector_nr,
+						      max_sector);
+
+		if (rv) {
+			raidkm_rowmap_bitmap_skipped(mddev, sector_nr, rv);
+			*skipped = 1;
+			return rv;
+		}
+	}
 	if (mddev->degraded >= conf->max_degraded &&
 	    test_bit(MD_RECOVERY_SYNC, &mddev->recovery)) {
 		sector_t rv = mddev->dev_sectors - sector_nr;
@@ -17263,9 +17360,10 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 
 		if (row_win)
 			did = raidkm_row_rebuild_window(mddev, sector_nr,
-					raidkm_row_bitmap_run_end(mddev,
+					raidkm_rowmap_run_end(mddev, sector_nr,
+						raidkm_row_bitmap_run_end(mddev,
 							sector_nr, max_sector,
-							row_win),
+							row_win)),
 							row_target,
 							tslot, -1,
 							conf->raid_disks -
@@ -17274,8 +17372,9 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 							row_win);
 		else
 			did = raidkm_row_rebuild_band(mddev, sector_nr,
-						      max_sector, row_target,
-						      tslot);
+					raidkm_rowmap_run_end(mddev, sector_nr,
+							      max_sector),
+					row_target, tslot);
 
 		/*
 		 * The row engine has synced these chunks: tell the bitmap, as
@@ -17407,6 +17506,8 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 
 		win_end = min(win_end, next);
 	}
+	/* ... and it stops where the row map says the pass skips again */
+	win_end = raidkm_rowmap_run_end(mddev, sector_nr, win_end);
 	win_sector = sector_nr + RAID5_STRIPE_SECTORS(conf);
 	for (submitted = 1;
 	     !conf->dcl &&	/* declustered: groups above replace the window */
@@ -17699,6 +17800,7 @@ static void raid5d(struct md_thread *thread)
 	struct mddev *mddev = thread->mddev;
 	struct r5conf *conf = mddev->private;
 	int handled;
+	bool rm_ok;
 	struct blk_plug plug;
 
 	pr_debug("+++ raid5d active\n");
@@ -17836,11 +17938,23 @@ static void raid5d(struct md_thread *thread)
 		    !list_empty(&conf->bitmap_list)) {
 			/* Now is a good time to flush some bitmap updates */
 			conf->seq_flush++;
+			/* pairs with raidkm_rowmap_note_write(): a stripe that
+			 * read the old seq_flush had dirtied its page first */
+			smp_mb();
 			spin_unlock_irq(&conf->device_lock);
-			mddev->bitmap_ops->unplug(mddev, true);
+			/* the row map parks stripes here with no bitmap too */
+			if (mddev->bitmap)
+				mddev->bitmap_ops->unplug(mddev, true);
+			/* a map page that reached no member keeps every parked
+			 * stripe parked: the next round tries again (each
+			 * failed member is md_error()ed, so it ends) */
+			rm_ok = raidkm_rowmap_flush(conf);
 			spin_lock_irq(&conf->device_lock);
-			conf->seq_write = conf->seq_flush;
-			activate_bit_delay(conf, conf->temp_inactive_list);
+			if (rm_ok) {
+				conf->seq_write = conf->seq_flush;
+				activate_bit_delay(conf,
+						   conf->temp_inactive_list);
+			}
 		}
 		raid5_activate_delayed(conf);
 
@@ -19374,6 +19488,14 @@ static struct md_sysfs_entry
 raidkm_row_write_entry = __ATTR(rk_row_write, S_IRUGO | S_IWUSR,
 				raidkm_row_write_show, raidkm_row_write_store);
 
+static struct md_sysfs_entry
+raidkm_rowmap_entry = __ATTR(rk_rowmap, S_IRUGO | S_IWUSR,
+			     raidkm_rowmap_show, raidkm_rowmap_store);
+
+static struct md_sysfs_entry
+raidkm_snap_entry = __ATTR(rk_snap, S_IRUGO | S_IWUSR,
+			   raidkm_snap_show, raidkm_snap_store);
+
 static ssize_t
 raidkm_row_write_depth_show(struct mddev *mddev, char *page)
 {
@@ -19885,6 +20007,8 @@ static struct attribute *raid5_attrs[] =  {
 	&raid5_skip_copy.attr,
 	&raidkm_row_dread_entry.attr,
 	&raidkm_row_write_entry.attr,
+	&raidkm_rowmap_entry.attr,
+	&raidkm_snap_entry.attr,
 	&raidkm_row_write_depth_entry.attr,
 	&raidkm_row_rebuild_entry.attr,
 	&raidkm_row_sync_entry.attr,
@@ -19993,6 +20117,11 @@ raid5_size(struct mddev *mddev, sector_t sectors, int raid_disks)
 {
 	struct r5conf *conf = mddev->private;
 
+	/* snapshots: the array is the origin, the rest of the rows is the
+	 * reserve (md's array_size checks against this; reshape and resize
+	 * are refused on these arrays) */
+	if (conf->snap)
+		return conf->snap->O * conf->snap->rs;
 	if (!sectors)
 		sectors = mddev->dev_sectors;
 	if (!raid_disks)
@@ -20134,6 +20263,8 @@ static void free_conf(struct r5conf *conf)
 	int i;
 
 	log_exit(conf);
+	raidkm_snap_free(conf);
+	raidkm_rowmap_free(conf);
 	raidkm_row_rb_set_free(conf);
 	/* an abort in setup_conf() can come here before the pool exists */
 	if (conf->row_wctx_free.next) {
@@ -21040,7 +21171,24 @@ static int raid5_set_limits(struct mddev *mddev)
 	 * might be to turn DISCARD into WRITE_ZEROES requests, as that is
 	 * required to be safe.
 	 */
-	if (!devices_handle_discard_safely ||
+	if (conf->rowmap) {
+		/*
+		 * With the row map a discarded row is U, so the array can
+		 * always take a discard.  The members get it only under the
+		 * same rule as without the map (devices_handle_discard_safely):
+		 * a trimmed block that does not read back the same twice
+		 * breaks the parity a later reconstruct-write builds over it
+		 * (U -> N), and the U goes to disk lazily, so a crash before
+		 * that leaves a W row over trimmed members.
+		 */
+		conf->rowmap->member_discard = devices_handle_discard_safely &&
+			lim.max_discard_sectors >= (stripe >> 9) &&
+			lim.discard_granularity >= stripe;
+		if (!conf->rowmap->member_discard) {
+			lim.max_hw_discard_sectors = UINT_MAX;
+			lim.discard_granularity = stripe;
+		}
+	} else if (!devices_handle_discard_safely ||
 	    lim.max_discard_sectors < (stripe >> 9) ||
 	    lim.discard_granularity < stripe)
 		lim.max_hw_discard_sectors = 0;
@@ -21383,6 +21531,26 @@ static int raid5_run(struct mddev *mddev)
 	mddev->dev_sectors &= ~((sector_t)mddev->chunk_sectors - 1);
 	mddev->resync_max_sectors = mddev->dev_sectors;
 
+	if (conf->level == RAID_KM_LEVEL &&
+	    (mddev->new_layout & RAIDKM_LAYOUT_ROWMAP)) {
+		ret = raidkm_rowmap_init(conf);
+		if (ret)
+			goto abort;
+	}
+	if (conf->level == RAID_KM_LEVEL &&
+	    (mddev->new_layout & RAIDKM_LAYOUT_SNAP)) {
+		/* the snapshot metadata: the array does not start without it,
+		 * the origin map decides where every row is */
+		ret = -EINVAL;
+		if (!conf->rowmap)
+			pr_err("md/raid:%s: snapshots need the row map\n",
+			       mdname(mddev));
+		else
+			ret = raidkm_snap_init(conf);
+		if (ret)
+			goto abort;
+	}
+
 	if (mddev->degraded > dirty_parity_disks &&
 	    mddev->recovery_cp != MaxSector) {
 		if (test_bit(MD_HAS_PPL, &mddev->flags))
@@ -21466,7 +21634,12 @@ abort:
 	free_conf(conf);
 	mddev->private = NULL;
 	pr_warn("md/raid:%s: failed to run raid set.\n", mdname(mddev));
-	return ret;
+	/* ret holds the last step's result: a step that succeeded (the row
+	 * map, a reshape recovery) leaves 0 behind, and a later refusal that
+	 * jumps here without its own error (the dirty degraded start) would
+	 * then report success with mddev->private gone -- md_run() goes on to
+	 * pers->size() and dereferences NULL */
+	return ret ?: -EIO;
 }
 
 static void raid5_free(struct mddev *mddev, void *priv)
@@ -21476,6 +21649,9 @@ static void raid5_free(struct mddev *mddev, void *priv)
 	/* Native checksum: drain the workqueue + flush dirty region pages on a
 	 * clean stop, before the conf and its rdevs go away. */
 	raidkm_csum_writeback(conf);
+	raidkm_snap_stop(conf);
+	raidkm_snap_free(conf);
+	raidkm_rowmap_stop(conf);
 	free_conf(conf);
 	mddev->to_remove = &raid5_attrs_group;
 }
@@ -21656,6 +21832,14 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 	int last = conf->raid_disks - 1;
 	bool copy_eligible;
 
+	if (!raidkm_snap_room(conf, rdev)) {
+		/* the snapshot metadata goes to every member, written whole
+		 * before the rebuild: it has to fit */
+		pr_err("md/raid:%s: snap: %pg is too small for the data, the row map and the snapshot metadata\n",
+		       mdname(mddev), rdev->bdev);
+		return -EINVAL;
+	}
+
 	if (test_bit(Journal, &rdev->flags)) {
 		if (conf->log)
 			return -EBUSY;
@@ -21681,6 +21865,11 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 	if (rdev->saved_raid_disk < 0 && has_failed(conf))
 		/* no point adding a device */
 		return -EINVAL;
+
+	/* row map: the rows an earlier recovery skipped are not in sync on
+	 * this member (raidkm_rowmap_rec_skipped()) */
+	if (conf->rowmap)
+		raidkm_rowmap_member_added(conf);
 
 	/*
 	 * Declustered Phase 3/3b rebalance v1 (population design note §5): a
@@ -21883,6 +22072,11 @@ static int raid5_resize(struct mddev *mddev, sector_t sectors)
 	 * worth it.
 	 */
 	sector_t newsize;
+
+	/* row map v1: the map sits right after the data area */
+	if (((struct r5conf *)mddev->private)->rowmap &&
+	    sectors != mddev->dev_sectors)
+		return -EOPNOTSUPP;
 	struct r5conf *conf = mddev->private;
 	int ret;
 
@@ -22954,6 +23148,17 @@ static int raidkm_check_reshape(struct mddev *mddev)
 {
 	unsigned int new_chunk = mddev->new_chunk_sectors;
 
+	/* row map v1: a row is one chunk of every member, so any geometry
+	 * change would move every row under the map */
+	if (((struct r5conf *)mddev->private)->rowmap &&
+	    (mddev->delta_disks ||
+	     (mddev->new_layout >= 0 && mddev->new_layout != mddev->layout) ||
+	     (new_chunk && new_chunk != mddev->chunk_sectors))) {
+		pr_warn("md/raid:%s: row map: reshape not supported\n",
+			mdname(mddev));
+		return -EOPNOTSUPP;
+	}
+
 	if (mddev->new_layout >= 0 && mddev->new_layout != mddev->layout) {
 		/*
 		 * Declustered geometry reshapes (add-parity m+1, add-data k+1,
@@ -23245,6 +23450,7 @@ static int raid5_start(struct mddev *mddev)
 {
 	struct r5conf *conf = mddev->private;
 
+	raidkm_snap_start(conf);
 	return r5l_start(conf->log);
 }
 
