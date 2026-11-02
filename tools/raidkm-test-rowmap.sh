@@ -60,15 +60,43 @@ mem_off() {
 			for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l" 2>/dev/null; done
 		done
 		umount "$d" 2>/dev/null && continue
-		[ $t -ge 300 ] && { echo "  WARNING: $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
+		[ $t -ge 300 ] && { echo "  $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
 		sleep 0.1; t=$((t + 1))
 	done
 }
 
+# mem_on <dir>: a tmpfs still mounted there (mem_off gave up) is never stacked
+# on: that is the leak mem_off exists to stop.  The suite stops instead.
+mem_on() {
+	mkdir -p "$1"
+	mountpoint -q "$1" && { fail "$1 still mounted: not stacking another tmpfs on it"; exit 1; }
+	mount -t tmpfs -o size=$2 tmpfs "$1" || { fail "mount tmpfs on $1"; exit 1; }
+}
+
+# T16's dm devices over the members; dm_off removes them (teardown too).  One
+# that will not go stays in DMN for the next try, and is a FAIL: it holds
+# its member loop device, and with it the member tmpfs.
+DMN=()
+dm_off() {
+	local d left=()
+	udevadm settle 2>/dev/null
+	for d in "${DMN[@]}"; do
+		dmsetup remove --retry "$d" 2>/dev/null && continue
+		dmsetup info "$d" >/dev/null 2>&1 || continue	# already gone
+		fail "dmsetup remove $d: $(dmsetup info -c --noheadings -o open "$d" 2>&1) opener(s)"
+		left+=("$d")
+	done
+	DMN=("${left[@]}")
+}
+
 teardown() {
 	$MDADM --stop $MD >/dev/null 2>&1
-	mem_off $RMMEM
+	dm_off
+	mem_off $RMMEM || fail "teardown: $RMMEM still mounted (its tmpfs would leak)"
 }
+# any exit (an early exit 1 included) gives back md70, the dm devices, the
+# loop devices and the tmpfs: the CI guest has no RAM to leave them in
+trap teardown EXIT
 
 load() {
 	modprobe -a md_mod raid6_pq async_tx async_xor async_memcpy async_pq async_raid6_recov 2>/dev/null
@@ -79,7 +107,7 @@ load() {
 }
 
 members() {	# fill members with random bytes so unsynced parity is garbage
-	mkdir -p $RMMEM; mount -t tmpfs -o size=$(( (NMEM + 2) * MEMSZ + 32 ))m tmpfs $RMMEM
+	mem_on $RMMEM $(( (NMEM + 2) * MEMSZ + 32 ))m
 	M=()
 	for i in $(seq 0 $NMEM); do
 		head -c ${MEMSZ}M /dev/urandom > $RMMEM/m$i
@@ -91,7 +119,7 @@ members() {	# fill members with random bytes so unsynced parity is garbage
 create() {	# create [extra mdadm options]
 	$MDADM --create $MD --level=raidkm --parity-count=2 --layout=rotating \
 		--raid-devices=$NMEM --chunk=$CHUNK --bitmap=${RM_BITMAP:-none} --row-map \
-		--run --force "$@" "${M[@]}" >/tmp/rm-create.log 2>&1 || { cat /tmp/rm-create.log; exit 1; }
+		--run --force "$@" "${M[@]}" >$RK_DIR/rm-create.log 2>&1 || { cat $RK_DIR/rm-create.log; exit 1; }
 	idle
 }
 
@@ -278,11 +306,11 @@ teardown
 members
 for f in "-e 1.0" "--assume-clean"; do
 	if $MDADM --create $MD --level=raidkm --parity-count=2 --raid-devices=$NMEM --chunk=$CHUNK \
-		--bitmap=none --row-map --run --force $f "${M[@]}" >/tmp/rm-create.log 2>&1; then
+		--bitmap=none --row-map --run --force $f "${M[@]}" >$RK_DIR/rm-create.log 2>&1; then
 		fail "T13 --row-map $f was accepted"; $MDADM --stop $MD >/dev/null 2>&1
 	else
-		grep -q -- "--row-map" /tmp/rm-create.log && pass "T13 --row-map $f refused: $(grep -- --row-map /tmp/rm-create.log | head -1 | cut -c1-70)" || \
-			fail "T13 --row-map $f failed for another reason: $(tail -1 /tmp/rm-create.log)"
+		grep -q -- "--row-map" $RK_DIR/rm-create.log && pass "T13 --row-map $f refused: $(grep -- --row-map $RK_DIR/rm-create.log | head -1 | cut -c1-70)" || \
+			fail "T13 --row-map $f failed for another reason: $(tail -1 $RK_DIR/rm-create.log)"
 	fi
 done
 
@@ -331,7 +359,6 @@ grep -q "^$MDN : active" /proc/mdstat && pass "T15 the whole array still assembl
 # Each member under dm: linear, except the map region, which is flakey in
 # its down state with error_reads + drop_writes (reads fail, writes vanish;
 # drop_writes alone lets reads through).
-DMN=(); dm_off() { local d; for d in "${DMN[@]}"; do dmsetup remove "$d" 2>/dev/null; done; DMN=(); }
 $MDADM --stop $MD >/dev/null 2>&1
 teardown; members; create; PIECES=(); write_set
 echo flush > /sys/block/$MDN/md/rk_rowmap
@@ -362,10 +389,12 @@ else
 	done
 	mk16="raidkm-test-rowmap T16 assemble $$.$(date +%s%N)"	# unique: the ring keeps earlier runs
 	echo "$mk16" > /dev/kmsg
-	out16=$($MDADM --assemble --run $MD "${D[@]}" 2>&1)
+	[ ${#D[@]} = ${#M[@]} ] && out16=$($MDADM --assemble --run $MD "${D[@]}" 2>&1)
 	sleep 1
 	k16() { dmesg | sed -n "/$mk16/,\$p"; }
-	if ! grep -q "^$MDN : active" /proc/mdstat; then
+	if [ ${#D[@]} != ${#M[@]} ]; then
+		:	# a dmsetup create failed (counted above): no degraded half-set
+	elif ! grep -q "^$MDN : active" /proc/mdstat; then
 		fail "T16 no assemble over the unreadable map region: $out16"
 		k16 | tail -8 | sed 's/^/    /'
 	else

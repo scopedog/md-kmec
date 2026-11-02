@@ -61,13 +61,19 @@
 #   MDADM        raidkm-aware mdadm (default: resolved like the suites do)
 #   BRD_NR=16 BRD_SIZE_KB=131072 NATIVE=1 RK_RELOAD=0 — the settings the release
 #   gates pass with; override any of them in the environment.
+#   RK_TMP       scratch base (default /tmp/raidkm-test): each suite gets its
+#                own <RK_TMP>/ci.<suite>/ and only that one is deleted after it
+#   MS_KEEP, XT_KEEP, FI_KEEP  mdadm-suite, xfstests, faultinject results
+#                (default <DIR>/mdadm-suite, <DIR>/xfstests, <DIR>/faultinject)
 #
 # Needs: root, bash, the raidkm and isal_lib modules (build tree or packaged),
 # the brd module, and about 2 GiB of free memory for the ramdisks.
 #
 # Output (DIR): <suite>.log, <suite>.dmesg (the suite's whole kernel log) and
 # <suite>.tail.dmesg (what the suite did not clear itself: the verdict's log)
-# per suite, summary.txt, results.xml (JUnit), env.txt.  Exit status: 0 only
+# per suite, summary.txt, results.xml (JUnit), env.txt; <suite>.scratch/ keeps
+# the small text files (*.log, *.out, *.fio, *.json) a suite left in its scratch
+# folder, which is deleted after it.  Exit status: 0 only
 # when every suite passed or was skipped with a clean kernel log; 1 on any
 # failure; 2 on a pre-flight refusal.
 #
@@ -211,6 +217,47 @@ need_kb=$(( BRD_NR * BRD_SIZE_KB + 524288 ))
 
 OUTPUT="${OUTPUT:-/var/tmp/raidkm-test-ci-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUTPUT" || die "cannot create $OUTPUT"
+# The nightly suites keep their results under RK_TMP by default: in CI they
+# belong with the other results, out of the scratch folder deleted after
+# each suite (their FAIL lines point at them)
+export MS_KEEP="${MS_KEEP:-$OUTPUT/mdadm-suite}"
+export XT_KEEP="${XT_KEEP:-$OUTPUT/xfstests}"
+export FI_KEEP="${FI_KEEP:-$OUTPUT/faultinject}"
+RK_TMP_BASE=$RK_TMP
+
+# under <dir>: the mounts below it, deepest first
+mounts_under() { awk -v d="$1" '$2 == d || index($2, d "/") == 1 {print $2}' /proc/mounts | sort -ru; }
+# holders_off <block device name>: stop what is stacked on it, top down: md
+# arrays are stopped, dm devices (with whatever is on them) removed
+holders_off() {
+	local h
+	for h in /sys/class/block/$1/holders/*; do
+		[ -e "$h" ] || continue
+		case ${h##*/} in
+		md*) "$MDADM" --stop "/dev/${h##*/}" >/dev/null 2>&1 ;;
+		dm-*) holders_off "${h##*/}"
+		      dmsetup remove --retry "$(cat "$h/dm/name" 2>/dev/null)" >/dev/null 2>&1 ;;
+		esac
+	done
+}
+# scratch_free <dir>: give back what a suite left under its scratch folder
+# (its own teardown never ran: killed at its timeout, or it gave up): stop
+# what is stacked on loop devices backed there (md arrays, dm devices),
+# detach those loop devices, unmount.  0 when nothing is left mounted.
+scratch_free() {
+	local d=$1 l m i
+	for i in 1 2 3 4 5; do
+		for l in $(losetup -l -n -O NAME,BACK-FILE | awk -v d="$d/" 'index($2, d) == 1 {print $1}'); do
+			holders_off "${l#/dev/}"
+			losetup -d "$l" 2>/dev/null
+		done
+		udevadm settle 2>/dev/null
+		for m in $(mounts_under "$d"); do umount "$m" 2>/dev/null; done
+		[ -z "$(mounts_under "$d")" ] && return 0
+		sleep 2
+	done
+	return 1
+}
 
 {
 	echo "date=$(date -Iseconds)"
@@ -313,6 +360,11 @@ for s in "${SUITES[@]}"; do
 	limit=${SUITE_TIMEOUT:-2400}
 	declared=${SUITE_TIMEOUTS[${s%%@*}]:-0}
 	[ "$declared" -gt "$limit" ] && limit=$declared
+	# a scratch folder of its own: deleting it afterwards cannot reach
+	# another suite's files, or anything else under RK_TMP (which may be a
+	# shared directory such as /var/tmp)
+	export RK_TMP="$RK_TMP_BASE/ci.$f"
+	rm -rf --one-file-system "$RK_TMP" 2>/dev/null; mkdir -p "$RK_TMP" || die "cannot create $RK_TMP"
 	start=$(date +%s)
 	klog_start "$OUTPUT/$f.dmesg" "$s"
 	timeout --foreground --kill-after=60 "$limit" \
@@ -323,7 +375,7 @@ for s in "${SUITES[@]}"; do
 	# Give the memory back before the next suite.  brd keeps every page a
 	# suite wrote until it is unloaded (2 GiB at BRD_NR=16), and RK_TMP is
 	# RAM where /tmp is tmpfs (bootc): the suites' scratch files (src, rd,
-	# patterns: ~0.5 GiB after the first 15 smoke suites) stay there.  On
+	# patterns: ~0.5 GiB after the first 15 smoke suites) stayed there.  On
 	# the 5 GiB CI guest the suites that bring their own tmpfs members
 	# (rowmap, snap, snap-persist) then ran it out of memory, and the OOM
 	# killer took sshd.  rk_setup_brd loads brd again for a suite that
@@ -331,7 +383,22 @@ for s in "${SUITES[@]}"; do
 	if [ "$KEEP_BRD" = 0 ] && lsmod | grep -q '^brd '; then
 		rmmod brd 2>/dev/null || true
 	fi
-	rm -rf --one-file-system "${RK_TMP:?}"/* 2>/dev/null || true
+	# The suite's own scratch folder only.  Its small text files (the logs a
+	# FAIL line points at) are kept with the results first.  A mount still
+	# under it is a leak the suite should have given back: it fails the
+	# suite, and is freed here so the next suite has the memory
+	# (rm -rf --one-file-system cannot free it).
+	mkdir -p "$OUTPUT/$f.scratch"
+	(cd "$RK_TMP" && find . -xdev -type f -size -1024k \
+		\( -name '*.log' -o -name '*.out' -o -name '*.fio' -o -name '*.json' \) \
+		-exec cp --parents -t "$OUTPUT/$f.scratch" {} + 2>/dev/null)
+	rmdir "$OUTPUT/$f.scratch" 2>/dev/null
+	leaked=$(mounts_under "$RK_TMP" | tr '\n' ' ')
+	if [ -n "$leaked" ]; then
+		scratch_free "$RK_TMP" && leaked="$leaked(freed)" ||
+			leaked="$leaked(still mounted: $(mounts_under "$RK_TMP" | tr '\n' ' '))"
+	fi
+	rm -rf --one-file-system "$RK_TMP" 2>/dev/null || true
 	klog_stop "$OUTPUT/$f.dmesg" "$s"
 	# the verdict's log: what the suite did not clear itself.  A suite that
 	# clears its kernel log (dmesg -C, or a harness it wraps) has judged what
@@ -362,6 +429,9 @@ for s in "${SUITES[@]}"; do
 	fi
 	if [ "${splats:-0}" != 0 ]; then
 		status=fail; note="${note:+$note; }$splats kernel warning line(s) in $f.tail.dmesg"
+	fi
+	if [ -n "$leaked" ]; then
+		status=fail; note="${note:+$note; }left mounted: ${leaked% }"
 	fi
 	# the whole log: what the suite cleared is no verdict, but say it is there
 	cleared=$(( $(rk_dmesg_splats "$OUTPUT/$f.dmesg") - ${splats:-0} ))

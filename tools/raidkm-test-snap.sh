@@ -77,7 +77,7 @@ mem_off() {
 			for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l" 2>/dev/null; done
 		done
 		umount "$d" 2>/dev/null && continue
-		[ $t -ge 300 ] && { echo "  WARNING: $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
+		[ $t -ge 300 ] && { echo "  $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
 		sleep 0.1; t=$((t + 1))
 	done
 }
@@ -86,12 +86,22 @@ teardown() {
 	exec 3<&-
 	umount $SNAPO $SNAPS 2>/dev/null
 	$MDADM --stop $MD >/dev/null 2>&1
-	mem_off $SNAPMEM
+	mem_off $SNAPMEM || fail "teardown: $SNAPMEM still mounted (its tmpfs would leak)"
 	if [ -d /sys/kernel/config/nullb ]; then
 		for d in /sys/kernel/config/nullb/rk*; do [ -d "$d" ] || continue
 			echo 0 > $d/power 2>/dev/null; rmdir $d; done
 	fi
 	M=()
+}
+# any exit (an early exit 1 included) gives back md70, the loop devices and
+# the tmpfs: the CI guest has no RAM to leave them in
+trap teardown EXIT
+# mem_on <dir>: a tmpfs still mounted there (mem_off gave up) is never stacked
+# on: that is the leak mem_off exists to stop.  The suite stops instead.
+mem_on() {
+	mkdir -p "$1"
+	mountpoint -q "$1" && { fail "$1 still mounted: not stacking another tmpfs on it"; exit 1; }
+	mount -t tmpfs -o size=$2 tmpfs "$1" || { fail "mount tmpfs on $1"; exit 1; }
 }
 loadmod() {
 	modprobe -a md_mod raid6_pq async_tx async_xor async_memcpy async_pq async_raid6_recov 2>/dev/null
@@ -101,7 +111,7 @@ loadmod() {
 }
 # mk_loop <n> <MiB each>
 mk_loop() {
-	mkdir -p $SNAPMEM; mount -t tmpfs -o size=$(( $1 * $2 + 64 ))m tmpfs $SNAPMEM
+	mem_on $SNAPMEM $(( $1 * $2 + 64 ))m
 	for i in $(seq 0 $(($1 - 1))); do truncate -s ${2}M $SNAPMEM/m$i; M+=("$(losetup -f --show $SNAPMEM/m$i)"); done
 }
 # mk_nullb <n> <MiB each> <max_sectors>
@@ -119,29 +129,29 @@ mk_nullb() {
 # mkarray <chunk KiB>: snapshots on a quarter of the rows
 mkarray() {
 	$MDADM --create $MD --level=raidkm --parity-count=2 --layout=rotating --raid-devices=${#M[@]} \
-		--chunk=$1 --bitmap=none --snapshots=25 --run --force "${M[@]}" >/tmp/mkarray.out 2>&1 || { fail "mdadm --create: $(tail -1 /tmp/mkarray.out)"; return 1; }
+		--chunk=$1 --bitmap=none --snapshots=25 --run --force "${M[@]}" >$RK_DIR/mkarray.out 2>&1 || { fail "mdadm --create: $(tail -1 $RK_DIR/mkarray.out)"; return 1; }
 	idle
 	ROWK=$(( $1 * (${#M[@]} - 2) ))			# row in KiB
 }
-pyw() {	# pyw <dev> <byte offset> <bytes> <seed> : one O_DIRECT write, data also to /tmp/pyw.<seed>
-	python3 -I - "$@" <<'EOF'
+pyw() {	# pyw <dev> <byte offset> <bytes> <seed> : one O_DIRECT write, data also to $RK_DIR/pyw.<seed>
+	python3 -I - "$@" "$RK_DIR/pyw.$4" <<'EOF'
 import mmap, os, random, sys
 dev, off, n, seed = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 random.seed(seed); data = bytes(random.getrandbits(8) for _ in range(n))
 buf = mmap.mmap(-1, (n + 4095) // 4096 * 4096); buf[:n] = data
 fd = os.open(dev, os.O_WRONLY | os.O_DIRECT)
 w = os.pwritev(fd, [memoryview(buf)[:n]], off); os.close(fd)
-open('/tmp/pyw.%d' % seed, 'wb').write(data)
+open(sys.argv[5], 'wb').write(data)
 sys.exit(0 if w == n else 1)
 EOF
 }
-pyr() {	# pyr <dev> <byte offset> <bytes> <seed> : read back == /tmp/pyw.<seed>
-	python3 -I - "$@" <<'EOF'
+pyr() {	# pyr <dev> <byte offset> <bytes> <seed> : read back == $RK_DIR/pyw.<seed>
+	python3 -I - "$@" "$RK_DIR/pyw.$4" <<'EOF'
 import os, sys
 dev, off, n, seed = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 fd = os.open(dev, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
 got = os.pread(fd, n, off); os.close(fd)
-sys.exit(0 if got == open('/tmp/pyw.%d' % seed, 'rb').read() else 1)
+sys.exit(0 if got == open(sys.argv[5], 'rb').read() else 1)
 EOF
 }
 fill() { fio --name=f --filename=$MD --direct=1 --rw=write --bs=1M --size=${1}M >/dev/null 2>&1; }
@@ -177,7 +187,7 @@ f3() {
 	fill 40; A=$(sumr $MD 0 40)
 	echo "create s1" > $SYS/rk_snap; S1=$(dev_of s1); udevadm settle
 	fio --name=v --filename=$MD --direct=1 --ioengine=libaio --iodepth=8 --rw=write --bs=1M --size=40M \
-	    --verify=crc32c --do_verify=1 >/tmp/f3.fio 2>&1 && pass "1M writes across rows + verify" || fail "fio across rows: $(grep -m1 -iE 'err|verify' /tmp/f3.fio)"
+	    --verify=crc32c --do_verify=1 >$RK_DIR/f3.fio 2>&1 && pass "1M writes across rows + verify" || fail "fio across rows: $(grep -m1 -iE 'err|verify' $RK_DIR/f3.fio)"
 	[ "$(sumr $S1 0 40)" = $A ] && pass "s1 unchanged" || fail "s1 changed"
 	r=$(sumr $S1 0 40); [ "$r" = $A ] && pass "snapshot reads across rows" || fail "snapshot read"
 	echo "destroy s1" > $SYS/rk_snap; teardown
@@ -220,8 +230,8 @@ f6() {
 	mk_loop 10 320; mkarray 128 || return
 	fill 192; echo "create s1" > $SYS/rk_snap; A=$(sumr $(dev_of s1) 0 192)
 	fio --name=o --filename=$MD --direct=1 --ioengine=libaio --iodepth=256 --numjobs=2 --rw=randwrite --bs=4k \
-	    --size=96M --offset_increment=96M --io_size=12M --verify=crc32c --do_verify=1 --verify_backlog=0 --randseed=7 --group_reporting >/tmp/f6.fio 2>&1 &&
-		pass "iodepth 512 random 4K + verify (cow_partial $(sv cow_partial), cow_fail $(sv cow_fail))" || fail "fio: $(grep -m1 -iE 'err|verify' /tmp/f6.fio)"
+	    --size=96M --offset_increment=96M --io_size=12M --verify=crc32c --do_verify=1 --verify_backlog=0 --randseed=7 --group_reporting >$RK_DIR/f6.fio 2>&1 &&
+		pass "iodepth 512 random 4K + verify (cow_partial $(sv cow_partial), cow_fail $(sv cow_fail))" || fail "fio: $(grep -m1 -iE 'err|verify' $RK_DIR/f6.fio)"
 	[ "$(sumr $(dev_of s1) 0 192)" = $A ] && pass "s1 unchanged" || fail "s1 changed"
 	echo "destroy s1" > $SYS/rk_snap; teardown
 }
@@ -329,8 +339,8 @@ perf() {	# the Phase 0b cases, member bytes per user byte
 	echo 1 > $SYS/rk_row_write
 	mem() { local r=0 w=0 l s; for l in "${M[@]}"; do s=($(cat /sys/block/$(basename $l)/stat)); r=$((r+s[2])); w=$((w+s[6])); done; echo "$r $w"; }
 	run() { local label=$1; shift; sync; echo 3 > /proc/sys/vm/drop_caches; local a=($(mem))
-		fio --name=$label --filename=$MD --direct=1 --ioengine=libaio --output-format=json --output=/tmp/sp-$label.json "$@" >/dev/null 2>&1 || fail "fio $label failed"
-		local b=($(mem)); read ub iops bw < <(python3 -I -c "import json;d=json.load(open('/tmp/sp-$label.json'))['jobs'][0]['write'];print(d['io_bytes'],round(d['iops']),round(d['bw_bytes']/1048576,1))")
+		fio --name=$label --filename=$MD --direct=1 --ioengine=libaio --output-format=json --output=$RK_DIR/sp-$label.json "$@" >/dev/null 2>&1 || fail "fio $label failed"
+		local b=($(mem)); read ub iops bw < <(python3 -I -c "import json;d=json.load(open('$RK_DIR/sp-$label.json'))['jobs'][0]['write'];print(d['io_bytes'],round(d['iops']),round(d['bw_bytes']/1048576,1))")
 		printf "    %-18s iops=%6s MiB/s=%7s rd/user=%5.2f wr/user=%5.2f\n" $label $iops $bw \
 			"$(echo "scale=2; ($((b[0]-a[0]))*512)/$ub" | bc)" "$(echo "scale=2; ($((b[1]-a[1]))*512)/$ub" | bc)"; }
 	R4=(--rw=randwrite --bs=4k --iodepth=16 --size=512M --io_size=16M --randrepeat=1 --randseed=42 --norandommap)

@@ -696,8 +696,12 @@ static void rk_rm_load(struct raidkm_rowmap *rm)
 			}
 			/*
 			 * A read error is not a blank page: the page may have
-			 * been written.  Unreadable on every in-sync member
-			 * must load as all N, never stay zeroed (all U).
+			 * been written.  With no valid copy on any in-sync
+			 * member, an unreadable one loads the page as all N,
+			 * never zeroed (all U) -- even when the others read
+			 * blank.  Deliberately cautious: the cost is a resync
+			 * of rows that may hold nothing, after a read error at
+			 * assemble.
 			 */
 			if (!sync_page_io(rdev, rm->region + (sector_t)p * 8,
 					  RK_RM_PAGE, rm->bounce, REQ_OP_READ,

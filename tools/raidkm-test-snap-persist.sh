@@ -86,14 +86,22 @@ mem_off() {
 			for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l" 2>/dev/null; done
 		done
 		umount "$d" 2>/dev/null && continue
-		[ $t -ge 300 ] && { echo "  WARNING: $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
+		[ $t -ge 300 ] && { echo "  $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
 		sleep 0.1; t=$((t + 1))
 	done
 }
 
+# mem_on <dir>: a tmpfs still mounted there (mem_off gave up) is never stacked
+# on: that is the leak mem_off exists to stop.  The suite stops instead.
+mem_on() {
+	mkdir -p "$1"
+	mountpoint -q "$1" && { fail "$1 still mounted: not stacking another tmpfs on it"; exit 1; }
+	mount -t tmpfs -o size=$2 tmpfs "$1" || { fail "mount tmpfs on $1"; exit 1; }
+}
+
 teardown() {
 	$MDADM --stop $MD >/dev/null 2>&1
-	mem_off $SNMEM
+	mem_off $SNMEM || fail "teardown: $SNMEM still mounted (its tmpfs would leak)"
 }
 
 load() {
@@ -104,7 +112,7 @@ load() {
 }
 
 members() {
-	mkdir -p $SNMEM; mount -t tmpfs -o size=$(( (NMEM + 2) * MEMSZ + 32 ))m tmpfs $SNMEM
+	mem_on $SNMEM $(( (NMEM + 2) * MEMSZ + 32 ))m
 	M=()
 	for i in $(seq 0 $NMEM); do
 		head -c ${MEMSZ}M /dev/urandom > $SNMEM/m$i
@@ -116,7 +124,7 @@ members() {
 assemble() {	# assemble [members...]: default all
 	local mem=("$@")
 	[ ${#mem[@]} -gt 0 ] || mem=("${M[@]}")
-	$MDADM --assemble --run $MD "${mem[@]}" >/tmp/sn-asm.log 2>&1 || { cat /tmp/sn-asm.log; return 1; }
+	$MDADM --assemble --run $MD "${mem[@]}" >$RK_DIR/sn-asm.log 2>&1 || { cat $RK_DIR/sn-asm.log; return 1; }
 	idle
 }
 
@@ -133,7 +141,7 @@ dmesg -C
 members
 $MDADM --create $MD --level=raidkm --parity-count=2 --layout=rotating \
 	--raid-devices=$NMEM --chunk=128 --bitmap=none --snapshots=20 \
-	--run --force "${M[@]}" >/tmp/sn-create.log 2>&1 || { cat /tmp/sn-create.log; exit 1; }
+	--run --force "${M[@]}" >$RK_DIR/sn-create.log 2>&1 || { cat $RK_DIR/sn-create.log; exit 1; }
 idle
 
 # T1 the array exports the origin only
@@ -307,12 +315,13 @@ snap --destroy ro1
 # T12 a spare without room for the snapshot metadata is refused
 truncate -s $(( MEMSZ - 3 ))M $SNMEM/small
 SMALL=$(losetup -f --show $SNMEM/small)
-$MDADM $MD --add "$SMALL" >/tmp/sn-small.log 2>&1 && fail "T12 a too small spare was added" || \
-	pass "T12 too small spare refused: $(tail -1 /tmp/sn-small.log)"
+$MDADM $MD --add "$SMALL" >$RK_DIR/sn-small.log 2>&1 && fail "T12 a too small spare was added" || \
+	pass "T12 too small spare refused: $(tail -1 $RK_DIR/sn-small.log)"
 grep -q "$(basename $SMALL)" /proc/mdstat && fail "T12 $SMALL in the array" || pass "T12 array unchanged"
 losetup -d "$SMALL"; rm -f $SNMEM/small
 
 dmesg | grep -qE "WARNING|BUG|Oops|inconsistent" && fail "kernel warnings (dmesg)" || pass "no kernel warnings"
+teardown	# before the verdict: a tmpfs that will not unmount is a FAIL
 echo "RESULT pass=$PASS fail=$FAIL"
 echo "==== snap-persist: $PASS passed, $FAIL failed ===="
 [ "$FAIL" = 0 ]
