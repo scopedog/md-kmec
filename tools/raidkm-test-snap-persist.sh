@@ -9,10 +9,27 @@
 #
 # Members are tmpfs-backed loop devices (8+2, 128 KiB chunks: rows of
 # 1 MiB of data), snapshots on 20% of the rows.
+# Ubuntu 26.04's dd is uutils coreutils, whose O_DIRECT I/O of 128 KiB and
+# more fails with EINVAL (and may not issue a block as one write); GNU dd is
+# installed beside it as gnudd.
+if command -v gnudd >/dev/null 2>&1; then dd() { gnudd "$@"; }; fi
 set -u
-KO=${RAIDKM_KO:?set RAIDKM_KO to raidkm.ko}
-ISAL_KO=${ISAL_KO:?set ISAL_KO to isal_lib.ko}
-MDADM=${MDADM:?set MDADM to an mdadm with --snapshots}
+TREE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+KO=${RAIDKM_KO:-$TREE/km/raidkm.ko}
+ISAL_KO=${ISAL_KO:-$TREE/isa-l/isal_lib.ko}
+MDADM=${MDADM:-$(command -v mdadm)}
+grep -qa -- --snapshots "$MDADM" 2>/dev/null || { echo "set MDADM to an mdadm with --snapshots"; exit 1; }
+# Packaged installs (raidkm-test-ci.sh in CI) have no .ko beside the tree:
+# a module path that does not exist loads the packaged module with modprobe,
+# and MDADM defaults to the mdadm on PATH.
+# scratch space under RK_TMP (raidkm-test-lib.sh's convention): the CI image's
+# root filesystem is read-only
+RK_DIR=${RK_TMP:-/tmp/raidkm-test}/snap-persist; mkdir -p "$RK_DIR" || exit 1
+SNMEM=$RK_DIR/mem
+rk_modload() {	# rk_modload <ko path> <module> [params...]
+	local ko=$1 mod=$2; shift 2
+	if [ -f "$ko" ]; then insmod "$ko" "$@"; else modprobe "$mod" "$@"; fi
+}
 MD=/dev/md70; MDN=md70
 NMEM=10; MEMSZ=64		# MiB
 ROW=$((1024 * 1024))
@@ -55,28 +72,43 @@ content() {	# content <label> <origin md5>
 wr() { openssl enc -aes-128-ctr -pass pass:$3 -nosalt -pbkdf2 </dev/zero 2>/dev/null | head -c $2 | \
 	dd of=$MD bs=$2 seek=$1 count=1 oflag=direct,seek_bytes iflag=fullblock status=none; }
 
+# mem_off <dir>: detach the loop devices on <dir>'s files, then unmount every
+# tmpfs stacked there.  A loop device still open when it is detached (udev
+# probing the members after the array stops: CI's system mdadm handles
+# raidkm) detaches only when closed, and its file keeps the tmpfs busy; an
+# umount that fails then leaked the whole tmpfs (the next case mounts on top)
+# and ran the 5 GiB CI guest out of memory.
+mem_off() {
+	local d=$1 f l t=0
+	udevadm settle 2>/dev/null
+	while mountpoint -q "$d"; do
+		for f in "$d"/*; do [ -e "$f" ] || continue
+			for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l" 2>/dev/null; done
+		done
+		umount "$d" 2>/dev/null && continue
+		[ $t -ge 300 ] && { echo "  WARNING: $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
+		sleep 0.1; t=$((t + 1))
+	done
+}
+
 teardown() {
 	$MDADM --stop $MD >/dev/null 2>&1
-	for f in /snmem/*; do
-		[ -e "$f" ] || continue
-		for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l"; done
-	done
-	umount /snmem 2>/dev/null
+	mem_off $SNMEM
 }
 
 load() {
 	modprobe -a md_mod raid6_pq async_tx async_xor async_memcpy async_pq async_raid6_recov 2>/dev/null
 	lsmod | grep -q '^raidkm' && { rmmod raidkm || exit 1; }
-	lsmod | grep -q '^isal_lib' || insmod $ISAL_KO
-	insmod $KO || exit 1
+	lsmod | grep -q '^isal_lib' || rk_modload $ISAL_KO isal_lib
+	rk_modload $KO raidkm || exit 1
 }
 
 members() {
-	mkdir -p /snmem; mount -t tmpfs -o size=$(( (NMEM + 2) * MEMSZ + 32 ))m tmpfs /snmem
+	mkdir -p $SNMEM; mount -t tmpfs -o size=$(( (NMEM + 2) * MEMSZ + 32 ))m tmpfs $SNMEM
 	M=()
 	for i in $(seq 0 $NMEM); do
-		head -c ${MEMSZ}M /dev/urandom > /snmem/m$i
-		M+=("$(losetup -f --show /snmem/m$i)")
+		head -c ${MEMSZ}M /dev/urandom > $SNMEM/m$i
+		M+=("$(losetup -f --show $SNMEM/m$i)")
 	done
 	SPARE=${M[$NMEM]}; unset "M[$NMEM]"
 }
@@ -273,13 +305,14 @@ snap --exists ro1 && pass "T11 it persists" || fail "T11 ro1 gone after restart"
 snap --destroy ro1
 
 # T12 a spare without room for the snapshot metadata is refused
-truncate -s $(( MEMSZ - 3 ))M /snmem/small
-SMALL=$(losetup -f --show /snmem/small)
+truncate -s $(( MEMSZ - 3 ))M $SNMEM/small
+SMALL=$(losetup -f --show $SNMEM/small)
 $MDADM $MD --add "$SMALL" >/tmp/sn-small.log 2>&1 && fail "T12 a too small spare was added" || \
 	pass "T12 too small spare refused: $(tail -1 /tmp/sn-small.log)"
 grep -q "$(basename $SMALL)" /proc/mdstat && fail "T12 $SMALL in the array" || pass "T12 array unchanged"
-losetup -d "$SMALL"; rm -f /snmem/small
+losetup -d "$SMALL"; rm -f $SNMEM/small
 
 dmesg | grep -qE "WARNING|BUG|Oops|inconsistent" && fail "kernel warnings (dmesg)" || pass "no kernel warnings"
 echo "RESULT pass=$PASS fail=$FAIL"
-[ $FAIL = 0 ]
+echo "==== snap-persist: $PASS passed, $FAIL failed ===="
+[ "$FAIL" = 0 ]

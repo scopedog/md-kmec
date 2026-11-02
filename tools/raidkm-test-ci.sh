@@ -14,13 +14,14 @@
 #   bash tools/raidkm-test-ci.sh --list [--tier=...]
 #
 # Tiers:
-#   smoke   ~25 min.  The row layer (degraded read once per row, native
+#   smoke   ~30 min.  The row layer (degraded read once per row, native
 #           checksum through the row paths), declustered population to
 #           completion, rebuild onto a spare and hot-replace (through the row
 #           layer, the default), full-row writes (row-write), resync and
 #           check through the row layer (row-sync), sysfs tunings that must
-#           not suspend the array (tunables), plus the functional and
-#           degraded smoke.  Meant for every CI run.
+#           not suspend the array (tunables), the row state map (rowmap) and
+#           native snapshots (snap, snap-persist: ~4 min together), plus the
+#           functional and degraded smoke.  Meant for every CI run.
 #   quick   smoke + the same rebuilds on the 4 KiB stripe path
 #           (replace@default_row_rebuild=0), declustered population, and the
 #           functional, degraded and replace suites again with full-row writes
@@ -86,7 +87,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window
        declustered-populate-window@default_dcl_row_rebuild=0 declustered-degraded replace
        scrub-badblocks degraded-trust-disk row-rebuild-load wide-row row-write
-       row-sync tunables)
+       row-sync tunables rowmap snap snap-persist)
 # <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.
@@ -319,6 +320,18 @@ for s in "${SUITES[@]}"; do
 	rc=$?
 	secs=$(( $(date +%s) - start ))
 	[ -n "$pfile" ] && echo "$pold" > "$pfile"
+	# Give the memory back before the next suite.  brd keeps every page a
+	# suite wrote until it is unloaded (2 GiB at BRD_NR=16), and RK_TMP is
+	# RAM where /tmp is tmpfs (bootc): the suites' scratch files (src, rd,
+	# patterns: ~0.5 GiB after the first 15 smoke suites) stay there.  On
+	# the 5 GiB CI guest the suites that bring their own tmpfs members
+	# (rowmap, snap, snap-persist) then ran it out of memory, and the OOM
+	# killer took sshd.  rk_setup_brd loads brd again for a suite that
+	# needs it; a brd still in use stays (rmmod refuses).
+	if [ "$KEEP_BRD" = 0 ] && lsmod | grep -q '^brd '; then
+		rmmod brd 2>/dev/null || true
+	fi
+	rm -rf --one-file-system "${RK_TMP:?}"/* 2>/dev/null || true
 	klog_stop "$OUTPUT/$f.dmesg" "$s"
 	# the verdict's log: what the suite did not clear itself.  A suite that
 	# clears its kernel log (dmesg -C, or a harness it wraps) has judged what

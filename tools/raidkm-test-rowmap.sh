@@ -8,11 +8,27 @@
 #   RM_NO_RECSKIP=1 load with rowmap_test_no_recskip=Y; T10's stripe check must FAIL
 #   (a module from before the 10-31 review fixes fails T9, T11 and T12;
 #   one from before the bitmap fix fails T14)
+# Ubuntu 26.04's dd is uutils coreutils, whose O_DIRECT I/O of 128 KiB and
+# more fails with EINVAL (and may not issue a block as one write); GNU dd is
+# installed beside it as gnudd.
+if command -v gnudd >/dev/null 2>&1; then dd() { gnudd "$@"; }; fi
 set -u
 TREE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 KO=${RAIDKM_KO:-$TREE/km/raidkm.ko}
 ISAL_KO=${ISAL_KO:-$TREE/isa-l/isal_lib.ko}
-MDADM=${MDADM:?set MDADM to a raidkm-aware mdadm with --row-map}
+MDADM=${MDADM:-$(command -v mdadm)}
+grep -qa -- row-map "$MDADM" 2>/dev/null || { echo "set MDADM to a raidkm-aware mdadm with --row-map"; exit 1; }
+# Packaged installs (raidkm-test-ci.sh in CI) have no .ko beside the tree:
+# a module path that does not exist loads the packaged module with modprobe,
+# and MDADM defaults to the mdadm on PATH.
+# scratch space under RK_TMP (raidkm-test-lib.sh's convention): the CI image's
+# root filesystem is read-only
+RK_DIR=${RK_TMP:-/tmp/raidkm-test}/rowmap; mkdir -p "$RK_DIR" || exit 1
+RMMEM=$RK_DIR/mem
+rk_modload() {	# rk_modload <ko path> <module> [params...]
+	local ko=$1 mod=$2; shift 2
+	if [ -f "$ko" ]; then insmod "$ko" "$@"; else modprobe "$mod" "$@"; fi
+}
 MD=/dev/md70; MDN=md70
 NMEM=10; MEMSZ=64		# MiB
 CHUNK=128			# KiB; row = 8 x 128K = 1 MiB of data
@@ -30,29 +46,44 @@ idle() {	# wait for sync to finish; a missing array (failed assemble) fails, not
 	sleep 0.5
 }
 
+# mem_off <dir>: detach the loop devices on <dir>'s files, then unmount every
+# tmpfs stacked there.  A loop device still open when it is detached (udev
+# probing the members after the array stops: CI's system mdadm handles
+# raidkm) detaches only when closed, and its file keeps the tmpfs busy; an
+# umount that fails then leaked the whole tmpfs (the next case mounts on top)
+# and ran the 5 GiB CI guest out of memory.
+mem_off() {
+	local d=$1 f l t=0
+	udevadm settle 2>/dev/null
+	while mountpoint -q "$d"; do
+		for f in "$d"/*; do [ -e "$f" ] || continue
+			for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l" 2>/dev/null; done
+		done
+		umount "$d" 2>/dev/null && continue
+		[ $t -ge 300 ] && { echo "  WARNING: $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
+		sleep 0.1; t=$((t + 1))
+	done
+}
+
 teardown() {
 	$MDADM --stop $MD >/dev/null 2>&1
-	for f in /rmmem/*; do
-		[ -e "$f" ] || continue
-		for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l"; done
-	done
-	umount /rmmem 2>/dev/null
+	mem_off $RMMEM
 }
 
 load() {
 	modprobe -a md_mod raid6_pq async_tx async_xor async_memcpy async_pq async_raid6_recov 2>/dev/null
 	lsmod | grep -q '^raidkm' && { rmmod raidkm || exit 1; }
-	lsmod | grep -q '^isal_lib' || insmod $ISAL_KO
-	insmod $KO rowmap_test_no_rcw=$([ "${RM_NO_RCW:-0}" = 1 ] && echo Y || echo N) \
+	lsmod | grep -q '^isal_lib' || rk_modload $ISAL_KO isal_lib
+	rk_modload $KO raidkm rowmap_test_no_rcw=$([ "${RM_NO_RCW:-0}" = 1 ] && echo Y || echo N) \
 		${RM_NO_RECSKIP:+rowmap_test_no_recskip=Y} || exit 1
 }
 
 members() {	# fill members with random bytes so unsynced parity is garbage
-	mkdir -p /rmmem; mount -t tmpfs -o size=$(( (NMEM + 2) * MEMSZ + 32 ))m tmpfs /rmmem
+	mkdir -p $RMMEM; mount -t tmpfs -o size=$(( (NMEM + 2) * MEMSZ + 32 ))m tmpfs $RMMEM
 	M=()
 	for i in $(seq 0 $NMEM); do
-		head -c ${MEMSZ}M /dev/urandom > /rmmem/m$i
-		M+=("$(losetup -f --show /rmmem/m$i)")
+		head -c ${MEMSZ}M /dev/urandom > $RMMEM/m$i
+		M+=("$(losetup -f --show $RMMEM/m$i)")
 	done
 	SPARE=${M[$NMEM]}; unset "M[$NMEM]"
 }
@@ -294,6 +325,63 @@ $MDADM --stop $MD >/dev/null 2>&1
 $MDADM --assemble $MD "${M[@]}" >/dev/null 2>&1; idle
 grep -q "^$MDN : active" /proc/mdstat && pass "T15 the whole array still assembles" || fail "T15 no assemble"
 
+# T16 (PR #19 review) a map page unreadable on every in-sync member loads
+# as all N, never as the zeroed all U: before the fix the read error set
+# neither "have" nor "bad" and resync/rebuild/check skipped rows with data.
+# Each member under dm: linear, except the map region, which is flakey in
+# its down state with error_reads + drop_writes (reads fail, writes vanish;
+# drop_writes alone lets reads through).
+DMN=(); dm_off() { local d; for d in "${DMN[@]}"; do dmsetup remove "$d" 2>/dev/null; done; DMN=(); }
+$MDADM --stop $MD >/dev/null 2>&1
+teardown; members; create; PIECES=(); write_set
+echo flush > /sys/block/$MDN/md/rk_rowmap
+w16=$(rm_get written); n16=$(rm_get needsync); p16=$(rm_get pages)
+# the map sits right after each member's data: data offset + dev_sectors
+dsz=$(( $(cat /sys/block/$MDN/md/component_size) * 2 ))
+$MDADM --stop $MD >/dev/null
+doff=$($MDADM --examine "${M[0]}" | awk '/Data Offset/ {print $4}')
+if [ -z "$doff" ] || [ "$dsz" = 0 ]; then
+	fail "T16 no data offset ($doff) or component size ($dsz)"
+	$MDADM --examine "${M[0]}" | sed 's/^/    /'
+else
+	a=$((doff + dsz)); len=$((p16 * 8)); D=()
+	for i in "${!M[@]}"; do
+		tot=$(blockdev --getsz "${M[$i]}"); n=rm16_$i
+		printf '%s\n' "0 $a linear ${M[$i]} 0" \
+			"$a $len flakey ${M[$i]} $a 0 1 2 error_reads drop_writes" \
+			"$((a + len)) $((tot - a - len)) linear ${M[$i]} $((a + len))" |
+			dmsetup create $n || { fail "T16 dmsetup create $n"; break; }
+		DMN+=($n); D+=(/dev/mapper/$n)
+	done
+	# udev's incremental assembly may grab the new devices: stop what it built
+	udevadm settle
+	for d in "${D[@]}"; do
+		for h in /sys/class/block/$(basename "$(readlink -f "$d")")/holders/md*; do
+			[ -e "$h" ] && $MDADM --stop /dev/$(basename "$h") >/dev/null 2>&1
+		done
+	done
+	mk16="raidkm-test-rowmap T16 assemble $$.$(date +%s%N)"	# unique: the ring keeps earlier runs
+	echo "$mk16" > /dev/kmsg
+	out16=$($MDADM --assemble --run $MD "${D[@]}" 2>&1)
+	sleep 1
+	k16() { dmesg | sed -n "/$mk16/,\$p"; }
+	if ! grep -q "^$MDN : active" /proc/mdstat; then
+		fail "T16 no assemble over the unreadable map region: $out16"
+		k16 | tail -8 | sed 's/^/    /'
+	else
+		u=$(rm_get unwritten)
+		[ "$u" = 0 ] && pass "T16 unreadable map: no row loads unwritten (needsync $(rm_get needsync), was $n16; written $w16 before)" || \
+			fail "T16 unreadable map: $u of $ROWS rows load unwritten (all-U, skipped by resync)"
+		k16 | grep -q "row map: .* $p16 damaged" && pass "T16 md reports $p16 damaged page(s)" || \
+			fail "T16 no damaged pages reported: $(k16 | grep 'row map:' | tail -1)"
+		idle; verify_set "T16 after resync with the map unreadable"
+	fi
+	$MDADM --stop $MD >/dev/null 2>&1
+	dm_off
+fi
+
 dmesg | grep -E "BUG|WARNING|Oops|KASAN" | tail -5
 teardown
 echo "RESULT pass=$PASS fail=$FAIL"
+echo "==== rowmap: $PASS passed, $FAIL failed ===="
+[ "$FAIL" = 0 ]

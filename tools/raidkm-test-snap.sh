@@ -22,10 +22,27 @@
 #   sudo RAIDKM_KO=.../raidkm.ko ISAL_KO=.../isal_lib.ko MDADM=.../mdadm \
 #        [SKIP="f3 ..."] [SNAP_PERF=1] bash tools/raidkm-test-snap.sh
 # Arrays are created with --snapshots=25 (origin 3/4 of the rows).
+# Ubuntu 26.04's dd is uutils coreutils, whose O_DIRECT I/O of 128 KiB and
+# more fails with EINVAL (and may not issue a block as one write); GNU dd is
+# installed beside it as gnudd.
+if command -v gnudd >/dev/null 2>&1; then dd() { gnudd "$@"; }; fi
 set -u
-KO=${RAIDKM_KO:?set RAIDKM_KO to raidkm.ko}
-ISAL=${ISAL_KO:?set ISAL_KO to isal_lib.ko}
-MDADM=${MDADM:?set MDADM to an mdadm with --snapshots}
+TREE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+KO=${RAIDKM_KO:-$TREE/km/raidkm.ko}
+ISAL=${ISAL_KO:-$TREE/isa-l/isal_lib.ko}
+MDADM=${MDADM:-$(command -v mdadm)}
+grep -qa -- --snapshots "$MDADM" 2>/dev/null || { echo "set MDADM to an mdadm with --snapshots"; exit 1; }
+# Packaged installs (raidkm-test-ci.sh in CI) have no .ko beside the tree:
+# a module path that does not exist loads the packaged module with modprobe,
+# and MDADM defaults to the mdadm on PATH.
+# scratch space under RK_TMP (raidkm-test-lib.sh's convention): the CI image's
+# root filesystem is read-only
+RK_DIR=${RK_TMP:-/tmp/raidkm-test}/snap; mkdir -p "$RK_DIR" || exit 1
+SNAPMEM=$RK_DIR/mem; SNAPO=$RK_DIR/origin; SNAPS=$RK_DIR/snap
+rk_modload() {	# rk_modload <ko path> <module> [params...]
+	local ko=$1 mod=$2; shift 2
+	if [ -f "$ko" ]; then insmod "$ko" "$@"; else modprobe "$mod" "$@"; fi
+}
 MD=/dev/md70; MDN=md70; SYS=/sys/block/$MDN/md
 NMEM=10; MEMSZ=${MEMSZ:-320}
 REG=${REG:-192}			# MiB of origin the content tests use (3 x 192 rows fit the reserve)
@@ -46,13 +63,30 @@ sumr() {	# sumr <dev> <offset MiB> <MiB>
 	echo ${s:0:32}; }
 M=()
 
+# mem_off <dir>: detach the loop devices on <dir>'s files, then unmount every
+# tmpfs stacked there.  A loop device still open when it is detached (udev
+# probing the members after the array stops: CI's system mdadm handles
+# raidkm) detaches only when closed, and its file keeps the tmpfs busy; an
+# umount that fails then leaked the whole tmpfs (the next case mounts on top)
+# and ran the 5 GiB CI guest out of memory.
+mem_off() {
+	local d=$1 f l t=0
+	udevadm settle 2>/dev/null
+	while mountpoint -q "$d"; do
+		for f in "$d"/*; do [ -e "$f" ] || continue
+			for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l" 2>/dev/null; done
+		done
+		umount "$d" 2>/dev/null && continue
+		[ $t -ge 300 ] && { echo "  WARNING: $d still busy after 30 s: $(losetup -l -O NAME,BACK-FILE -n | grep -F "$d" | head -3 | tr '\n' ' ')"; return 1; }
+		sleep 0.1; t=$((t + 1))
+	done
+}
+
 teardown() {
 	exec 3<&-
-	umount /mnt/snapo /mnt/snaps 2>/dev/null
+	umount $SNAPO $SNAPS 2>/dev/null
 	$MDADM --stop $MD >/dev/null 2>&1
-	for f in /snapmem/*; do [ -e "$f" ] || continue
-		for l in $(losetup -j "$f" -O NAME -n); do losetup -d "$l"; done; done
-	umount /snapmem 2>/dev/null
+	mem_off $SNAPMEM
 	if [ -d /sys/kernel/config/nullb ]; then
 		for d in /sys/kernel/config/nullb/rk*; do [ -d "$d" ] || continue
 			echo 0 > $d/power 2>/dev/null; rmdir $d; done
@@ -62,13 +96,13 @@ teardown() {
 loadmod() {
 	modprobe -a md_mod raid6_pq async_tx async_xor async_memcpy async_pq async_raid6_recov 2>/dev/null
 	lsmod | grep -q '^raidkm' && { rmmod raidkm || exit 1; }
-	lsmod | grep -q '^isal_lib' || insmod $ISAL || exit 1
-	insmod $KO || exit 1
+	lsmod | grep -q '^isal_lib' || rk_modload $ISAL isal_lib || exit 1
+	rk_modload $KO raidkm || exit 1
 }
 # mk_loop <n> <MiB each>
 mk_loop() {
-	mkdir -p /snapmem; mount -t tmpfs -o size=$(( $1 * $2 + 64 ))m tmpfs /snapmem
-	for i in $(seq 0 $(($1 - 1))); do truncate -s ${2}M /snapmem/m$i; M+=("$(losetup -f --show /snapmem/m$i)"); done
+	mkdir -p $SNAPMEM; mount -t tmpfs -o size=$(( $1 * $2 + 64 ))m tmpfs $SNAPMEM
+	for i in $(seq 0 $(($1 - 1))); do truncate -s ${2}M $SNAPMEM/m$i; M+=("$(losetup -f --show $SNAPMEM/m$i)"); done
 }
 # mk_nullb <n> <MiB each> <max_sectors>
 mk_nullb() {
@@ -272,21 +306,21 @@ content() {
 freeze() {
 	echo "== freeze: ext4 on the origin, snapshot while mounted under load"
 	mkfs.ext4 -q -F -E stride=32,stripe_width=256,nodiscard $MD
-	mkdir -p /mnt/snapo /mnt/snaps; mount $MD /mnt/snapo
-	for i in $(seq 1 20); do dd if=/dev/urandom of=/mnt/snapo/f$i bs=1M count=2 status=none; done; sync
-	( i=0; while [ -e /mnt/snapo/f1 ]; do echo $i > /mnt/snapo/live; i=$((i+1)); dd if=/dev/zero of=/mnt/snapo/g bs=64k count=16 conv=fsync status=none 2>/dev/null; done ) &
+	mkdir -p $SNAPO $SNAPS; mount $MD $SNAPO
+	for i in $(seq 1 20); do dd if=/dev/urandom of=$SNAPO/f$i bs=1M count=2 status=none; done; sync
+	( i=0; while [ -e $SNAPO/f1 ]; do echo $i > $SNAPO/live; i=$((i+1)); dd if=/dev/zero of=$SNAPO/g bs=64k count=16 conv=fsync status=none 2>/dev/null; done ) &
 	LOAD=$!; sleep 2
 	t0=$(date +%s.%N); echo "create fz" > $SYS/rk_snap; t1=$(date +%s.%N)
 	kill $LOAD; wait $LOAD 2>/dev/null
 	FZ=$(dev_of fz); udevadm settle
 	st=$(dumpe2fs -h $FZ 2>/dev/null | grep -iE "^Filesystem features" | grep -c needs_recovery)
 	[ "$st" = 0 ] && pass "snapshot taken under load in $(echo "$t1 - $t0" | bc) s, no needs_recovery" || fail "snapshot needs journal replay"
-	mount -o ro,noload $FZ /mnt/snaps && {
-		bad=0; for i in $(seq 1 20); do cmp -s /mnt/snapo/f$i /mnt/snaps/f$i || bad=$((bad+1)); done
+	mount -o ro,noload $FZ $SNAPS && {
+		bad=0; for i in $(seq 1 20); do cmp -s $SNAPO/f$i $SNAPS/f$i || bad=$((bad+1)); done
 		[ $bad = 0 ] && pass "20 files on the snapshot match the origin" || fail "$bad files differ"
-		umount /mnt/snaps; }
+		umount $SNAPS; }
 	e2fsck -fn $FZ >/dev/null 2>&1 && pass "e2fsck -fn on the snapshot: clean" || fail "e2fsck on the snapshot"
-	umount /mnt/snapo
+	umount $SNAPO
 	echo "destroy fz" > $SYS/rk_snap
 }
 
@@ -327,3 +361,5 @@ dmesg | grep -iE "BUG|WARNING|Oops|KASAN|call trace|beyond end of device|spans a
 dmesg | grep -qiE "BUG|WARNING|Oops|KASAN|beyond end of device" && fail "kernel messages above"
 teardown
 echo "RESULT pass=$PASS fail=$FAIL"
+echo "==== snap: $PASS passed, $FAIL failed ===="
+[ "$FAIL" = 0 ]

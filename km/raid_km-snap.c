@@ -1206,7 +1206,7 @@ static int rk_snap_create(struct raidkm_snap *sn, const char *name, char *args)
 	u64 moved = 0, freed = 0;
 	unsigned int slot;
 	bool frozen;
-	int err;
+	int err, id;
 
 	if (!rk_name_ok(name))
 		return -EINVAL;
@@ -1266,9 +1266,11 @@ static int rk_snap_create(struct raidkm_snap *sn, const char *name, char *args)
 		mutex_unlock(&sn->mutex);
 		return err;
 	}
+	/* g is listed: once the mutex drops, a destroy may free it */
+	id = g->id;
 	mutex_unlock(&sn->mutex);
 	pr_info("md/raid:%s: snap %s created (id %d, %sfrozen)\n",
-		mdname(mddev), name, g->id, frozen ? "" : "not ");
+		mdname(mddev), name, id, frozen ? "" : "not ");
 	return 0;
 }
 

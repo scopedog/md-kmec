@@ -689,11 +689,21 @@ static void rk_rm_load(struct raidkm_rowmap *rm)
 			 * the members present), i.e. win with rows U that now
 			 * hold data.  It gets every page at its rebuild.
 			 */
-			if (rdev->raid_disk >= 0 &&
-			    test_bit(In_sync, &rdev->flags) &&
-			    sync_page_io(rdev, rm->region + (sector_t)p * 8,
-					 RK_RM_PAGE, rm->bounce, REQ_OP_READ,
-					 false)) {
+			if (rdev->raid_disk < 0 ||
+			    !test_bit(In_sync, &rdev->flags)) {
+				rdev_dec_pending(rdev, mddev);
+				continue;
+			}
+			/*
+			 * A read error is not a blank page: the page may have
+			 * been written.  Unreadable on every in-sync member
+			 * must load as all N, never stay zeroed (all U).
+			 */
+			if (!sync_page_io(rdev, rm->region + (sector_t)p * 8,
+					  RK_RM_PAGE, rm->bounce, REQ_OP_READ,
+					  false)) {
+				bad = true;
+			} else {
 				ok = rk_rm_check(rm, buf, &gen);
 				if (ok < 0)
 					bad = true;
