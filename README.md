@@ -118,7 +118,7 @@ These are load-bearing for the design and not up for negotiation:
 | `mdadm --grow --raid-devices=<N-1>` to REMOVE a data disk (shrink-data, online, m fixed) | ✅ done (2026-07-30) — the inverse of `--add-data`, via the same journaled per-band COW engine walked **backwards** (the narrower geometry packs data deeper per disk, so the walk starts at the end; every home write lands strictly below the still-live old rows — no backup file, no `data_offset` shift). One disk per invocation (v1). **Array-size-first**: shrink the filesystem, clamp with `--grow --array-size=<kb>` (mdadm computes and prints the exact value on refusal), then `--grow --raid-devices=<N-1>`; the freed member becomes a spare (remove + `--zero-superblock` before reuse). Crash-safe: a mid-shrink stop/power-loss recovers by plain `--assemble` (the journal resumes the descending walk). Native-checksum arrays included (band verify-src + CRC re-key). Both layouts, m=2/3 validated: data byte-exact, scrub clean, decode oracle at m, concurrent fio randwrite+verify across the moving frontier, crash/resume ×2. The declustered analogue — pool shrink by one group (`--grow --raid-devices=<N-g>`) and spare-count increase — shipped 2026-07-31 via the same backward engine (gates: `tools/raidkm-test-declustered-shrink*.sh`). Gates: `tools/raidkm-test-shrink{,-crash}.sh` |
 | **Declustered parity — wide-pool layout with distributed spare** (`--layout=declustered`) | ✅ done (2026-07-16) — narrow *k+m* groups scattered over an N-disk pool by a seeded, rotation-expanded balanced permutation (clean-room, dRAID-*lineage* combinatorics — Holland & Gibson design theory, **no OpenZFS/CDDL code**), with **distributed spare** columns instead of a dedicated hot spare. Capacity balance is **exact by construction** and the rebuild read/write load is rotation-symmetric, so a failed disk's reconstruction spreads across every survivor. **Headline: rebuilding a failed 16 GB member on an 80-disk pool (g=13) took 44.9 s vs 785.1 s for a classic 78+2 array — 17.5×** (it also beats a narrow 11+2 classic, because the distributed spare removes the single-writer bottleneck). Geometry via `--group-width=g [--spare-columns=s] [--dcl-nbase=n] [--dcl-seed=x]`; the permutation seed + geometry live in a per-member on-disk **rkdcl** metadata block (4 KiB tail reserve, crc + generation), the kernel regenerates the identical permutation from the seed. Constraint C1 `(N−s) mod g == 0` (mdadm validates + suggests a legal `s`). Declustering is *m-agnostic* — validated m=2..5 on real NVMe (incl. the single-group-row `ngroups=1` edge). **Native per-block checksums compose** (see the next row), and **online pool expansion** (`mdadm --grow --raid-devices=N'`) widens the pool via a journaled crash-recoverable COW reshape (m=2/3 validated: data intact, scrub clean, degraded-read EC-correct, crash/power-loss/torn-write recovered); the per-group geometry reshapes (`--add-parity` / `--add-data` / `--spare-columns=s'`) run **online** too, serving the un-migrated region with old-geometry stripes (native-checksum arrays included); **capacity-shrinking reshapes** — pool shrink by one group (`--grow --raid-devices=<N-g>`) and spare-count increase — run online via the same engine walked **backwards**, gated array-size-first; v1 still excludes a file-backed bitmap (refused, not run wrong). See *Declustered parity* below |
 | **Declustered population + rebalance — rebuild into / migrate out of the distributed spare** | ✅ done (2026-07-17) — when a member fails, **population** reconstructs its content into the distributed spare columns as a raidkm-owned sync action (`echo <idx> > /sys/block/mdN/md/rk_dcl_populate`, or automatic with `rk_dcl_auto=1`), advancing a crash-safe journaled prefix mark (rkdcl v2, FUA+PREFLUSH every 16 MiB). **Sequential multi-assignment** (up to `s` failed disks, one populating at a time) uses **chained redirects** — a spare column can rotate onto another failed disk, so the slot→disk map resolves through the active assignments; the on-disk journal is **adaptive v2/v3** (a published v2 module fails *closed* rather than silently dropping an assignment). Adding a replacement **rebalances** by **copy-from-spare** (16-worker parallel copy straight from the already-populated spare — no GF decode, array never degraded during it; per-band quiesce + offset-split, strict-journaled per band) instead of a decode rebuild, falling back to the validated decode leg on any persistent copy fault. With **native checksums** enabled the copy **migrates** each block's CRC from the spare disk's key to the replacement's alongside the bytes, so integrity is preserved end-to-end (a torn/rotted copy is caught on first read and healed by decode). Power-loss crash matrices (dm-flakey) green for population, second-population, and mid-copy resume. Hardened by **two adversarial multi-agent reviews** (16 findings fixed: journal quorum, arm-publication barriers, auto-arm rescan, a copy-abort progress-contract data-loss bug, wedge-to-decode fallbacks). Validated under KASAN + on stock-RHEL real NVMe. See *Declustered parity* below |
-| **Row state map** — rebuild, resync and check skip the rows that hold no data (`mdadm --create … --row-map`) | ✅ done (2026-10-31) — 2 bits per row (unwritten / needs sync / written) in a sealed reserve at every member's tail, written to every member and to a replacement before its rebuild; a new array needs **no initial resync**; a partial write into an unwritten row is written by a forced reconstruct-write, the rest of the row synced by the next resync or repair; a whole-row discard returns a row to unwritten.  A damaged map page loads as "needs sync" (never skipped).  Gate `tools/raidkm-test-rowmap.sh` (33 checks, with negative controls).  Not with native checksums, declustered, PPL/journal, reshape or metadata 1.0 (refused).  See *Row state map and native snapshots* below |
+| **Row state map** — rebuild, resync and check skip the rows that hold no data (`mdadm --create … --row-map`) | ✅ done (2026-10-31) — 2 bits per row (unwritten / needs sync / written) in a sealed reserve at every member's tail, written to every member and to a replacement before its rebuild; a new array needs **no initial resync**; a partial write into an unwritten row is written by a forced reconstruct-write, the rest of the row synced by the next resync or repair; a whole-row discard returns a row to unwritten.  A damaged map page loads as "needs sync" (never skipped).  Gate `tools/raidkm-test-rowmap.sh` (33 checks, with negative controls).  Declustered pools included (2026-11-02).  Not with native checksums, PPL/journal, reshape or metadata 1.0 (refused).  See *Row state map and native snapshots* below |
 | **Native read-only snapshots** (`mdadm --create … --snapshots=<reserve %>`, `mdadm --snapshot`) | ✅ done (2026-11-01) — copy-on-write per row inside the array: no thin pool, no second metadata device.  Up to 64 snapshots in a linear chain, each a read-only block device `/dev/mdXs<id>`; a create freezes a mounted filesystem for its point in time.  **Crash safe**: every change goes to a journal on every member before the write that needed a copy is acknowledged; checkpoints and a replay at assemble bring the snapshots back after a stop, crash or power cut.  Power-cut matrix (dm-log-writes, every snapshot's md5 as the oracle, degraded included): **323 passed, 0 failed** on RHEL 9.7, 109/0 on 9.8.  A full reserve fails the write with ENOSPC and leaves the snapshots intact.  4 KiB first pass after a snapshot ~10% ahead of dm-thin, 1 MiB ~35% ahead, same member bytes.  Gates `tools/raidkm-test-snap.sh` (36 checks), `tools/raidkm-test-snap-persist.sh` (31).  See *Row state map and native snapshots* below |
 
 ### How level 71 is integrated into raid5.c
@@ -1583,8 +1583,16 @@ cat /sys/block/md70/md/rk_rowmap     # rows per state, skipped_rows, flushes, ..
 ```
 
 `--examine` prints a `Row Map : on` line (and `Snapshots : on` on a snapshot
-array).  Refused with the row map (v1): native checksums, declustered parity, PPL / the raidkm journal, any reshape or
+array).  Refused with the row map (v1): native checksums, PPL / the raidkm journal, any reshape or
 resize, and metadata 1.0 (superblock at the device end).
+
+On a **declustered** pool (`--layout=declustered … --row-map`) a row is still
+one chunk of every pool member, holding every group's data (`ngroups * k`
+chunks); the map sits one chunk after the data, past the rkdcl block, and the
+array's bios are cut at that row.  A replacement gets the map before the
+copy from the distributed spare, as a rebuilt member does.  Population into
+the spare columns and the copy back still walk every row (correct, not yet
+faster than without the map).
 
 ### Native snapshots (`--snapshots=<reserve %>`)
 
@@ -1652,8 +1660,26 @@ row a snapshot holds.  When the reserve is full, a write that needs a copy
 fails with **ENOSPC**; the snapshots stay intact, and destroying one
 gives its rows back.
 
-**Not yet** (refused, not run wrong): native checksums, declustered parity,
-PPL / the raidkm journal, reshape or grow.  Discards on a snapshot array are
+**Not yet** (refused, not run wrong): native checksums,
+PPL / the raidkm journal, reshape or grow.
+
+**Declustered pools** take snapshots too (`--layout=declustered
+--group-width=g … --snapshots=<pct>`): the copy unit is a declustered row,
+every group's data (`ngroups * k` chunks; 14 disks of 4+2 groups and 2 spare
+columns at 128 KiB: 1 MiB), and snapshots survive population into the spare
+columns, a power cut during it, and the copy back to a new disk.  A row over
+1 MiB never takes the whole-row redirect from a direct write of 4 KiB pages
+(the block layer sends at most 256 pages per bio, so the write comes in two
+pieces): the first write to it after a snapshot is a read-merge-write copy,
+and such a write leaves an unwritten row "needs sync" until a repair.  Classic
+arrays with rows over 1 MiB behave the same.  Copies in flight are bounded by
+bytes (128 MiB of rows, `cow_slots` in `rk_snap`), never fewer than 2 slots, so
+the ceiling is the larger of 128 MiB and two rows; one row buffer stays
+allocated while the array runs.  On a wide pool that is real memory and a
+narrow pipe: 80 disks in 6 groups of 11+2 at 1 MiB chunks have a 66 MiB row,
+66 MiB held from assembly, at most 132 MiB in copies, and 2 copies at a time
+(each first small write to a row after a snapshot copies the whole 66 MiB).
+Pick a smaller chunk for snapshot pools that take small writes.  Discards on a snapshot array are
 ignored (a row may be shared).  The origin map is in memory, not demand
 paged; snapshots are read-only, and there is no external metadata device.
 

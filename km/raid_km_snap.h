@@ -146,6 +146,11 @@ struct rk_snap_cow {
 };
 
 #define RK_SNAP_COWS	64
+/* rows in flight in COWs at most this many bytes (a partial COW holds a
+ * row buffer): a wide row -- a declustered pool's, or a classic one at a
+ * big chunk -- gets fewer COW slots, never fewer than 2, so the ceiling
+ * is max(128 MiB, 2 rows); one row of it stays reserved (buf_pool) */
+#define RK_SNAP_COW_BYTES	(128U << 20)
 
 struct raidkm_snap_one {
 	struct list_head	list;		/* sn->snaps, oldest first */
@@ -183,6 +188,7 @@ struct raidkm_snap {
 	 * waits for memory or a COW */
 	struct rk_snap_cow	cow[RK_SNAP_COWS];
 	DECLARE_BITMAP(cow_busy, RK_SNAP_COWS);
+	unsigned int		cows_max;	/* slots used, <= RK_SNAP_COWS */
 	struct bio_list		overflow;	/* writes that found no free COW,
 						 * or came while hold was set */
 	bool			hold;		/* create/destroy: start no COW */

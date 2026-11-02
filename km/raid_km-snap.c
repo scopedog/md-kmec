@@ -338,6 +338,10 @@ static void rk_cow_fn(struct work_struct *work)
 	if (!st) {
 		rk_merge(b, bi, (size_t)off << 9);
 		st = rk_row_io(sn, REQ_OP_WRITE, b, newP);
+		/* in more than one bio when the row is over one: each made
+		 * the row N, together they wrote all of it */
+		if (!st)
+			raidkm_rowmap_note_row_written(sn->conf, newP);
 	}
 	mempool_free(b, sn->buf_pool);
 	atomic64_inc(&sn->cow_partial);
@@ -427,8 +431,8 @@ int raidkm_snap_map_bio(struct r5conf *conf, struct bio **bip)
 		bio_io_error(bi);
 		return RK_SNAP_DONE;
 	}
-	i = find_first_zero_bit(sn->cow_busy, RK_SNAP_COWS);
-	if (sn->hold || i >= RK_SNAP_COWS) {
+	i = find_first_zero_bit(sn->cow_busy, sn->cows_max);
+	if (sn->hold || i >= sn->cows_max) {
 		/* a create/destroy is waiting for the COWs to drain, or every
 		 * slot is busy: the next COW to end (or the unhold) sends it
 		 * again */
@@ -858,7 +862,7 @@ int raidkm_snap_init(struct r5conf *conf)
 		       mdname(mddev));
 		return -EINVAL;
 	}
-	rs = (u64)conf->chunk_sectors * (conf->raid_disks - conf->m);
+	rs = raidkm_row_data_sectors(conf);
 	if (rs << 9 < PAGE_SIZE || (rs << 9) & ~PAGE_MASK) {
 		pr_err("md/raid:%s: snap: the row is not a whole number of pages\n",
 		       mdname(mddev));
@@ -924,7 +928,13 @@ int raidkm_snap_init(struct r5conf *conf)
 				 mdname(mddev));
 	sn->cwq = alloc_ordered_workqueue("rk_snapc_%s", WQ_MEM_RECLAIM,
 					  mdname(mddev));
-	sn->buf_pool = mempool_create(2, rk_rowbuf_alloc, rk_rowbuf_free,
+	sn->cows_max = clamp_t(u64, RK_SNAP_COW_BYTES / (rs << 9), 2,
+			       RK_SNAP_COWS);
+	/* a reserve of one row: a partial COW holds one buffer at a time
+	 * (rk_cow_fn), so one guarantees progress; every element
+	 * stays allocated for the array's life, and the row is a whole
+	 * declustered row on a pool (tens of MiB when wide) */
+	sn->buf_pool = mempool_create(1, rk_rowbuf_alloc, rk_rowbuf_free,
 				      (void *)(unsigned long)((rs << 9) >> PAGE_SHIFT));
 	if (!sn->wq || !sn->cwq || !sn->buf_pool ||
 	    bioset_init(&sn->bs, 64, 0, BIOSET_NEED_BVECS)) {
@@ -1422,7 +1432,7 @@ ssize_t raidkm_snap_show(struct mddev *mddev, char *page)
 			   "origin_rows %llu\nreserve_rows %llu\nreserve_pct %u\nfree_rows %llu\nredirected %llu\n"
 			   "cow_whole %lld\ncow_partial %lld\ncow_fail %lld\ncow_nospc %lld\nfreed %lld\n"
 			   "checkpoint %llu\njournal_tail %llu\njournal_head %llu\ncommits %lld\nrecords %lld\n"
-			   "checkpoints %lld\nreplayed %lld\nbroken %d\nsnapshots %d\n",
+			   "checkpoints %lld\nreplayed %lld\nbroken %d\nsnapshots %d\ncow_slots %u\n",
 			   sn->O, sn->R - sn->O, sn->reserve_pct,
 			   sn->R - bitmap_weight(sn->used, sn->R),
 			   READ_ONCE(sn->redirected),
@@ -1437,7 +1447,7 @@ ssize_t raidkm_snap_show(struct mddev *mddev, char *page)
 			   atomic64_read(&sn->records),
 			   atomic64_read(&sn->ckpts),
 			   atomic64_read(&sn->replayed),
-			   READ_ONCE(sn->broken), sn->nsnaps);
+			   READ_ONCE(sn->broken), sn->nsnaps, sn->cows_max);
 	list_for_each_entry(g, &sn->snaps, list)
 		n += sysfs_emit_at(page, n,
 				   "snap name=%s id=%d ctime=%lld dev=/dev/%s exc=%llu%s%s\n",

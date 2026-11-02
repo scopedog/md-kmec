@@ -16717,6 +16717,24 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 	 * otherwise un-quiesce the array from under the band (conf->quiesce
 	 * is a state machine, not a refcount).
 	 */
+	/* row map + snapshot metadata: R gets the whole region before its
+	 * copy starts, as a stock recovery seeds its member (the flushes
+	 * after this reach R too: every member that is not Faulty).  Not
+	 * under the retire mutex: the snapshot checkpoint waits for I/O.
+	 * Lock-free peek first (as the dispatch in sync_request): a pass
+	 * the checks below abort copies nothing, and seeding it would
+	 * repeat a whole region write + checkpoint on every re-nudge. */
+	if (sector_nr == 0 && conf->rowmap) {
+		struct md_rdev *r = NULL;
+
+		pop = READ_ONCE(conf->reb_pop);
+		if (pop >= 0 && pop < (int)conf->dcl->s &&
+		    conf->reb[pop].state == RKDCL_ASSIGN_COPYING)
+			r = READ_ONCE(conf->disks[conf->reb[pop].disk].rdev);
+		if (r && !test_bit(Faulty, &r->flags))
+			raidkm_rowmap_seed(conf);
+	}
+
 	mutex_lock(&conf->dcl_retire_mutex);
 	/* revalidate under the mutex: the dispatch check in sync_request
 	 * was lock-free and a retire can land in between (reb_pop then
@@ -20133,7 +20151,7 @@ raid5_size(struct mddev *mddev, sector_t sectors, int raid_disks)
 	if (conf->dcl)
 		/* declustered: each row (one chunk per member) carries
 		 * ngroups * k data columns */
-		return sectors * conf->dcl->ngroups * conf->dcl->k;
+		return sectors * raidkm_row_data_cols(conf);
 	if (is_raidkm(conf)) {
 		/*
 		 * Mid m-CHANGING reshape max_degraded is max(old_m, new_m)
@@ -21029,7 +21047,33 @@ static int raid5_create_ctx_pool(struct r5conf *conf)
  */
 static unsigned int raidkm_row_sectors(struct r5conf *conf)
 {
+	/* declustered with the row map: its row, every group of a device row
+	 * (raidkm_row_data_sectors()), so a write of a whole one comes as one
+	 * bio -- the row map makes it W, a snapshot redirects it whole
+	 * instead of a read, merge and copy.  A multiple of each group's
+	 * stripe; the row write path, the other user of the boundary, is off
+	 * on declustered arrays. */
+	if (conf->dcl && conf->rowmap)
+		return raidkm_row_data_sectors(conf);
 	return conf->chunk_sectors * raid5_stripe_data_disks(conf);
+}
+
+/*
+ * The row in bytes for lim.io_opt.  In 64 bits, then clamped: the
+ * declustered row (chunk x ngroups x k) is ngroups times the old chunk x k
+ * and a legal geometry (a 16 MiB chunk, ~250 data columns) reaches 4 GiB,
+ * where a 32-bit << 9 wraps -- and max_hw_sectors and the request
+ * context's stripe bitmap are derived from io_opt.  Clamped to a whole
+ * number of chunks.
+ */
+static unsigned int raidkm_row_io_opt(struct r5conf *conf)
+{
+	u64 bytes = (u64)raidkm_row_sectors(conf) << 9;
+	unsigned int cb = conf->chunk_sectors << 9;
+
+	if (bytes <= UINT_MAX)
+		return bytes;
+	return rounddown(UINT_MAX, cb);
 }
 
 /*
@@ -21069,7 +21113,7 @@ static void raidkm_update_row_limits(struct r5conf *conf)
 		return;
 	lim = queue_limits_start_update(mddev->gendisk->queue);
 	lim.io_min = conf->chunk_sectors << 9;
-	lim.io_opt = lim.io_min * raid5_stripe_data_disks(conf);
+	lim.io_opt = raidkm_row_io_opt(conf);	/* the row */
 	/*
 	 * raid5_set_limits()'s rule again for the new row: a member's request
 	 * cap (max_user_sectors, stacked in at run time) below a row splits
@@ -21122,7 +21166,7 @@ static int raid5_set_limits(struct mddev *mddev)
 	/* the current chunk (conf's: the new one mid chunk-size reshape), as
 	 * the row boundary below uses */
 	lim.io_min = conf->chunk_sectors << 9;
-	lim.io_opt = lim.io_min * raid5_stripe_data_disks(conf);
+	lim.io_opt = raidkm_row_io_opt(conf);	/* the row */
 	lim.features |= BLK_FEAT_RAID_PARTIAL_STRIPES_EXPENSIVE;
 
 	/*
@@ -21171,10 +21215,12 @@ static int raid5_set_limits(struct mddev *mddev)
 	 * might be to turn DISCARD into WRITE_ZEROES requests, as that is
 	 * required to be safe.
 	 */
-	if (conf->rowmap) {
+	if (conf->rowmap && !conf->dcl) {
 		/*
 		 * With the row map a discarded row is U, so the array can
-		 * always take a discard.  The members get it only under the
+		 * always take a discard.  (Declustered: no discard fan-out
+		 * yet, raid5_make_request refuses them; limits as without
+		 * the map.)  The members get it only under the
 		 * same rule as without the map (devices_handle_discard_safely):
 		 * a trimmed block that does not read back the same twice
 		 * breaks the parity a later reconstruct-write builds over it

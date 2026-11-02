@@ -9,6 +9,11 @@
 #
 # Members are tmpfs-backed loop devices (8+2, 128 KiB chunks: rows of
 # 1 MiB of data), snapshots on 20% of the rows.
+#
+# SNAP_DCL=<N>:<g>:<s> runs it on a declustered array instead: a pool of N
+# members, groups of g = k + 2, s spare columns (14:6:2 = two 4+2 groups,
+# rows of 1 MiB again; 20:6:2 = three, rows of 1.5 MiB), and adds T13: a
+# member populated into the spare columns, then copied back to a new disk.
 # Ubuntu 26.04's dd is uutils coreutils, whose O_DIRECT I/O of 128 KiB and
 # more fails with EINVAL (and may not issue a block as one write); GNU dd is
 # installed beside it as gnudd.
@@ -33,10 +38,25 @@ rk_modload() {	# rk_modload <ko path> <module> [params...]
 MD=/dev/md70; MDN=md70
 NMEM=10; MEMSZ=64		# MiB
 ROW=$((1024 * 1024))
+CHUNK=$((128 * 1024))
+LAYOUT=(--layout=rotating); DCL_SECT=0; DCL_NAME=
+if [ -n "${SNAP_DCL:-}" ]; then
+	IFS=: read -r NMEM DCL_G DCL_S <<<"$SNAP_DCL"
+	[[ "$NMEM" =~ ^[0-9]+$ && "$DCL_G" =~ ^[0-9]+$ && "$DCL_S" =~ ^[0-9]+$ ]] && \
+		[ "$DCL_G" -gt 2 ] && [ "$NMEM" -gt "$DCL_S" ] || \
+		{ echo "SNAP_DCL=$SNAP_DCL: want <N>:<g>:<s>, g > 2 (m = 2), N > s"; exit 1; }
+	DCL_NG=$(( (NMEM - DCL_S) / DCL_G ))
+	[ $DCL_NG -ge 1 ] && [ $(( DCL_NG * DCL_G + DCL_S )) = "$NMEM" ] || { echo "SNAP_DCL=$SNAP_DCL: N - s is not a multiple of g"; exit 1; }
+	ROW=$(( CHUNK * DCL_NG * (DCL_G - 2) ))
+	LAYOUT=(--layout=declustered --group-width=$DCL_G --spare-columns=$DCL_S)
+	DCL_SECT=$(( CHUNK / 512 ))	# the rkdcl chunk before the row map
+	DCL_NAME=" (declustered $SNAP_DCL, $DCL_NG group(s), rows of $(( ROW / 1024 )) KiB)"
+fi
 PASS=0; FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $*"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $*"; }
 sn_get() { awk -v k="$1" '$1 == k {print $2}' /sys/block/$MDN/md/rk_snap; }
+rm_get() { awk -v k="$1" '$1 == k {print $2}' /sys/block/$MDN/md/rk_rowmap; }
 snap() { $MDADM --snapshot $MD "$@"; }
 idle() {
 	local t=0
@@ -133,14 +153,35 @@ restart() {	# stop, assemble [members]
 	assemble "$@"
 }
 
-echo "== snapshot persistence test"
+echo "== snapshot persistence test$DCL_NAME"
 trap teardown EXIT
 teardown
 load
 dmesg -C
 members
-$MDADM --create $MD --level=raidkm --parity-count=2 --layout=rotating \
-	--raid-devices=$NMEM --chunk=128 --bitmap=none --snapshots=20 \
+
+# T0 (declustered) the row map alone: bios are cut at its row (every
+# group of a device row), so a whole-row write makes the row W
+if [ -n "${SNAP_DCL:-}" ]; then
+	$MDADM --create $MD --level=raidkm --parity-count=2 "${LAYOUT[@]}" \
+		--raid-devices=$NMEM --chunk=$(( CHUNK / 1024 )) --bitmap=none --row-map \
+		--run --force "${M[@]}" >$RK_DIR/sn-create0.log 2>&1 || { cat $RK_DIR/sn-create0.log; exit 1; }
+	idle
+	[ "$(cat /sys/block/$MDN/queue/optimal_io_size)" = $ROW ] && \
+		[ "$(cat /sys/block/$MDN/queue/chunk_sectors)" = $(( ROW / 512 )) -o $ROW -gt $((1024 * 1024)) ] && \
+		pass "T0 row map alone: io_opt = the row ($ROW)" || \
+		fail "T0 io_opt $(cat /sys/block/$MDN/queue/optimal_io_size) chunk_sectors $(cat /sys/block/$MDN/queue/chunk_sectors), row $ROW"
+	for r in $(seq 0 9); do wr $(( r * ROW )) $ROW r0-$r; done
+	if [ $ROW -le $((1024 * 1024)) ]; then
+		[ "$(rm_get written)" -ge 10 ] && [ "$(rm_get needsync)" = 0 ] && \
+			pass "T0 10 whole-row writes: $(rm_get written) row(s) W" || \
+			fail "T0 written $(rm_get written) needsync $(rm_get needsync)"
+	fi
+	$MDADM --stop $MD >/dev/null
+fi
+
+$MDADM --create $MD --level=raidkm --parity-count=2 "${LAYOUT[@]}" \
+	--raid-devices=$NMEM --chunk=$(( CHUNK / 1024 )) --bitmap=none --snapshots=20 \
 	--run --force "${M[@]}" >$RK_DIR/sn-create.log 2>&1 || { cat $RK_DIR/sn-create.log; exit 1; }
 idle
 
@@ -166,9 +207,25 @@ for r in $(seq 10 19); do wr $(( r * ROW + 8192 )) 4096 part$r; done	# partial
 h1=$(md5 $MD)
 [ "$(md5 "$d1")" = "$h0" ] && pass "T2 s1 = the origin at create" || fail "T2 s1 changed"
 [ "$h1" != "$h0" ] && pass "T2 origin changed" || fail "T2 origin unchanged"
-[ "$(sn_get cow_whole)" -ge 10 ] && [ "$(sn_get cow_partial)" -ge 10 ] && \
-	pass "T2 COWs: $(sn_get cow_whole) whole, $(sn_get cow_partial) partial" || \
-	fail "T2 cow counts $(sn_get cow_whole) $(sn_get cow_partial)"
+# every COW wrote its new row whole (in more than one bio when the row is
+# over 1 MiB): those rows are W, not N
+[ "$(rm_get written)" -ge 20 ] && pass "T2 COW target rows W ($(rm_get written) written, $(rm_get needsync) needsync)" || \
+	fail "T2 written $(rm_get written) needsync $(rm_get needsync)"
+if [ $ROW -le $((1024 * 1024)) ]; then
+	[ "$(rm_get needsync)" = 0 ] && pass "T2 no row left N" || fail "T2 needsync $(rm_get needsync)"
+fi
+# A whole-row COW needs the row in one bio: a direct write from 4 KiB
+# pages comes in bios of at most 256 pages (BIO_MAX_VECS), so a row over
+# 1 MiB (20:6:2's 1.5 MiB) is always two pieces and copied partially
+if [ $ROW -le $((1024 * 1024)) ]; then
+	[ "$(sn_get cow_whole)" -ge 10 ] && [ "$(sn_get cow_partial)" -ge 10 ] && \
+		pass "T2 COWs: $(sn_get cow_whole) whole, $(sn_get cow_partial) partial" || \
+		fail "T2 cow counts $(sn_get cow_whole) $(sn_get cow_partial)"
+else
+	[ $(( $(sn_get cow_whole) + $(sn_get cow_partial) )) -ge 20 ] && \
+		pass "T2 COWs: $(sn_get cow_whole) whole, $(sn_get cow_partial) partial (rows over 1 MiB: two bios each)" || \
+		fail "T2 cow counts $(sn_get cow_whole) $(sn_get cow_partial)"
+fi
 
 # T3 clean stop/assemble: everything back from the checkpoint
 restart || exit 1
@@ -249,13 +306,13 @@ $MDADM $MD --add "${M[1]}" >/dev/null 2>&1 || fail "T8 add ${M[1]}"
 idle
 snap --set s3 t8=1 || fail "T8 set"		# a record after the seed
 # where the region starts: data_offset + the kernel's component size
-# (chunk-rounded) + the row map's pages
+# (chunk-rounded) [+ the rkdcl chunk] + the row map's pages
 SZ=$(( $(cat /sys/block/$MDN/md/component_size) * 2 / 256 * 256 ))
 $MDADM --stop $MD >/dev/null
 DO=$($MDADM --examine "${M[5]}" | awk '/Data Offset/ {print $4}')
 [ -n "$DO" ] && [ "$SZ" -gt 0 ] || fail "T8 region offset (data offset '$DO', size '$SZ')"
 ROWS=$(( SZ / 256 )); RMP=$(( (ROWS + 16319) / 16320 ))
-SNOFF=$(( (DO + SZ) / 8 + RMP ))		# 4 KiB page of the region's start
+SNOFF=$(( (DO + SZ + DCL_SECT) / 8 + RMP ))	# 4 KiB page of the region's start
 NRM=$(( (ROWS + 509) / 510 )); NPM=$(( (NRM + 4079) / 4080 ))
 # header, table and pmap copies: the seed's and the stop's checkpoints write
 # both copies of each to every member.  (Not the rmap slots: the slot a page
@@ -319,6 +376,60 @@ $MDADM $MD --add "$SMALL" >$RK_DIR/sn-small.log 2>&1 && fail "T12 a too small sp
 	pass "T12 too small spare refused: $(tail -1 $RK_DIR/sn-small.log)"
 grep -q "$(basename $SMALL)" /proc/mdstat && fail "T12 $SMALL in the array" || pass "T12 array unchanged"
 losetup -d "$SMALL"; rm -f $SNMEM/small
+
+# T13 (declustered) a member fails and is populated into the spare
+# columns: the snapshots and the origin read the same from there; then a
+# new disk takes its place by the copy from the spare, and gets the row map
+# and the snapshot metadata before the copy (it is seeded as a recovering
+# member is): the array comes up from it without two other members
+if [ -n "${SNAP_DCL:-}" ]; then
+	wr $(( 5 * ROW )) $ROW t13a
+	snap --create p1 || fail "T13 create p1"
+	for r in $(seq 50 59); do wr $(( r * ROW )) $ROW t13-$r; done
+	wr $(( 60 * ROW + 4096 )) 4096 t13part
+	hp=$(md5 "$(sdev p1)"); hs1=$(md5 "$(sdev s1)"); h13=$(md5 $MD)
+	V=${M[3]}; VS=$(cat /sys/block/$MDN/md/dev-$(basename "$V")/slot)
+	$MDADM $MD --fail "$V" >/dev/null 2>&1 && $MDADM $MD --remove "$V" >/dev/null 2>&1 || fail "T13 fail/remove $V"
+	echo "$VS" > /sys/block/$MDN/md/rk_dcl_populate 2>/dev/null || fail "T13 arm population of slot $VS"
+	t=0
+	until grep -q "^populated $VS " /sys/block/$MDN/md/rk_dcl_populate; do
+		[ $t -ge 600 ] && { fail "T13 population: $(cat /sys/block/$MDN/md/rk_dcl_populate | tr '\n' ' ')"; break; }
+		sleep 0.5; t=$((t + 1))
+	done
+	idle
+	same "T13 populated p1" "$hp" "$(sdev p1)" && same "T13 populated s1" "$hs1" "$(sdev s1)" && \
+		same "T13 populated origin" "$h13" $MD && \
+		pass "T13 slot $VS populated into the spare: p1, s1, origin intact" || fail "T13 after population"
+	# a COW while populated: the write goes to the spare columns
+	wr $(( 70 * ROW )) $ROW t13pop; wr $(( 71 * ROW + 8192 )) 4096 t13pop2
+	h13=$(md5 $MD)
+	same "T13 COW while populated" "$hp" "$(sdev p1)" && pass "T13 COWs while populated keep p1" || \
+		fail "T13 COWs while populated"
+	dd if=/dev/zero of="$SPARE" bs=1M count=$MEMSZ status=none
+	$MDADM $MD --add "$SPARE" >/dev/null 2>&1 || fail "T13 add $SPARE"
+	idle
+	dmesg | grep -q "copy of disk .* COMPLETE" && pass "T13 copy-back from the spare to the new disk" || \
+		fail "T13 no copy-back ($(dmesg | grep -iE 'declustered|retired|copy' | tail -2 | tr '\n' ' '))"
+	dmesg | grep -q "row map: .* page(s) written to $(basename "$SPARE") before its rebuild" && \
+		pass "T13 the new disk got the row map before the copy" || fail "T13 no row map seed for $SPARE"
+	[ "$(cat /sys/block/$MDN/md/degraded)" = 0 ] && pass "T13 not degraded" || \
+		fail "T13 degraded $(cat /sys/block/$MDN/md/degraded)"
+	snap --set p1 t13=1 || fail "T13 set"
+	$MDADM --stop $MD >/dev/null
+	r5=$(regmd5 "${M[5]}")
+	[ "$(regmd5 "$SPARE")" = "$r5" ] && pass "T13 the new disk holds the same snapshot metadata" || \
+		fail "T13 metadata on $SPARE $(regmd5 "$SPARE"), others $r5"
+	RMOFF=$(( (DO + SZ + DCL_SECT) / 8 ))
+	rmmd5() { dd if="$1" bs=4096 skip=$RMOFF count=$RMP status=none | md5sum | cut -c1-32; }
+	[ "$(rmmd5 "$SPARE")" = "$(rmmd5 "${M[5]}")" ] && pass "T13 and the same row map" || \
+		fail "T13 row map on $SPARE differs"
+	NEW=("${M[@]:0:3}" "$SPARE" "${M[@]:6}")	# 4 and 5 left out
+	assemble "${NEW[@]}" || exit 1
+	same "T13 p1" "$hp" "$(sdev p1)" && same "T13 s1" "$hs1" "$(sdev s1)" && same "T13 origin" "$h13" $MD && \
+		snap --list p1 | grep -q "t13=1" && pass "T13 the new disk + others, two left out: intact" || \
+		fail "T13 after the copy-back"
+	M=("${NEW[@]:0:3}" "$SPARE" "${M[4]}" "${M[5]}" "${M[@]:6}")
+fi
 
 dmesg | grep -qE "WARNING|BUG|Oops|inconsistent" && fail "kernel warnings (dmesg)" || pass "no kernel warnings"
 teardown	# before the verdict: a tmpfs that will not unmount is a FAIL

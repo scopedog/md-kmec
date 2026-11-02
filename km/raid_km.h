@@ -1327,6 +1327,23 @@ static inline bool is_raidkm(struct r5conf *conf)
  * NULL) and in the end_reshape..finish_reshape window (a fresh stripe is
  * built at the NEW width, which differs from prev_dcl->g).
  */
+/* Data chunks in one device row (one chunk of every member): k on the
+ * classic layouts, every group's k on a declustered pool (its spare
+ * columns hold none).  The capacity, the row map's row and the snapshot
+ * row are this many chunks. */
+static inline unsigned int raidkm_row_data_cols(struct r5conf *conf)
+{
+	if (conf->dcl)
+		return conf->dcl->ngroups * conf->dcl->k;
+	return conf->raid_disks - conf->m;
+}
+
+/* array sectors per device row */
+static inline u64 raidkm_row_data_sectors(struct r5conf *conf)
+{
+	return (u64)conf->chunk_sectors * raidkm_row_data_cols(conf);
+}
+
 static inline bool raidkm_sh_dcl_prev(struct r5conf *conf,
 				      struct stripe_head *sh)
 {

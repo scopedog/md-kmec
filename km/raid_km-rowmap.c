@@ -62,11 +62,6 @@ static void rk_rm_set(struct raidkm_rowmap *rm, u64 row, unsigned int st)
 	__set_bit(rk_rm_page(row), rm->dirty);
 }
 
-static inline u64 rk_rm_row_sectors(struct r5conf *conf)
-{
-	return (u64)conf->chunk_sectors * (conf->raid_disks - conf->m);
-}
-
 /* ---- on-disk pages ------------------------------------------------- */
 
 static u32 rk_rm_page_crc(const u8 *buf)
@@ -259,7 +254,7 @@ bool raidkm_rowmap_note_write(struct r5conf *conf, sector_t sector,
 			      unsigned int sectors)
 {
 	struct raidkm_rowmap *rm = conf->rowmap;
-	u64 rs = rk_rm_row_sectors(conf), first, last, r;
+	u64 rs = raidkm_row_data_sectors(conf), first, last, r;
 	u64 end = (u64)sector + sectors;
 	bool change = false, durable = false, lazy = false;
 	unsigned long flags;
@@ -314,6 +309,31 @@ bool raidkm_rowmap_note_write(struct r5conf *conf, sector_t sector,
 	if (lazy && !durable)
 		queue_delayed_work(system_wq, &rm->lazy, RK_RM_LAZY_DELAY);
 	return durable;
+}
+
+/*
+ * Device row @row was written whole, in several bios (none of them the
+ * whole row: raidkm_rowmap_note_write() made it N): every stripe of it was
+ * a reconstruct-write, so its parity is good everywhere -- W, lazily as
+ * any N -> W.  The snapshot's COW of a row over one bio.
+ */
+void raidkm_rowmap_note_row_written(struct r5conf *conf, u64 row)
+{
+	struct raidkm_rowmap *rm = conf->rowmap;
+	unsigned long flags;
+	bool lazy = false;
+
+	if (!rm || row >= rm->nrows)
+		return;
+	spin_lock_irqsave(&rm->lock, flags);
+	if (rk_rm_get(rm, row) == RK_RM_N || rk_rm_get(rm, row) == RK_RM_S) {
+		rk_rm_set(rm, row, RK_RM_W);
+		atomic64_inc(&rm->to_w);
+		lazy = true;
+	}
+	spin_unlock_irqrestore(&rm->lock, flags);
+	if (lazy)
+		queue_delayed_work(system_wq, &rm->lazy, RK_RM_LAZY_DELAY);
 }
 
 /* rows [first_row, last_row) were discarded whole: content undefined */
@@ -539,6 +559,13 @@ static void rk_rm_seed(struct r5conf *conf)
 	mutex_unlock(&rm->flush_mutex);
 }
 
+/* declustered copy-back: the replacement gets every page before the copy
+ * (a stock recovery seeds from raidkm_rowmap_sync_skip()) */
+void raidkm_rowmap_seed(struct r5conf *conf)
+{
+	rk_rm_seed(conf);
+}
+
 /*
  * At the top of raid5_sync_request: how many sectors from @sector_nr the
  * pass may skip (0 = none).  At the start of a full pass it also seeds a
@@ -742,11 +769,11 @@ int raidkm_rowmap_init(struct r5conf *conf)
 	struct raidkm_rowmap *rm;
 	struct md_rdev *rdev;
 
-	if (conf->dcl || conf->csum || raid5_has_log(conf) ||
+	if (conf->csum || raid5_has_log(conf) ||
 	    raid5_has_ppl(conf) || test_bit(MD_HAS_JOURNAL, &mddev->flags) ||
 	    test_bit(MD_HAS_PPL, &mddev->flags) ||
 	    mddev->reshape_position != MaxSector) {
-		pr_err("md/raid:%s: row map: not supported with declustered parity, native checksums, a journal/PPL or a reshape\n",
+		pr_err("md/raid:%s: row map: not supported with native checksums, a journal/PPL or a reshape\n",
 		       mdname(mddev));
 		return -EINVAL;
 	}
@@ -760,7 +787,9 @@ int raidkm_rowmap_init(struct r5conf *conf)
 	rm->chunk_sectors = conf->chunk_sectors;
 	rm->nrows = div_u64(mddev->dev_sectors, conf->chunk_sectors);
 	rm->npages = DIV_ROUND_UP_ULL(rm->nrows, RK_RM_ROWS_PER_PAGE);
-	rm->region = mddev->dev_sectors;
+	/* after the data; declustered: after the rkdcl chunk, which sits
+	 * at dev_sectors (raidkm_csum_region() makes the same step) */
+	rm->region = mddev->dev_sectors + (conf->dcl ? conf->chunk_sectors : 0);
 	rm->id = crc32c(0, mddev->uuid, sizeof(mddev->uuid));
 
 	rdev_for_each(rdev, mddev) {

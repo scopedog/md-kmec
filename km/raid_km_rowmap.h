@@ -19,9 +19,13 @@
  * rebuild skips it.  Everything else is lazy -- losing it leaves a row
  * looking more used than it is, which only costs a skip.
  *
- * On disk: a tail reserve on every member at data_offset + dev_sectors,
+ * On disk: a tail reserve on every member at data_offset + dev_sectors
+ * (one chunk later on a declustered array: its rkdcl block is there),
  * 4 KiB pages of (4096 - 16) * 4 states and a trailer, written to every
  * member.  The copy with the highest generation and a good CRC wins.
+ *
+ * Declustered: a row is still one chunk of every member (the pool), with
+ * ngroups * k data chunks in it; its state covers every group of the row.
  */
 #ifndef _RAID_KM_ROWMAP_H
 #define _RAID_KM_ROWMAP_H
@@ -71,6 +75,8 @@ struct raidkm_rowmap {
 };
 
 int raidkm_rowmap_init(struct r5conf *conf);
+void raidkm_rowmap_seed(struct r5conf *conf);
+void raidkm_rowmap_note_row_written(struct r5conf *conf, u64 row);
 struct md_rdev *raidkm_rowmap_member(struct r5conf *conf, int slot);
 void raidkm_rowmap_stop(struct r5conf *conf);
 void raidkm_rowmap_free(struct r5conf *conf);
