@@ -16729,8 +16729,16 @@ static sector_t raidkm_dcl_copy_request(struct mddev *mddev,
 
 		pop = READ_ONCE(conf->reb_pop);
 		if (pop >= 0 && pop < (int)conf->dcl->s &&
-		    conf->reb[pop].state == RKDCL_ASSIGN_COPYING)
-			r = READ_ONCE(conf->disks[conf->reb[pop].disk].rdev);
+		    READ_ONCE(conf->reb[pop].state) == RKDCL_ASSIGN_COPYING) {
+			/* bounded as in raidkm_dcl_rescue_worker(): a scrub
+			 * (state NONE, then disk -1) can land between the two
+			 * loads; a torn read skips the seed, and the check
+			 * under the mutex below aborts the pass */
+			int X = READ_ONCE(conf->reb[pop].disk);
+
+			if (X >= 0 && X < conf->raid_disks)
+				r = READ_ONCE(conf->disks[X].rdev);
+		}
 		if (r && !test_bit(Faulty, &r->flags))
 			raidkm_rowmap_seed(conf);
 	}
