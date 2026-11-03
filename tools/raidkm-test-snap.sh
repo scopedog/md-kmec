@@ -129,7 +129,7 @@ mk_nullb() {
 # mkarray <chunk KiB>: snapshots on a quarter of the rows
 mkarray() {
 	$MDADM --create $MD --level=raidkm --parity-count=2 --layout=rotating --raid-devices=${#M[@]} \
-		--chunk=$1 --bitmap=none --snapshots=25 --run --force "${M[@]}" >$RK_DIR/mkarray.out 2>&1 || { fail "mdadm --create: $(tail -1 $RK_DIR/mkarray.out)"; return 1; }
+		--chunk=$1 --bitmap=none --snapshots=25 $([ "${SNAP_CSUM:-0}" = 1 ] && echo --checksum) --run --force "${M[@]}" >$RK_DIR/mkarray.out 2>&1 || { fail "mdadm --create: $(tail -1 $RK_DIR/mkarray.out)"; return 1; }
 	idle
 	ROWK=$(( $1 * (${#M[@]} - 2) ))			# row in KiB
 }
@@ -370,6 +370,12 @@ if [ "${SNAP_PERF:-0}" = 1 ]; then setup_content; perf; teardown; fi
 dmesg | grep -iE "BUG|WARNING|Oops|KASAN|call trace|beyond end of device|spans a row" | tail -5
 dmesg | grep -qiE "BUG|WARNING|Oops|KASAN|beyond end of device" && fail "kernel messages above"
 teardown
+# with --checksum no test here corrupts data: any mismatch is a stale or
+# missing CRC (the dmesg ring was cleared at the start)
+if [ "${SNAP_CSUM:-0}" = 1 ]; then
+	n=$(dmesg | grep -c "native csum mismatch")
+	[ "$n" = 0 ] && pass "no native csum mismatch" || fail "$n native csum mismatch(es)"
+fi
 echo "RESULT pass=$PASS fail=$FAIL"
 echo "==== snap: $PASS passed, $FAIL failed ===="
 [ "$FAIL" = 0 ]

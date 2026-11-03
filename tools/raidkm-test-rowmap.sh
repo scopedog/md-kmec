@@ -6,6 +6,9 @@
 #   MDADM=...      a raidkm-aware mdadm with --row-map (required)
 #   RM_NO_RCW=1    negative control: load with rowmap_test_no_rcw=Y; T4 must FAIL
 #   RM_NO_RECSKIP=1 load with rowmap_test_no_recskip=Y; T10's stripe check must FAIL
+#   RM_CSUM=1      every array with --checksum too; T17 runs
+#   RM_NO_CSUM_DROP=1 (with RM_CSUM=1) load with csum_test_no_discard_drop=Y;
+#                  T17 must FAIL
 #   (a module from before the 10-31 review fixes fails T9, T11 and T12;
 #   one from before the bitmap fix fails T14)
 # Ubuntu 26.04's dd is uutils coreutils, whose O_DIRECT I/O of 128 KiB and
@@ -31,6 +34,11 @@ rk_modload() {	# rk_modload <ko path> <module> [params...]
 }
 MD=/dev/md70; MDN=md70
 NMEM=10; MEMSZ=64		# MiB
+# RM_CSUM=1: every array also gets native checksums (--checksum); T17 runs
+CSUM_OPT=(); [ "${RM_CSUM:-0}" = 1 ] && CSUM_OPT=(--checksum)
+# the CRC region's size when the row map follows it (km
+# raidkm_csum_reserve_sectors(), mdadm rkcs_reserve()), in sectors
+csum_reserve() { local p=$(( ($1 / 8 + 1021) / 1022 )); echo $(( (p * 8 + 127) / 128 * 128 )); }
 CHUNK=128			# KiB; row = 8 x 128K = 1 MiB of data
 ROW=$((1024 * 1024))
 PASS=0; FAIL=0
@@ -103,7 +111,8 @@ load() {
 	lsmod | grep -q '^raidkm' && { rmmod raidkm || exit 1; }
 	lsmod | grep -q '^isal_lib' || rk_modload $ISAL_KO isal_lib
 	rk_modload $KO raidkm rowmap_test_no_rcw=$([ "${RM_NO_RCW:-0}" = 1 ] && echo Y || echo N) \
-		${RM_NO_RECSKIP:+rowmap_test_no_recskip=Y} || exit 1
+		${RM_NO_RECSKIP:+rowmap_test_no_recskip=Y} \
+		${RM_NO_CSUM_DROP:+csum_test_no_discard_drop=Y} "$@" || exit 1
 }
 
 members() {	# fill members with random bytes so unsynced parity is garbage
@@ -119,7 +128,7 @@ members() {	# fill members with random bytes so unsynced parity is garbage
 create() {	# create [extra mdadm options]
 	$MDADM --create $MD --level=raidkm --parity-count=2 --layout=rotating \
 		--raid-devices=$NMEM --chunk=$CHUNK --bitmap=${RM_BITMAP:-none} --row-map \
-		--run --force "$@" "${M[@]}" >$RK_DIR/rm-create.log 2>&1 || { cat $RK_DIR/rm-create.log; exit 1; }
+		${CSUM_OPT[@]} --run --force "$@" "${M[@]}" >$RK_DIR/rm-create.log 2>&1 || { cat $RK_DIR/rm-create.log; exit 1; }
 	idle
 }
 
@@ -151,6 +160,7 @@ verify_set() {	# verify_set <label>
 }
 
 echo "== row map test (negative control: ${RM_NO_RCW:-0})"
+mk0="raidkm-test-rowmap start $$.$(date +%s%N)"; echo "$mk0" > /dev/kmsg
 teardown; load; members; create
 ROWS=$(rm_get rows)
 echo "    rows $ROWS, map pages $(rm_get pages)"
@@ -383,6 +393,7 @@ if [ -z "$doff" ] || [ "$dsz" = 0 ]; then
 	$MDADM --examine "${M[0]}" | sed 's/^/    /'
 else
 	a=$((doff + dsz)); len=$((p16 * 8)); D=()
+	[ "${RM_CSUM:-0}" = 1 ] && a=$((a + $(csum_reserve $dsz)))	# after the CRC region
 	for i in "${!M[@]}"; do
 		tot=$(blockdev --getsz "${M[$i]}"); n=rm16_$i
 		printf '%s\n' "0 $a linear ${M[$i]} 0" \
@@ -418,6 +429,86 @@ else
 	fi
 	$MDADM --stop $MD >/dev/null 2>&1
 	dm_off
+fi
+
+if [ "${RM_CSUM:-0}" = 1 ]; then
+# T1-T16 corrupt no data: with --checksum any mismatch so far is a stale or
+# missing CRC (or a CRC region overlapping the row map)
+n=$(dmesg | sed -n "/$mk0/,\$p" | grep -c "native csum mismatch")
+[ "$n" = 0 ] && pass "T1-T16 with --checksum: no csum mismatch" || fail "T1-T16 with --checksum: $n csum mismatch(es)"
+# members start as random bytes: mdadm zeroes the CRC region at create, so
+# no page of it loads as damaged
+n=$(dmesg | sed -n "/$mk0/,\$p" | grep -c "native csum region page rotted")
+[ "$n" = 0 ] && pass "T1-T16 with --checksum: the CRC region starts zeroed (no rotted page)" || fail "T1-T16 with --checksum: $n rotted region page(s)"
+# T17 native checksums and member discards.  Members that take a discard
+# read the trimmed blocks back as zeroes, so the CRCs of those blocks must
+# be off the region -- on disk, before the discard goes out: the region is
+# written back lazily, and a resync skips U rows, so nothing would
+# re-derive them after a crash.  Stale ones false-mismatch on every later
+# read of the rows and on the reconstruct-write a partial write into them
+# does.  The neighbouring rows keep theirs, and a block written after that
+# has its CRC (rot is caught).
+teardown; load devices_handle_discard_safely=Y; members; create
+if [ "$(rm_get member_discard)" != 1 ]; then
+	fail "T17 member_discard $(rm_get member_discard) with devices_handle_discard_safely=Y"
+else
+R=100; NR=64; C2=$((CHUNK * 2)); NB=$((C2 / 8))	# rows R..R+63; a chunk in sectors, 4K blocks
+b0=$((R * NB)); nb=$((NR * NB))			# their blocks on every member: 3 region pages
+mk17="raidkm-test-rowmap T17 $$.$(date +%s%N)"; echo "$mk17" > /dev/kmsg
+mm17() { dmesg | sed -n "/$mk17/,\$p" | grep -c "native csum mismatch"; }
+nz() {	# nz <member> <blk> <n>: slots of blocks blk..blk+n-1 holding a CRC, on disk
+	local d=$1 b=$2 n=$3 p base=$(( (doff + dsz) / 8 ))
+	for p in $(seq $((b / 1022)) $(((b + n - 1) / 1022))); do
+		dd if=$d bs=4096 skip=$((base + p)) count=1 iflag=direct status=none | od -An -v -tu4 -w4 |
+			awk -v lo=$((b - p * 1022)) -v hi=$((b + n - 1 - p * 1022)) \
+				'NR - 1 >= lo && NR - 1 <= hi && NR <= 1022 && $1 != 0 {c++} END {print c + 0}'
+	done | awk '{s += $1} END {print s + 0}'
+}
+dsz=$(( $(cat /sys/block/$MDN/md/component_size) * 2 ))
+doff=$($MDADM --examine "${M[0]}" | awk '/Data Offset/ {print $4}')
+z=0; for d in "${M[@]}"; do z=$((z + $(nz $d $b0 $nb))); done
+[ $z = 0 ] && pass "T17 a new array's CRC region is zeroed over random members" || fail "T17 $z non-zero slots in a new array's CRC region"
+wr $(((R - 1) * ROW)) $(((NR + 2) * ROW)) s17		# whole rows, a neighbour each side
+$MDADM --stop $MD >/dev/null				# the CRCs go to the region
+$MDADM --assemble $MD "${M[@]}" >/dev/null 2>&1; idle
+[ "$(nz ${M[0]} $b0 $nb)" = $nb ] && pass "T17 the rows' CRCs are on disk" || fail "T17 $(nz ${M[0]} $b0 $nb) of $nb CRCs on disk before the discard"
+u0=$(rm_get unwritten)
+blkdiscard -o $((R * ROW)) -l $((NR * ROW)) $MD
+[ "$(rm_get unwritten)" = $((u0 + NR)) ] && pass "T17 $NR discarded rows are U" || fail "T17 unwritten $u0 -> $(rm_get unwritten)"
+z=0; k=0
+for d in "${M[@]}"; do					# the array still runs: nothing flushed since
+	z=$((z + $(nz $d $b0 $nb)))
+	k=$((k + $(nz $d $((b0 - NB)) $NB) + $(nz $d $((b0 + nb)) $NB)))
+done
+[ $z = 0 ] && pass "T17 the trimmed rows' CRCs are off every member's disk" || fail "T17 $z CRCs of trimmed blocks still on disk"
+[ $k = $((2 * NB * NMEM)) ] && pass "T17 the neighbouring rows keep theirs" || fail "T17 neighbours: $k of $((2 * NB * NMEM)) CRCs"
+dd if=$MD of=/dev/null bs=1M skip=$R count=$NR iflag=direct status=none && \
+	[ "$(mm17)" = 0 ] && pass "T17 reads of the trimmed rows check no stale CRC" || fail "T17 trimmed rows: $(mm17) mismatch(es)"
+P=$((R * ROW + 2 * CHUNK * 1024 + 8192))		# 4K in row R's 3rd data chunk
+wr $P 4096 p17						# U -> N: reconstruct-write reads the rest
+dd if=$MD of=/dev/null bs=1M skip=$R count=1 iflag=direct status=none
+[ "$(rd $P 4096)" = "$(expect 0 4096 p17)" ] && pass "T17 the 4K written into a U row reads back" || fail "T17 4K piece wrong"
+[ "$(mm17)" = 0 ] && pass "T17 no stale CRC checked after the row left U" || fail "T17 $(mm17) mismatch(es) after the row left U"
+[ "$(rm_get needsync)" -ge 1 ] || fail "T17 row $R not N"
+# the new block's own CRC is there: rot on its member is caught and healed
+$MDADM --stop $MD >/dev/null
+want=$(expect 0 4096 p17); hit=""
+for d in "${M[@]}"; do
+	for o in $(seq 0 $((C2 / 8 - 1))); do	# the member and the 4K slot within its chunk
+		[ "$(dd if=$d bs=4096 skip=$(( (doff + R * C2) / 8 + o )) count=1 iflag=direct status=none | md5sum | cut -c1-32)" = "$want" ] && { hit="$d $o"; break 2; }
+	done
+done
+if [ -z "$hit" ]; then
+	fail "T17 the written 4K is on no member"
+else
+	read d o <<<"$hit"
+	dd if=/dev/urandom of=$d bs=4096 seek=$(( (doff + R * C2) / 8 + o )) count=1 oflag=direct conv=notrunc status=none
+	$MDADM --assemble $MD "${M[@]}" >/dev/null 2>&1; idle
+	m0=$(mm17)
+	[ "$(rd $P 4096)" = "$want" ] && pass "T17 rot in the new block: original bytes back" || fail "T17 rot in the new block not healed"
+	[ "$(mm17)" -gt "$m0" ] && pass "T17 its CRC caught the rot" || fail "T17 no mismatch on a rotted block with a CRC"
+fi
+fi
 fi
 
 dmesg | grep -E "BUG|WARNING|Oops|KASAN" | tail -5

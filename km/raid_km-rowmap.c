@@ -769,11 +769,11 @@ int raidkm_rowmap_init(struct r5conf *conf)
 	struct raidkm_rowmap *rm;
 	struct md_rdev *rdev;
 
-	if (conf->csum || raid5_has_log(conf) ||
+	if (raid5_has_log(conf) ||
 	    raid5_has_ppl(conf) || test_bit(MD_HAS_JOURNAL, &mddev->flags) ||
 	    test_bit(MD_HAS_PPL, &mddev->flags) ||
 	    mddev->reshape_position != MaxSector) {
-		pr_err("md/raid:%s: row map: not supported with native checksums, a journal/PPL or a reshape\n",
+		pr_err("md/raid:%s: row map: not supported with a journal/PPL or a reshape\n",
 		       mdname(mddev));
 		return -EINVAL;
 	}
@@ -788,8 +788,12 @@ int raidkm_rowmap_init(struct r5conf *conf)
 	rm->nrows = div_u64(mddev->dev_sectors, conf->chunk_sectors);
 	rm->npages = DIV_ROUND_UP_ULL(rm->nrows, RK_RM_ROWS_PER_PAGE);
 	/* after the data; declustered: after the rkdcl chunk, which sits
-	 * at dev_sectors (raidkm_csum_region() makes the same step) */
+	 * at dev_sectors (raidkm_csum_region() makes the same step); with
+	 * native checksums after their region, which then has a fixed size
+	 * (raidkm_csum_reserve_sectors(), mdadm rkrm_off1() the same) */
 	rm->region = mddev->dev_sectors + (conf->dcl ? conf->chunk_sectors : 0);
+	if (raidkm_layout_has_csum(mddev->new_layout))
+		rm->region += raidkm_csum_reserve_sectors(mddev->dev_sectors);
 	rm->id = crc32c(0, mddev->uuid, sizeof(mddev->uuid));
 
 	rdev_for_each(rdev, mddev) {

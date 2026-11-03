@@ -1306,6 +1306,20 @@ static inline bool is_raidkm(struct r5conf *conf)
 	return conf->level == RAID_KM_LEVEL;
 }
 
+/*
+ * The native checksum region's size when the row map follows it (mdadm
+ * super1.c computes the same): one 4-byte slot per 4 KiB block of the member
+ * data, 1022 slots per 4 KiB page (RAIDKM_CSUM_PER_PAGE at 4 KiB pages),
+ * rounded up to 64 KiB so a 64 KiB-page kernel's region (16382 slots per
+ * page) fits too.  Without the row map the region runs to the device end.
+ */
+static inline sector_t raidkm_csum_reserve_sectors(sector_t dev_sectors)
+{
+	u64 pages = DIV_ROUND_UP_ULL((u64)dev_sectors >> 3, 1022);
+
+	return round_up(pages * 8, 128);
+}
+
 /* Data chunks in one device row (one chunk of every member): k on the
  * classic layouts, every group's k on a declustered pool (its spare
  * columns hold none).  The capacity, the row map's row and the snapshot

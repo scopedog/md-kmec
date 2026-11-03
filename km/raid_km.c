@@ -2237,6 +2237,12 @@ struct raidkm_csum_cache {
 					 * them (each holds a read AND a count
 					 * raid5_quiesce waits on) */
 	unsigned int		nr_shards;
+	/* raidkm_csum_drop_rows(): one at a time; while it runs, a page
+	 * faulted in gets the slots of blocks [drop_b0, drop_b1) cleared
+	 * (the disk may still hold them until the drop's writes land) */
+	struct mutex		drop_mutex;
+	spinlock_t		drop_lock;	/* the pair, read and set */
+	unsigned long		drop_b0, drop_b1;
 	struct raidkm_csum_shard shards[];	/* flexible: nr_shards of them */
 };
 
@@ -2322,6 +2328,11 @@ static bool raidkm_csum_region(struct r5conf *conf, struct md_rdev *rdev,
 		return false;
 	*start = region;
 	*sectors = dev - region;
+	/* with the row map the region has a fixed size, and the row map
+	 * (then the snapshot metadata) follows it: never past it */
+	if (conf->mddev->new_layout & RAIDKM_LAYOUT_ROWMAP)
+		*sectors = min_t(sector_t, *sectors,
+				 raidkm_csum_reserve_sectors(conf->mddev->dev_sectors));
 	return true;
 }
 
@@ -2385,7 +2396,7 @@ static bool raidkm_csum_page_read(struct r5conf *conf, int m,
  * (eviction re-checks DIRTY under slock and keeps a re-dirtied page).  The
  * snapshot (shard bounce page; caller holds s->lock) lets sync_page_io run
  * unlocked and gives the trailer a stable image to cover. */
-static void raidkm_csum_page_flush(struct raidkm_csum_shard *s,
+static bool raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 				   struct raidkm_csum_page *pg)
 {
 	struct r5conf *conf = s->cache->conf;
@@ -2395,11 +2406,12 @@ static void raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 	sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
 	struct raidkm_csum_trailer *tr;
 	void *crcs;
+	bool ok;
 	u32 g;
 
 	if (!conf->csum_disk || !rdev || test_bit(Faulty, &rdev->flags)) {
 		clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
-		return;
+		return true;
 	}
 	/* pin across the (sleeping) region write -- see raidkm_csum_page_read */
 	atomic_inc(&rdev->nr_pending);
@@ -2407,7 +2419,7 @@ static void raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 	    off + (PAGE_SIZE >> 9) > rsec) {		/* past region end */
 		rdev_dec_pending(rdev, conf->mddev);
 		clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
-		return;
+		return true;
 	}
 	spin_lock(&pg->slock);
 	clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
@@ -2422,11 +2434,13 @@ static void raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 	conf->csum_gen = g;
 	tr->gen = cpu_to_le32(g);
 	tr->self_crc = cpu_to_le32(crc32c_le(0, crcs, RAIDKM_CSUM_BODY));
-	if (!sync_page_io(rdev, (rstart - rdev->data_offset) + off, PAGE_SIZE,
-			  s->bounce, REQ_OP_WRITE | REQ_FUA, false))
+	ok = sync_page_io(rdev, (rstart - rdev->data_offset) + off, PAGE_SIZE,
+			  s->bounce, REQ_OP_WRITE | REQ_FUA, false);
+	if (!ok)
 		pr_warn_ratelimited("md/raid:%s: native csum page write failed disk %d\n",
 				    mdname(conf->mddev), m);
 	rdev_dec_pending(rdev, conf->mddev);
+	return ok;
 }
 
 static void raidkm_csum_page_free(struct raidkm_csum_page *pg)
@@ -2503,6 +2517,26 @@ static void raidkm_csum_evict_locked(struct raidkm_csum_shard *s)
 	}
 }
 
+/* Clear, in the page image @crcs of region page @key, the slots of the
+ * blocks a raidkm_csum_drop_rows() in progress drops: the disk may still
+ * hold their old CRCs.  Caller holds the page's shard lock (the drop sets
+ * the range before it takes any shard lock, clears it after its writes). */
+static void raidkm_csum_drop_range_locked(struct raidkm_csum_cache *c,
+					  unsigned long key, __le32 *crcs)
+{
+	unsigned long p0 = (key & ((1UL << 40) - 1)) * RAIDKM_CSUM_PER_PAGE;
+	unsigned long b0, b1, lo, hi;
+
+	spin_lock(&c->drop_lock);
+	b0 = c->drop_b0;
+	b1 = c->drop_b1;
+	spin_unlock(&c->drop_lock);
+	lo = max(b0, p0);
+	hi = min(b1, p0 + RAIDKM_CSUM_PER_PAGE);
+	if (lo < hi)
+		memset(&crcs[lo - p0], 0, (hi - lo) * sizeof(*crcs));
+}
+
 /* Return the resident region page for `key`, faulting it in on a miss.  NULL on
  * OOM (caller skips verify/store).  BLOCKING; caller holds s->lock. */
 static struct raidkm_csum_page *raidkm_csum_get(struct raidkm_csum_shard *s,
@@ -2551,6 +2585,7 @@ static struct raidkm_csum_page *raidkm_csum_get(struct raidkm_csum_shard *s,
 			clear_page(crcs);
 			set_bit(RAIDKM_CSUM_P_REBUILD, &pg->flags);
 		}
+		raidkm_csum_drop_range_locked(s->cache, key, crcs);
 	} else {
 		clear_page(page_address(pg->page));	/* in-core only */
 	}
@@ -2698,6 +2733,185 @@ static void raidkm_csum_store(struct r5conf *conf, int member,
 	queue_work(c->wq, &s->work);
 }
 
+/* read-only: this module takes native checksums together with the row map
+ * (and snapshots).  mdadm --create looks for it before it writes members. */
+static bool rowmap_csum = true;
+module_param(rowmap_csum, bool, 0444);
+MODULE_PARM_DESC(rowmap_csum,
+		 "read-only: native checksums (--checksum) work with the row map (--row-map, --snapshots)");
+
+/* testing only: let member discards go out with the CRCs of the trimmed
+ * blocks still in place, to show the suite catches the false mismatches */
+static bool csum_test_no_discard_drop;
+module_param(csum_test_no_discard_drop, bool, 0644);
+MODULE_PARM_DESC(csum_test_no_discard_drop,
+		 "TESTING ONLY: do not drop the native CRCs of blocks the members are sent a discard for");
+
+/*
+ * Native checksums, discard: the members are about to be sent a discard of
+ * device rows [first_row, last_row) (one chunk of every member each), after
+ * which the blocks read back as zeroes.  Their CRCs go first, and on disk,
+ * not just in the cache: the region is written back lazily, so a crash would
+ * leave the old CRCs over the trimmed blocks, and with the row map nothing
+ * re-derives them (a resync skips U rows).  On every present member: the
+ * resident pages' slots and the parked stores of those blocks are cleared,
+ * the whole region pages in the range are zeroed on disk (generation 0:
+ * never written), and the partial pages at its ends are rewritten.
+ *
+ * Sleeps on region I/O, so it runs on a workqueue (raidkm_csum_drop_rows()
+ * below).  False: a member's region could not be written, and the caller
+ * must not send the discard down (the slots cleared so far only skip
+ * verify: the safe direction).  A write that races the discard on the same
+ * blocks may store a CRC the trim then invalidates; a write and a discard
+ * of one block at once have no defined result anyway.
+ */
+static bool raidkm_csum_drop_rows_io(struct r5conf *conf, u64 first_row,
+				     u64 last_row)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	unsigned long nb = conf->chunk_sectors >> RAID5_STRIPE_SHIFT(conf);
+	unsigned long pp = RAIDKM_CSUM_PER_PAGE, ps = PAGE_SIZE >> 9;
+	unsigned long b0 = first_row * nb, b1 = last_row * nb;
+	/* pages touched [p0, p1), of them whole [f0, f1) */
+	unsigned long p0 = b0 / pp, p1 = DIV_ROUND_UP(b1, pp);
+	unsigned long f0 = DIV_ROUND_UP(b0, pp), f1 = b1 / pp;
+	bool ok = true;
+	unsigned int i;
+	int m;
+
+	if (!c || first_row >= last_row)
+		return true;
+	mutex_lock(&c->drop_mutex);
+	spin_lock(&c->drop_lock);
+	c->drop_b0 = b0;
+	c->drop_b1 = b1;
+	spin_unlock(&c->drop_lock);
+
+	/* in core; a page faulted in from here on clears the range itself */
+	for (i = 0; i < c->nr_shards; i++) {
+		struct raidkm_csum_shard *s = &c->shards[i];
+		struct raidkm_csum_page *pg;
+		unsigned long k;
+		bool woke = false;
+		void *e;
+
+		mutex_lock(&s->lock);
+		for (m = 0; m < conf->raid_disks; m++) {
+			unsigned long mk = (unsigned long)m << 40;
+
+			xa_for_each_range(&s->pages, k, pg, mk + p0,
+					  mk + p1 - 1) {
+				spin_lock(&pg->slock);
+				raidkm_csum_drop_range_locked(c, k,
+						page_address(pg->page));
+				spin_unlock(&pg->slock);
+			}
+			xa_for_each_range(&s->pending, k, e, mk + b0,
+					  mk + b1 - 1) {
+				if (xa_erase(&s->pending, k)) {
+					atomic_dec(&s->pending_nr);
+					woke = true;
+				}
+			}
+		}
+		mutex_unlock(&s->lock);
+		if (woke)
+			wake_up(&s->pending_waitq);
+	}
+
+	/* on disk */
+	for (m = 0; conf->csum_disk && m < conf->raid_disks; m++) {
+		struct md_rdev *rdev = conf->disks[m].rdev;
+		unsigned long mk = (unsigned long)m << 40, p, np, ends[2];
+		sector_t rstart, rsec;
+		int j;
+
+		if (!rdev || test_bit(Faulty, &rdev->flags))
+			continue;
+		atomic_inc(&rdev->nr_pending);	/* see raidkm_csum_page_read */
+		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec)) {
+			rdev_dec_pending(rdev, conf->mddev);
+			continue;		/* no region: in core only */
+		}
+		np = rsec / ps;
+		if (min(f1, np) > f0 &&
+		    (blkdev_issue_zeroout(rdev->bdev, rstart + f0 * ps,
+					  (min(f1, np) - f0) * ps, GFP_NOIO, 0) ||
+		     blkdev_issue_flush(rdev->bdev)))
+			ok = false;
+		rdev_dec_pending(rdev, conf->mddev);
+
+		/* the partial pages at the ends: read, clear, write (FUA) */
+		ends[0] = p0 < f0 || f0 >= f1 ? p0 : ULONG_MAX;
+		ends[1] = p1 - 1 >= f1 && p1 - 1 != ends[0] ? p1 - 1 : ULONG_MAX;
+		for (j = 0; j < 2; j++) {
+			struct raidkm_csum_shard *s;
+			struct raidkm_csum_page *pg;
+
+			p = ends[j];
+			if (p == ULONG_MAX || p >= np)
+				continue;
+			s = &c->shards[p % c->nr_shards];
+			mutex_lock(&s->lock);
+			pg = raidkm_csum_get(s, mk | p);	/* clears on fault */
+			if (pg) {
+				spin_lock(&pg->slock);
+				raidkm_csum_drop_range_locked(c, mk | p,
+						page_address(pg->page));
+				set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+				spin_unlock(&pg->slock);
+				if (!raidkm_csum_page_flush(s, pg))
+					ok = false;
+			} else {
+				ok = false;
+			}
+			mutex_unlock(&s->lock);
+		}
+	}
+
+	spin_lock(&c->drop_lock);
+	c->drop_b0 = c->drop_b1 = 0;
+	spin_unlock(&c->drop_lock);
+	mutex_unlock(&c->drop_mutex);
+	return ok;
+}
+
+struct raidkm_csum_drop_work {
+	struct work_struct	work;
+	struct r5conf		*conf;
+	u64			first_row, last_row;
+	bool			ok;
+};
+
+static void raidkm_csum_drop_fn(struct work_struct *w)
+{
+	struct raidkm_csum_drop_work *d =
+		container_of(w, struct raidkm_csum_drop_work, work);
+
+	d->ok = raidkm_csum_drop_rows_io(d->conf, d->first_row, d->last_row);
+}
+
+/* The discard path is inside submit_bio (raid5_make_request): bios issued
+ * from here sit on current->bio_list until it returns, so waiting on region
+ * I/O here would never end.  The drop runs on the csum bypass workqueue
+ * (WQ_MEM_RECLAIM, not the shard workers it takes the locks of) and the
+ * discard waits for it. */
+static bool raidkm_csum_drop_rows(struct r5conf *conf, u64 first_row,
+				  u64 last_row)
+{
+	struct raidkm_csum_drop_work d = {
+		.conf = conf, .first_row = first_row, .last_row = last_row,
+	};
+
+	if (!conf->csum || first_row >= last_row)
+		return true;
+	INIT_WORK_ONSTACK(&d.work, raidkm_csum_drop_fn);
+	queue_work(conf->csum->abio_wq, &d.work);
+	flush_work(&d.work);
+	destroy_work_on_stack(&d.work);
+	return d.ok;
+}
+
 /* Verify one stripe's R5_CsumPending blocks (workqueue, sleepable).  Blocks
  * that could not be verified inline at completion land here: the tag fetch may
  * block, and this pass doubles as the RECHECK for an inline mismatch (under
@@ -2793,6 +3007,14 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 			struct raidkm_csum_page *pg;
 
 			mutex_lock(&s->lock);
+			/* still parked?  raidkm_csum_drop_rows() erases
+			 * entries under this lock: landing one it erased
+			 * would put a dropped CRC back */
+			if (xa_load(&s->pending, idx) != e) {
+				mutex_unlock(&s->lock);
+				did = true;
+				continue;
+			}
 			pg = raidkm_csum_get(s, raidkm_csum_key(member, blk));
 			if (pg) {
 				spin_lock(&pg->slock);
@@ -2939,6 +3161,8 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 		return NULL;
 	c->conf = conf;
 	c->nr_shards = nsh;
+	mutex_init(&c->drop_mutex);
+	spin_lock_init(&c->drop_lock);
 	/* split the total soft ceiling across shards (>=16 each so tiny caches work) */
 	per = max(max(total, 64u) / nsh, 16u);
 	for (i = 0; i < nsh; i++) {
@@ -13379,6 +13603,7 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 	struct stripe_head *sh;
 	struct bvec_iter bi_iter;
 	struct bio *orig_bi = bi;
+	bool pass_down;
 	int stripe_sectors;
 
 	/*
@@ -13411,12 +13636,33 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 
 	/* row map: whole rows discarded are U (content undefined), and the
 	 * members see the discard only when they can take one */
-	if (conf->rowmap) {
+	pass_down = !conf->rowmap || conf->rowmap->member_discard;
+	if (conf->rowmap)
 		raidkm_rowmap_note_discard(conf, first_stripe, last_stripe);
-		if (!conf->rowmap->member_discard) {
-			bio_endio(bi);
-			return;
-		}
+
+	/*
+	 * Native checksums: the CRCs of the blocks the members are about to
+	 * trim go first, on disk.  Not while a sync, rebuild or check runs:
+	 * one already in these rows stores their CRCs again (rederive, a
+	 * repaired parity, a rebuilt chunk) while it holds their stripes,
+	 * which can be after the drop -- the loop below only waits for it to
+	 * let go.  One that starts after the test sees the rows U (above)
+	 * and skips them; with no row map there are no U rows, but nothing
+	 * trims while one runs either.  The discard is a hint: the members
+	 * just do not get it.  Nor when the drop fails.
+	 */
+	if (pass_down && conf->csum) {
+		smp_mb();	/* the U states before the test */
+		if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+			pass_down = false;
+		else if (!csum_test_no_discard_drop &&
+			 !raidkm_csum_drop_rows(conf, first_stripe,
+						last_stripe))
+			pass_down = false;
+	}
+	if (!pass_down) {
+		bio_endio(bi);
+		return;
 	}
 
 	/*

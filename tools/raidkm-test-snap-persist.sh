@@ -37,6 +37,8 @@ rk_modload() {	# rk_modload <ko path> <module> [params...]
 }
 MD=/dev/md70; MDN=md70
 NMEM=10; MEMSZ=64		# MiB
+# SNAP_CSUM=1: the arrays also get native checksums (--checksum)
+CSUM_OPT=(); [ "${SNAP_CSUM:-0}" = 1 ] && CSUM_OPT=(--checksum)
 ROW=$((1024 * 1024))
 CHUNK=$((128 * 1024))
 LAYOUT=(--layout=rotating); DCL_SECT=0; DCL_NAME=
@@ -165,7 +167,7 @@ members
 if [ -n "${SNAP_DCL:-}" ]; then
 	$MDADM --create $MD --level=raidkm --parity-count=2 "${LAYOUT[@]}" \
 		--raid-devices=$NMEM --chunk=$(( CHUNK / 1024 )) --bitmap=none --row-map \
-		--run --force "${M[@]}" >$RK_DIR/sn-create0.log 2>&1 || { cat $RK_DIR/sn-create0.log; exit 1; }
+		"${CSUM_OPT[@]}" --run --force "${M[@]}" >$RK_DIR/sn-create0.log 2>&1 || { cat $RK_DIR/sn-create0.log; exit 1; }
 	idle
 	[ "$(cat /sys/block/$MDN/queue/optimal_io_size)" = $ROW ] && \
 		[ "$(cat /sys/block/$MDN/queue/chunk_sectors)" = $(( ROW / 512 )) -o $ROW -gt $((1024 * 1024)) ] && \
@@ -182,7 +184,7 @@ fi
 
 $MDADM --create $MD --level=raidkm --parity-count=2 "${LAYOUT[@]}" \
 	--raid-devices=$NMEM --chunk=$(( CHUNK / 1024 )) --bitmap=none --snapshots=20 \
-	--run --force "${M[@]}" >$RK_DIR/sn-create.log 2>&1 || { cat $RK_DIR/sn-create.log; exit 1; }
+	"${CSUM_OPT[@]}" --run --force "${M[@]}" >$RK_DIR/sn-create.log 2>&1 || { cat $RK_DIR/sn-create.log; exit 1; }
 idle
 
 # T1 the array exports the origin only
@@ -312,7 +314,10 @@ $MDADM --stop $MD >/dev/null
 DO=$($MDADM --examine "${M[5]}" | awk '/Data Offset/ {print $4}')
 [ -n "$DO" ] && [ "$SZ" -gt 0 ] || fail "T8 region offset (data offset '$DO', size '$SZ')"
 ROWS=$(( SZ / 256 )); RMP=$(( (ROWS + 16319) / 16320 ))
-SNOFF=$(( (DO + SZ + DCL_SECT) / 8 + RMP ))	# 4 KiB page of the region's start
+# with --checksum the CRC region sits before the row map (km
+# raidkm_csum_reserve_sectors(): a slot per 4K, 1022 per page, 64 KiB-rounded)
+CSR=0; [ "${SNAP_CSUM:-0}" = 1 ] && CSR=$(( ( (SZ / 8 + 1021) / 1022 * 8 + 127) / 128 * 128 ))
+SNOFF=$(( (DO + SZ + DCL_SECT + CSR) / 8 + RMP ))	# 4 KiB page of the region's start
 NRM=$(( (ROWS + 509) / 510 )); NPM=$(( (NRM + 4079) / 4080 ))
 # header, table and pmap copies: the seed's and the stop's checkpoints write
 # both copies of each to every member.  (Not the rmap slots: the slot a page
@@ -419,7 +424,7 @@ if [ -n "${SNAP_DCL:-}" ]; then
 	r5=$(regmd5 "${M[5]}")
 	[ "$(regmd5 "$SPARE")" = "$r5" ] && pass "T13 the new disk holds the same snapshot metadata" || \
 		fail "T13 metadata on $SPARE $(regmd5 "$SPARE"), others $r5"
-	RMOFF=$(( (DO + SZ + DCL_SECT) / 8 ))
+	RMOFF=$(( (DO + SZ + DCL_SECT + CSR) / 8 ))	# past the CRC region with --checksum
 	rmmd5() { dd if="$1" bs=4096 skip=$RMOFF count=$RMP status=none | md5sum | cut -c1-32; }
 	[ "$(rmmd5 "$SPARE")" = "$(rmmd5 "${M[5]}")" ] && pass "T13 and the same row map" || \
 		fail "T13 row map on $SPARE differs"
@@ -433,6 +438,12 @@ fi
 
 dmesg | grep -qE "WARNING|BUG|Oops|inconsistent" && fail "kernel warnings (dmesg)" || pass "no kernel warnings"
 teardown	# before the verdict: a tmpfs that will not unmount is a FAIL
+# with --checksum no test here corrupts data: any mismatch is a stale or
+# missing CRC (the dmesg ring was cleared at the start)
+if [ "${SNAP_CSUM:-0}" = 1 ]; then
+	n=$(dmesg | grep -c "native csum mismatch")
+	[ "$n" = 0 ] && pass "no native csum mismatch" || fail "$n native csum mismatch(es)"
+fi
 echo "RESULT pass=$PASS fail=$FAIL"
 echo "==== snap-persist: $PASS passed, $FAIL failed ===="
 [ "$FAIL" = 0 ]
