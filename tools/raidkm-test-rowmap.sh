@@ -159,6 +159,17 @@ echo "    rows $ROWS, map pages $(rm_get pages)"
 [ "$(rm_get unwritten)" = "$ROWS" ] && pass "T1 new array all unwritten ($ROWS)" || fail "T1 unwritten $(rm_get unwritten) of $ROWS"
 [ "$(rm_get skipped_rows)" -ge "$ROWS" ] && pass "T1 initial resync skipped every row" || fail "T1 skipped_rows $(rm_get skipped_rows)"
 
+# T1b an array without --snapshots: every mdadm --snapshot op exits 22 (how
+# callers such as snapshot tools check support before they freeze anything)
+if grep -qa -- "--checkpoint" "$MDADM"; then
+	bad=""
+	for op in "--list" "--list --export" "--exists x" "--create x" "--destroy x" "--checkpoint"; do
+		$MDADM --snapshot $MD $op >/dev/null 2>&1; rc=$?
+		[ $rc = 22 ] || bad="$bad [$op]=$rc"
+	done
+	[ -z "$bad" ] && pass "T1b --snapshot ops exit 22 without --snapshots" || fail "T1b exit codes:$bad"
+fi
+
 # T2 partial writes -> N, whole rows -> W
 write_set
 [ "$(rm_get needsync)" = 40 ] && pass "T2 40 rows needsync" || fail "T2 needsync $(rm_get needsync)"

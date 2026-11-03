@@ -1629,7 +1629,9 @@ writes in flight, takes the snapshot and thaws it.
 
 Names are `[A-Za-z0-9._-]`, 1–63 characters; attributes are `key=value`
 pairs, up to 1 KiB per snapshot.  Exit codes: 0 ok, 1 no such snapshot,
-16 busy, 17 exists, 22 bad argument, 5 anything else.
+16 busy, 17 exists, 22 bad argument, 5 anything else.  On an array made
+without `--snapshots` every operation, `--list` and `--exists` included,
+exits 22: that is how a script checks for snapshot support.
 
 ```sh
 mdadm --snapshot /dev/md70 --create nightly-1 --attr owner=ops
