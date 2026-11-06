@@ -1225,6 +1225,9 @@ md-kmec/
 │   ├── raidkm-test-csum-thrash.sh     # native-checksum region-cache eviction round-trip
 │   ├── raidkm-test-row-dread-wide.sh  # degraded span read once per row (unaligned, races, dcl)
 │   ├── raidkm-test-row-csum.sh        # native checksum through the row paths (poisoned survivors refused)
+│   ├── raidkm-test-gtc-swap.sh        # group_thread_cnt / worker_thread_cnt written under resync + I/O
+│   │                                    # (a field-reported crash; G3 deterministic on a fault-inject build)
+│   ├── raidkm-test-nowait.sh          # io_uring 1 MiB O_DIRECT reads keep up with 2 MiB / libaio (needs fio)
 │   ├── raidkm-test-declustered-populate-window.sh  # population backpressure window, pause + retry
 │   ├── raidkm-test-declustered-row-transitions.sh  # the row layer across spare-assignment
 │   │                                    # transitions: off while POPULATING/COPYING, live while

@@ -17999,21 +17999,53 @@ static int handle_active_stripes(struct r5conf *conf, int group,
 	return batch_size;
 }
 
+#ifdef RAIDKM_FAULT_INJECT
+/* testing only: hold each worker before it looks at its group, so work
+ * queued before a worker-group swap is still running across it
+ * (raidkm-test-gtc-swap.sh G3).  Fault-inject builds only: no sleep in the
+ * stripe-worker path of a production module. */
+static unsigned int gtc_test_work_delay_ms;
+module_param(gtc_test_work_delay_ms, uint, 0644);
+MODULE_PARM_DESC(gtc_test_work_delay_ms,
+		 "TESTING ONLY: delay each stripe worker this many ms before it handles stripes");
+#endif
+
 static void raid5_do_work(struct work_struct *work)
 {
 	struct r5worker *worker = container_of(work, struct r5worker, work);
 	struct r5worker_group *group = worker->group;
 	struct r5conf *conf = group->conf;
 	struct mddev *mddev = conf->mddev;
-	int group_id = group - conf->worker_groups;
+	int group_id;
 	int handled;
 	struct blk_plug plug;
 
 	pr_debug("+++ raid5worker active\n");
 
+#ifdef RAIDKM_FAULT_INJECT
+	{
+		unsigned int delay_ms = READ_ONCE(gtc_test_work_delay_ms);
+
+		if (unlikely(delay_ms))
+			msleep(delay_ms);
+	}
+#endif
 	blk_start_plug(&plug);
 	handled = 0;
 	spin_lock_irq(&conf->device_lock);
+	/* a worker of groups that were swapped out (raidkm_swap_worker_groups
+	 * flushes before the swap, so this is a backstop): it took its index
+	 * as group - conf->worker_groups, against the new array -- wild
+	 * (a field-reported crash).  The index is the group's own, checked against the
+	 * array now published. */
+	group_id = group->index;
+	if (WARN_ON_ONCE(group_id < 0 || group_id >= conf->group_cnt ||
+			 conf->worker_groups + group_id != group)) {
+		worker->working = false;
+		spin_unlock_irq(&conf->device_lock);
+		blk_finish_plug(&plug);
+		return;
+	}
 	while (1) {
 		int batch_size, released;
 
@@ -19086,13 +19118,73 @@ raid5_show_group_thread_cnt(struct mddev *mddev, char *page)
 static int alloc_thread_groups(struct r5conf *conf, int cnt,
 			       int *group_cnt,
 			       struct r5worker_group **worker_groups);
+static void free_worker_groups(struct r5worker_group *groups, int group_cnt);
+
+/*
+ * Replace conf->worker_groups (group_thread_cnt, worker_thread_cnt).  Caller
+ * holds mddev_suspend_and_lock().
+ *
+ * raid5_quiesce() first: since 6.12 mddev_suspend() drains active_io only and
+ * no longer calls pers->quiesce, so an in-flight sync/check -- which holds
+ * no active_io reference -- keeps queueing stripes on the worker-group
+ * lists; the swap would strand them (permanently active: the stripe cache
+ * runs dry and raid5_get_active_stripe() deadlocks).  raid5_quiesce() parks
+ * the sync thread and waits for active_stripes == 0.
+ *
+ * Then flush raidkmwq WHILE THE OLD GROUPS ARE STILL PUBLISHED.
+ * active_stripes == 0 does not mean no work is pending: each
+ * raid5_wakeup_stripe_thread() queues up to worker_cnt_per_group extra
+ * workers (128 by default) when a group's list grows -- a resync starting
+ * does that -- and those run later, finding nothing.  Run after the swap,
+ * such a worker computed its group index against the NEW array
+ * (raid5_do_work: group - conf->worker_groups), a wild index, and
+ * handle_active_stripes() took a list head from it: GPF (a field report: writing
+ * group_thread_cnt 128 -> 16 as the post-assemble resync started).  With
+ * the array quiesced nothing can queue new work, so after this flush no
+ * work refers to the old groups and the swap is safe.  (The flush AFTER the
+ * swap, 882132f, closed a wakeup-after-flush window that only existed
+ * without the quiesce; it stays as a backstop before the free: a rare
+ * sysfs write can afford the second wait.)
+ */
+#ifdef RAIDKM_FAULT_INJECT
+/* testing only (raidkm-test-gtc-swap.sh G3, GS_NEG=1): the order that crashed,
+ * swap before the drain.  Fault-inject builds only: on a production module
+ * it would let root switch the fix off. */
+static bool gtc_test_old_order;
+module_param(gtc_test_old_order, bool, 0644);
+MODULE_PARM_DESC(gtc_test_old_order,
+		 "TESTING ONLY: swap the worker groups before draining raidkmwq (the order that crashed)");
+#else
+#define gtc_test_old_order false
+#endif
+
+static void raidkm_swap_worker_groups(struct mddev *mddev, struct r5conf *conf,
+				      int per_group, int group_cnt,
+				      struct r5worker_group *new_groups)
+{
+	struct r5worker_group *old_groups = conf->worker_groups;
+	int old_cnt = conf->group_cnt;
+
+	raid5_quiesce(mddev, true);
+	if (!gtc_test_old_order)
+		flush_workqueue(raid5_wq);
+	spin_lock_irq(&conf->device_lock);
+	conf->group_cnt = group_cnt;
+	conf->worker_cnt_per_group = per_group;
+	conf->worker_groups = new_groups;
+	spin_unlock_irq(&conf->device_lock);
+	flush_workqueue(raid5_wq);
+	free_worker_groups(old_groups, old_cnt);
+	raid5_quiesce(mddev, false);
+}
+
 static ssize_t
 raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 {
 	struct r5conf *conf;
 	unsigned int new;
 	int err;
-	struct r5worker_group *new_groups, *old_groups;
+	struct r5worker_group *new_groups;
 	int group_cnt;
 
 	if (len >= PAGE_SIZE)
@@ -19112,61 +19204,10 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	if (!conf)
 		err = -ENODEV;
 	else if (new != conf->worker_cnt_per_group) {
-		old_groups = conf->worker_groups;
-
 		err = alloc_thread_groups(conf, new, &group_cnt, &new_groups);
-		if (!err) {
-			/*
-			 * Quiesce the stripe cache across the worker_groups
-			 * swap.  Since 6.12, mddev_suspend() only drains
-			 * active_io (normal bios) and no longer calls
-			 * pers->quiesce, so an in-flight sync/check -- which
-			 * holds no active_io reference -- keeps allocating
-			 * stripes onto conf->handle_list.  In worker-group mode
-			 * that list is never serviced, so without this drain the
-			 * swap would strand every stripe still queued there:
-			 * permanently active, never released, eventually
-			 * exhausting the cache and deadlocking
-			 * raid5_get_active_stripe().  raid5_quiesce() parks the
-			 * sync thread and waits for active_stripes == 0, so
-			 * conf->handle_list is provably empty at the swap.
-			 */
-			raid5_quiesce(mddev, true);
-			spin_lock_irq(&conf->device_lock);
-			conf->group_cnt = group_cnt;
-			conf->worker_cnt_per_group = new;
-			conf->worker_groups = new_groups;
-			spin_unlock_irq(&conf->device_lock);
-
-			if (old_groups) {
-				int node;
-
-				/*
-				 * Drain any worker still referencing the old
-				 * groups before freeing them.  new_groups is
-				 * already published above (under device_lock), so
-				 * raid5_wakeup_stripe_thread now queues only to
-				 * the new groups -- this flush is therefore the
-				 * point after which no work can touch the old
-				 * groups.  The previous code flushed *before* the
-				 * swap, leaving a window in which a wakeup that
-				 * had read the old worker_groups could queue work
-				 * to an old group after the flush; that worker
-				 * then ran after the free -- a use-after-free
-				 * that GP-faults in raid5_do_work
-				 * (worker->group->conf, non-canonical pointer).
-				 */
-				flush_workqueue(raid5_wq);
-
-				/* each node-ID slot owns its own workers
-				 * allocation (alloc_thread_groups sizes by
-				 * nr_node_ids); free them all, not just [0] */
-				for (node = 0; node < nr_node_ids; node++)
-					kfree(old_groups[node].workers);
-			}
-			kfree(old_groups);
-			raid5_quiesce(mddev, false);
-		}
+		if (!err)
+			raidkm_swap_worker_groups(mddev, conf, new, group_cnt,
+						  new_groups);
 	}
 	mddev_unlock_and_resume(mddev);
 
@@ -19208,7 +19249,7 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	struct r5conf *conf;
 	unsigned int new_total, new_per_group, nodes;
 	int err;
-	struct r5worker_group *new_groups, *old_groups;
+	struct r5worker_group *new_groups;
 	int group_cnt;
 
 	if (len >= PAGE_SIZE)
@@ -19237,40 +19278,11 @@ raid5_store_worker_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	}
 
 	if (new_per_group != conf->worker_cnt_per_group) {
-		old_groups = conf->worker_groups;
-
 		err = alloc_thread_groups(conf, new_per_group,
 					  &group_cnt, &new_groups);
-		if (!err) {
-			/* Quiesce across the swap -- same rationale as
-			 * raid5_store_group_thread_cnt(): this alias performs
-			 * the identical worker_groups swap and needs the same
-			 * stripe-cache drain so an in-flight sync/check cannot
-			 * strand stripes on conf->handle_list. */
-			raid5_quiesce(mddev, true);
-			spin_lock_irq(&conf->device_lock);
-			conf->group_cnt = group_cnt;
-			conf->worker_cnt_per_group = new_per_group;
-			conf->worker_groups = new_groups;
-			spin_unlock_irq(&conf->device_lock);
-
-			if (old_groups) {
-				int node;
-
-				/* Drain workers still referencing the old groups
-				 * only AFTER new_groups is published; flushing
-				 * before the swap left a use-after-free window
-				 * (see raid5_store_group_thread_cnt()). */
-				flush_workqueue(raid5_wq);
-				/* each node-ID slot owns its own workers
-				 * allocation (alloc_thread_groups sizes by
-				 * nr_node_ids); free them all, not just [0] */
-				for (node = 0; node < nr_node_ids; node++)
-					kfree(old_groups[node].workers);
-			}
-			kfree(old_groups);
-			raid5_quiesce(mddev, false);
-		}
+		if (!err)
+			raidkm_swap_worker_groups(mddev, conf, new_per_group,
+						  group_cnt, new_groups);
 	}
 out:
 	mddev_unlock_and_resume(mddev);
@@ -20352,6 +20364,7 @@ static int alloc_thread_groups(struct r5conf *conf, int cnt, int *group_cnt,
 		INIT_LIST_HEAD(&group->loprio_list);
 		group->conf = conf;
 		group->workers = workers;
+		group->index = i;
 
 		for (j = 0; j < cnt; j++) {
 			struct r5worker *worker = group->workers + j;
@@ -20373,14 +20386,19 @@ out_free:
 	return -ENOMEM;
 }
 
-static void free_thread_groups(struct r5conf *conf)
+static void free_worker_groups(struct r5worker_group *groups, int group_cnt)
 {
 	int i;
 
-	if (conf->worker_groups)
-		for (i = 0; i < conf->group_cnt; i++)
-			kfree(conf->worker_groups[i].workers);
-	kfree(conf->worker_groups);
+	if (groups)
+		for (i = 0; i < group_cnt; i++)
+			kfree(groups[i].workers);
+	kfree(groups);
+}
+
+static void free_thread_groups(struct r5conf *conf)
+{
+	free_worker_groups(conf->worker_groups, conf->group_cnt);
 	conf->worker_groups = NULL;
 }
 
@@ -21440,6 +21458,23 @@ static int raid5_set_limits(struct mddev *mddev)
 	rdev_for_each(rdev, mddev)
 		queue_limits_stack_bdev(&lim, rdev->bdev, rdev->new_data_offset,
 				mddev->gendisk->disk_name);
+	/*
+	 * No REQ_NOWAIT (upstream 3fe5b7c9, "md: remove REQ_NOWAIT support
+	 * from raid1/10/456", 7.2; the builtin md core still sets the feature
+	 * in md_init_stacking_limits()).  raidkm blocks internally anyway, and
+	 * a NOWAIT bio it does take goes wrong: io_uring sends a 1 MiB O_DIRECT
+	 * read as one NOWAIT bio, the aligned-read bypass clones it per chunk
+	 * with the flag, a member whose max transfer is below the chunk must
+	 * split its clone, the block layer refuses to split a NOWAIT bio
+	 * (BLK_STS_AGAIN), and raid5_align_endio() takes that for a read error:
+	 * the whole read is redone through the stripe cache on raid5d, 4 KiB at
+	 * a time (fio 1 MiB io_uring reads 7x slower than 2 MiB or libaio on a
+	 * 4-member RHEL 9.8 rig, 36x on 4 NVMe: the "1vs2MiB" problem).
+	 * Without the feature io_uring issues the reads from a worker that may
+	 * block, as it does for 2 MiB.  Stacking only clears features, so a
+	 * member added later cannot set it again.
+	 */
+	lim.features &= ~BLK_FEAT_NOWAIT;
 	/*
 	 * Split bios at row boundaries (upstream d51e1668fad6, 7.1).  Without
 	 * it the block layer cuts a bio over max_sectors into pieces counted

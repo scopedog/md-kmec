@@ -112,11 +112,12 @@ QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate
        functional@default_row_write=1 degraded@default_row_write=1
        replace@default_row_write=1
        functional@default_row_sync=1 degraded@default_row_sync=1
-       scrub-badblocks@default_row_sync=1 row-write@default_row_sync=1)
+       scrub-badblocks@default_row_sync=1 row-write@default_row_sync=1
+       gtc-swap)
 FULL=("${QUICK[@]}" grow grow-traditional reshape-concurrent declustered-create declustered-io
       declustered-rebalance declustered-csum declustered-autoarm declustered-multi declustered-crash
       declustered-row-transitions
-      declustered-csum@default_dcl_row_rebuild=0)
+      declustered-csum@default_dcl_row_rebuild=0 nowait)
 NIGHTLY=("${QUICK[@]}" faultinject xfstests mdadm-suite)
 # suites that run `mdadm --stop --scan` (directly, via rk_udev_quiesce, or in
 # mdadm's own test harness)

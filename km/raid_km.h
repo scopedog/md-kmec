@@ -730,6 +730,7 @@ struct r5worker_group {
 	struct r5conf *conf;
 	struct r5worker *workers;
 	int stripes_cnt;
+	int index;		/* in its conf->worker_groups array */
 };
 
 /*

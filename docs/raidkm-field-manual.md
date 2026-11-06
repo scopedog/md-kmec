@@ -1131,6 +1131,8 @@ NATIVE=1 tools/raidkm-test-selfheal.sh # checksum-driven heal (or dm-integrity b
 NATIVE=1 tools/raidkm-test-csum-thrash.sh  # CRC-region cache eviction round-trip
 tools/raidkm-test-row-dread-wide.sh    # degraded span read once per row: unaligned, two failures, races, dcl
 NATIVE=1 tools/raidkm-test-row-csum.sh # checksum verified/published through the row paths
+tools/raidkm-test-gtc-swap.sh          # group_thread_cnt / worker_thread_cnt under resync + I/O (a field-reported crash)
+tools/raidkm-test-nowait.sh            # io_uring 1 MiB reads vs 2 MiB / libaio (fio; no REQ_NOWAIT)
 tools/raidkm-test-scrub-badblocks.sh   # check/repair over a live member's recorded bad blocks
 tools/raidkm-test-degraded-trust-disk.sh # a readable block is read from disk, never decoded from parity
 tools/raidkm-test-row-rebuild-load.sh  # row rebuild under a degraded read: every chunk accounted, data intact
