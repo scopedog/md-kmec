@@ -995,7 +995,36 @@ static int rk_sn_load_maps(struct raidkm_snap *sn, struct page *page, u64 c)
 }
 
 /*
- * origin, exc, used, shared from the reverse map, with the checks that it
+ * The leaf of the origin map holding L, allocated (and filled with the
+ * identity) if it is not there yet; NULL only when @gfp may fail.  Called
+ * where origin entries change, never under sn->lock with a sleeping @gfp.
+ */
+u32 *rk_sn_leaf(struct raidkm_snap *sn, u64 L, gfp_t gfp)
+{
+	u32 **slot = &sn->odir[L >> RK_SN_LEAF_SHIFT];
+	u32 *leaf = smp_load_acquire(slot), *old;
+	u64 base = L & ~(u64)(RK_SN_LEAF - 1);
+	unsigned int i;
+
+	if (leaf)
+		return leaf;
+	leaf = kmalloc_array(RK_SN_LEAF, sizeof(*leaf), gfp);
+	if (!leaf)
+		return NULL;
+	for (i = 0; i < RK_SN_LEAF; i++)
+		leaf[i] = base + i;
+	/* release: the identity is visible before the pointer */
+	old = cmpxchg_release(slot, NULL, leaf);
+	if (old) {
+		kfree(leaf);
+		return old;
+	}
+	atomic64_inc(&sn->leaves);
+	return leaf;
+}
+
+/*
+ * origin, exc, used from the reverse map, with the checks that it
  * is one: every origin row L has exactly one physical row, every row has
  * one owner (by construction), every snapshot row's owner exists.
  */
@@ -1004,15 +1033,15 @@ static int rk_sn_derive(struct raidkm_snap *sn)
 	struct mddev *mddev = sn->conf->mddev;
 	unsigned long *moved, idx;
 	struct raidkm_snap_one *g;
-	u64 L;
+	u32 *leaf;
+	u64 L, d;
 	void *e;
 	int err = 0;
 
-	moved = bitmap_zalloc(sn->O, GFP_KERNEL);
+	moved = rk_bitmap_zalloc(sn->O);
 	if (!moved)
 		return -ENOMEM;
-	for (L = 0; L < sn->O; L++)
-		sn->origin[L] = L;
+	/* the origin map starts as the identity: no leaf */
 	bitmap_set(sn->used, 0, sn->O);
 	xa_for_each(&sn->rmap, idx, e) {
 		u16 owner = xa_to_value(e) >> 32;
@@ -1028,7 +1057,12 @@ static int rk_sn_derive(struct raidkm_snap *sn)
 				err = -EUCLEAN;
 				break;
 			}
-			sn->origin[l] = idx;
+			leaf = rk_sn_leaf(sn, l, GFP_KERNEL);
+			if (!leaf) {
+				err = -ENOMEM;
+				break;
+			}
+			leaf[l & (RK_SN_LEAF - 1)] = idx;
 			__set_bit(idx, sn->used);
 		} else {
 			g = rk_snap_slot(sn, owner - RK_SN_OWN_SNAP0);
@@ -1055,20 +1089,21 @@ static int rk_sn_derive(struct raidkm_snap *sn)
 				break;
 			}
 		}
-	bitmap_free(moved);
+	rk_bitmap_free(moved);
 	if (err) {
 		pr_err("md/raid:%s: snap: the reverse map is inconsistent\n",
 		       mdname(mddev));
 		return err;
 	}
 	sn->redirected = 0;
-	for (L = 0; L < sn->O; L++)
-		sn->redirected += sn->origin[L] != L;
-	if (sn->nsnaps) {
-		g = list_last_entry(&sn->snaps, struct raidkm_snap_one, list);
-		bitmap_fill(sn->shared, sn->O);
-		xa_for_each(&g->exc, idx, e)
-			__clear_bit(idx, sn->shared);
+	for (d = 0; d < sn->ndir; d++) {
+		leaf = sn->odir[d];
+		if (!leaf)
+			continue;
+		for (L = d << RK_SN_LEAF_SHIFT;
+		     L < min(sn->O, (d + 1) << RK_SN_LEAF_SHIFT); L++)
+			sn->redirected += leaf[L & (RK_SN_LEAF - 1)] != L;
+		cond_resched();
 	}
 	return 0;
 }
@@ -1080,7 +1115,7 @@ static bool rk_sn_op_valid(struct raidkm_snap *sn, struct rk_snap_op *op)
 	case RK_OP_REDIRECT:
 		return sn->nsnaps && op->L < sn->O && op->newP < sn->R &&
 		       op->oldP < sn->R &&
-		       sn->origin[op->L] == op->oldP &&
+		       rk_sn_origin(sn, op->L) == op->oldP &&
 		       !test_bit(op->newP, sn->used);
 	case RK_OP_CREATE:
 		return op->slot < RK_SNAP_SLOTS && !test_bit(op->slot, sn->slots);
@@ -1198,11 +1233,12 @@ int rk_sn_alloc(struct raidkm_snap *sn)
 {
 	unsigned int i;
 
-	sn->origin = kvmalloc_array(sn->O, sizeof(u32), GFP_KERNEL);
-	sn->shared = bitmap_zalloc(sn->O, GFP_KERNEL);
-	sn->used = bitmap_zalloc(sn->R, GFP_KERNEL);
+	sn->ndir = DIV_ROUND_UP_ULL(sn->O, RK_SN_LEAF);
+	sn->odir = kvcalloc(sn->ndir, sizeof(*sn->odir), GFP_KERNEL);
+	atomic64_set(&sn->leaves, 0);
+	sn->used = rk_bitmap_zalloc(sn->R);
 	sn->pmap = kvzalloc(sn->N, GFP_KERNEL);
-	sn->rdirty = bitmap_zalloc(sn->N, GFP_KERNEL);
+	sn->rdirty = rk_bitmap_zalloc(sn->N);
 	sn->jbuf = kcalloc(RK_SN_JBUF, sizeof(*sn->jbuf), GFP_KERNEL);
 	sn->io_rdevs = kcalloc(sn->conf->raid_disks * 2, sizeof(*sn->io_rdevs),
 			       GFP_KERNEL);
@@ -1210,7 +1246,7 @@ int rk_sn_alloc(struct raidkm_snap *sn)
 			      GFP_KERNEL);
 	/* + 1: a spare page to hold one while a run is written */
 	sn->cbuf = kcalloc(RK_SN_CBUF + 1, sizeof(*sn->cbuf), GFP_KERNEL);
-	if (!sn->origin || !sn->shared || !sn->used || !sn->pmap ||
+	if (!sn->odir || !sn->used || !sn->pmap ||
 	    !sn->rdirty || !sn->jbuf || !sn->cbuf || !sn->io_rdevs ||
 	    !sn->io_bios)
 		return -ENOMEM;
@@ -1241,8 +1277,14 @@ void rk_sn_free(struct raidkm_snap *sn)
 	kfree(sn->io_bios);
 	xa_destroy(&sn->rmap);
 	kvfree(sn->pmap);
-	bitmap_free(sn->rdirty);
-	kvfree(sn->origin);
-	bitmap_free(sn->shared);
-	bitmap_free(sn->used);
+	rk_bitmap_free(sn->rdirty);
+	if (sn->odir) {
+		u64 d;
+
+		for (d = 0; d < sn->ndir; d++)
+			kfree(sn->odir[d]);
+		kvfree(sn->odir);
+		sn->odir = NULL;
+	}
+	rk_bitmap_free(sn->used);
 }

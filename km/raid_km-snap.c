@@ -232,6 +232,16 @@ static struct raidkm_snap_one *rk_newest(struct raidkm_snap *sn)
 	       list_last_entry(&sn->snaps, struct raidkm_snap_one, list);
 }
 
+/* origin row L is shared with the newest snapshot: there is one, and it
+ * has no exception (its own copy) for L.  sn->lock held, or the array
+ * suspended */
+static bool rk_sn_shared(struct raidkm_snap *sn, u64 L)
+{
+	struct raidkm_snap_one *g = rk_newest(sn);
+
+	return g && !xa_load(&g->exc, L);
+}
+
 /* the COW in flight for row L, or NULL; sn->lock held */
 static struct rk_snap_cow *rk_busy_find(struct raidkm_snap *sn, u64 L)
 {
@@ -325,7 +335,7 @@ static void rk_cow_fn(struct work_struct *work)
 	blk_status_t st;
 
 	spin_lock_irq(&sn->lock);
-	oldP = sn->origin[L];
+	oldP = rk_sn_origin(sn, L);
 	newP = rk_alloc_row(sn);
 	spin_unlock_irq(&sn->lock);
 	if (newP == U64_MAX) {
@@ -354,6 +364,125 @@ static void rk_cow_fn(struct work_struct *work)
 }
 
 /*
+ * A discard of origin rows (map_bio).  Only whole rows: md ignores the
+ * partial ones anyway.  One run at the front of the bio, the rest goes back
+ * to the queue (as a write across rows does):
+ *  - rows the newest snapshot does not share, on consecutive physical rows:
+ *    remapped there, they go on as any discard (the rows go U, the members
+ *    trim them, the CRCs are dropped first).  No snapshot holds those rows:
+ *    an older one reads through the newer ones' copies.
+ *  - rows the newest snapshot shares: dropped.  The snapshot still needs
+ *    the row, so nothing can be trimmed or freed; redirecting the origin to
+ *    a free row instead would only use up the reserve the COWs of real
+ *    writes need (a fstrim after a snapshot would take a row per free row)
+ *    for nothing a rebuild skips.  The origin row stays written (W) after
+ *    the snapshots holding it are destroyed: only a later discard of it,
+ *    then unshared, trims it (a filesystem that remembers the trim, as
+ *    ext4 does until it is mounted again, does not send one), and until
+ *    then a rebuild re-encodes it.  The discard still completes, as a
+ *    discard is a hint.
+ * A row with a COW in flight waits for it, as a write does.
+ */
+static int rk_snap_discard(struct r5conf *conf, struct raidkm_snap *sn,
+			   struct bio **bip)
+{
+	struct bio *bi = *bip;
+	sector_t s = bi->bi_iter.bi_sector, e = bio_end_sector(bi);
+	struct rk_snap_cow *c;
+	unsigned long flags;
+	u64 L, Lend, P = 0, n, cap;
+	bool shared;
+
+	L = div64_u64(s + sn->rs - 1, sn->rs);
+	Lend = min_t(u64, div64_u64(e, sn->rs), sn->O);
+	if (L >= Lend) {
+		bio_endio(bi);
+		return RK_SNAP_DONE;
+	}
+	if (s < L * sn->rs) {
+		/* the partial row at the front: nothing to do for it */
+		struct bio *f = bio_split(bi, L * sn->rs - s, GFP_NOIO,
+					  &conf->bio_split);
+
+		if (IS_ERR_OR_NULL(f)) {
+			bio_endio(bi);		/* a hint */
+			return RK_SNAP_DONE;
+		}
+		bio_chain(f, bi);
+		bio_endio(f);
+		s = L * sn->rs;
+	}
+	/* one bio's size, and the walk under the lock, are bounded */
+	/* the scan below runs with interrupts off: a short run per call */
+	cap = min_t(u64, Lend - L, min_t(u64, 512, (UINT_MAX >> 9) / sn->rs));
+
+	/*
+	 * Under md's active_io (map_bio's caller) no row becomes shared (a
+	 * create suspends the array) and an unshared row's origin entry stays
+	 * (only a COW of a shared row moves one), so the run found here holds
+	 * until the discard is remapped; only a COW in flight can end.
+	 */
+	spin_lock_irqsave(&sn->lock, flags);
+	c = rk_busy_find(sn, L);
+	if (c) {
+		if (e > (L + 1) * sn->rs) {
+			/* the rest goes on; L waits for its COW */
+			spin_unlock_irqrestore(&sn->lock, flags);
+			n = 1;
+			goto split;
+		}
+		bio_list_add(&c->waiters, bi);
+		spin_unlock_irqrestore(&sn->lock, flags);
+		return RK_SNAP_DONE;
+	}
+	shared = rk_sn_shared(sn, L);
+	if (!shared)
+		P = rk_sn_origin(sn, L);
+	for (n = 1; n < cap; n++) {
+		if (rk_busy_find(sn, L + n) || rk_sn_shared(sn, L + n) != shared)
+			break;
+		if (!shared && rk_sn_origin(sn, L + n) != P + n)
+			break;
+	}
+	spin_unlock_irqrestore(&sn->lock, flags);
+split:
+	if (e > (L + n) * sn->rs) {
+		struct bio *split = bio_split(bi, (L + n) * sn->rs - s,
+					      GFP_NOIO, &conf->bio_split);
+
+		if (IS_ERR_OR_NULL(split)) {
+			bio_endio(bi);
+			return RK_SNAP_DONE;
+		}
+		bio_chain(split, bi);
+		submit_bio_noacct(bi);
+		*bip = bi = split;
+	}
+	if (c) {
+		/* the COW may have ended meanwhile: then this comes back at once */
+		spin_lock_irqsave(&sn->lock, flags);
+		c = rk_busy_find(sn, L);
+		if (c) {
+			bio_list_add(&c->waiters, bi);
+			spin_unlock_irqrestore(&sn->lock, flags);
+			return RK_SNAP_DONE;
+		}
+		spin_unlock_irqrestore(&sn->lock, flags);
+		submit_bio_noacct(bi);
+		return RK_SNAP_DONE;
+	}
+	if (shared) {
+		atomic64_add(n, &sn->disc_drop);
+		bio_endio(bi);
+		return RK_SNAP_DONE;
+	}
+	atomic64_add(n, &sn->disc_rows);
+	bi->bi_iter.bi_sector = P * sn->rs;
+	bio_set_flag(bi, BIO_REMAPPED);
+	return RK_SNAP_GO;
+}
+
+/*
  * raid5_make_request(), before anything else: remap an origin bio to its
  * physical row, or take a write to a shared row for a COW.  RK_SNAP_DONE:
  * the bio is ours now.  *bip may change: a bio across a row boundary is
@@ -376,11 +505,8 @@ int raidkm_snap_map_bio(struct r5conf *conf, struct bio **bip)
 
 	if (bio_flagged(bi, BIO_REMAPPED) || !bio_sectors(bi))
 		return RK_SNAP_GO;
-	if (bio_op(bi) == REQ_OP_DISCARD) {
-		/* a discard is only a hint, and rows may be shared */
-		bio_endio(bi);
-		return RK_SNAP_DONE;
-	}
+	if (bio_op(bi) == REQ_OP_DISCARD)
+		return rk_snap_discard(conf, sn, bip);
 	L = div64_u64(s, sn->rs);
 	if (L >= sn->O) {
 		pr_err_ratelimited("md/raid:%s: snap: bio %llu+%u past the origin\n",
@@ -408,7 +534,7 @@ int raidkm_snap_map_bio(struct r5conf *conf, struct bio **bip)
 	if (!op_is_write(bio_op(bi)) || !sn->nsnaps) {
 		/* no snapshot: nothing shared, no COW in flight, the map
 		 * changes only with a COW */
-		P = READ_ONCE(sn->origin[L]);
+		P = rk_sn_origin(sn, L);
 		goto remap;
 	}
 
@@ -419,8 +545,11 @@ int raidkm_snap_map_bio(struct r5conf *conf, struct bio **bip)
 		spin_unlock_irqrestore(&sn->lock, flags);
 		return RK_SNAP_DONE;
 	}
-	if (!test_bit(L, sn->shared)) {
-		P = sn->origin[L];
+	/* not shared with the newest snapshot: it has its own copy of L
+	 * (an exception), so the origin's row is the origin's alone.  A COW
+	 * of L that is storing that exception is still busy (above) */
+	if (!rk_sn_shared(sn, L)) {
+		P = rk_sn_origin(sn, L);
 		spin_unlock_irqrestore(&sn->lock, flags);
 		goto remap;
 	}
@@ -465,7 +594,7 @@ int raidkm_snap_map_bio(struct r5conf *conf, struct bio **bip)
 	}
 	c->op.type = RK_OP_REDIRECT;
 	c->op.L = L;
-	c->op.oldP = sn->origin[L];
+	c->op.oldP = rk_sn_origin(sn, L);
 	c->op.newP = newP;
 	spin_unlock_irqrestore(&sn->lock, flags);
 	/* the write goes on to the new row as it is; its completion is the
@@ -495,13 +624,16 @@ void rk_snap_apply(struct raidkm_snap *sn, struct rk_snap_op *op, bool replay)
 	struct r5conf *conf = sn->conf;
 	struct raidkm_snap_one *g, *older;
 	unsigned long flags, L;
-	bool was_newest;
 	u64 moved = 0, freed = 0;
+	u32 *leaf;
 	void *e;
 
 	switch (op->type) {
 	case RK_OP_REDIRECT:
 		g = rk_newest(sn);
+		/* the leaf first: it may sleep, the entry changes under lock */
+		leaf = rk_sn_leaf(sn, op->L, replay ? GFP_KERNEL | __GFP_NOFAIL :
+					      GFP_NOIO | __GFP_NOFAIL);
 		/* a reader of g looks at exc first, then the origin: first
 		 * the old row into exc, then the origin's new row */
 		xa_store(&g->exc, op->L, xa_mk_value((u64)op->oldP + 1),
@@ -510,9 +642,8 @@ void rk_snap_apply(struct raidkm_snap *sn, struct rk_snap_op *op, bool replay)
 		rk_sn_rmap_set(sn, op->newP, op->L, RK_SN_OWN_ORIGIN);
 		spin_lock_irqsave(&sn->lock, flags);
 		g->nexc++;
-		WRITE_ONCE(sn->origin[op->L], op->newP);
+		WRITE_ONCE(leaf[op->L & (RK_SN_LEAF - 1)], op->newP);
 		sn->redirected += (op->newP != op->L) - (op->oldP != op->L);
-		clear_bit(op->L, sn->shared);
 		__set_bit(op->newP, sn->used);
 		spin_unlock_irqrestore(&sn->lock, flags);
 		return;
@@ -526,7 +657,7 @@ void rk_snap_apply(struct raidkm_snap *sn, struct rk_snap_op *op, bool replay)
 		__set_bit(op->slot, sn->slots);
 		if (g->id >= sn->next_id)
 			sn->next_id = g->id + 1;
-		bitmap_fill(sn->shared, sn->O);
+		/* g has no exception yet: every origin row is shared */
 		spin_unlock_irqrestore(&sn->lock, flags);
 		return;
 
@@ -559,28 +690,14 @@ void rk_snap_apply(struct raidkm_snap *sn, struct rk_snap_op *op, bool replay)
 			}
 			cond_resched();
 		}
+		/* g was the newest: the origin is now shared with the next
+		 * older one exactly where that one has no exception (after the
+		 * moves), which is what rk_sn_shared() reads from now on */
 		spin_lock_irqsave(&sn->lock, flags);
-		was_newest = g == rk_newest(sn);
 		list_del(&g->list);
 		sn->nsnaps--;
 		__clear_bit(op->slot, sn->slots);
 		spin_unlock_irqrestore(&sn->lock, flags);
-		/*
-		 * g was the newest: the origin is now shared with the next
-		 * older one exactly where that one reads through to the
-		 * origin, i.e. where it has no exception (after the moves).
-		 * Without sn->lock: the array is suspended (no map_bio) and no
-		 * COW runs, the only readers of shared.  O(exceptions).
-		 */
-		if (list_empty(&sn->snaps)) {
-			bitmap_zero(sn->shared, sn->O);
-		} else if (was_newest) {
-			bitmap_fill(sn->shared, sn->O);
-			xa_for_each(&older->exc, L, e) {
-				__clear_bit(L, sn->shared);
-				cond_resched();
-			}
-		}
 		xa_destroy(&g->exc);
 		op->L = moved;
 		op->newP = freed;
@@ -656,7 +773,7 @@ static void rk_snap_submit_bio(struct bio *bio)
 		}
 	}
 	if (P == U64_MAX)
-		P = sn->origin[L];
+		P = rk_sn_origin(sn, L);
 	spin_unlock_irq(&sn->lock);
 
 	clone = bio_alloc_clone(rk_md_bdev(sn), bio, GFP_NOIO, &sn->bs);
@@ -1432,7 +1549,9 @@ ssize_t raidkm_snap_show(struct mddev *mddev, char *page)
 			   "origin_rows %llu\nreserve_rows %llu\nreserve_pct %u\nfree_rows %llu\nredirected %llu\n"
 			   "cow_whole %lld\ncow_partial %lld\ncow_fail %lld\ncow_nospc %lld\nfreed %lld\n"
 			   "checkpoint %llu\njournal_tail %llu\njournal_head %llu\ncommits %lld\nrecords %lld\n"
-			   "checkpoints %lld\nreplayed %lld\nbroken %d\nsnapshots %d\ncow_slots %u\n",
+			   "checkpoints %lld\nreplayed %lld\nbroken %d\nsnapshots %d\ncow_slots %u\n"
+			   "origin_leaves %lld\norigin_map_bytes %llu\n"
+			   "discard_rows %lld\ndiscard_shared %lld\n",
 			   sn->O, sn->R - sn->O, sn->reserve_pct,
 			   sn->R - bitmap_weight(sn->used, sn->R),
 			   READ_ONCE(sn->redirected),
@@ -1447,7 +1566,12 @@ ssize_t raidkm_snap_show(struct mddev *mddev, char *page)
 			   atomic64_read(&sn->records),
 			   atomic64_read(&sn->ckpts),
 			   atomic64_read(&sn->replayed),
-			   READ_ONCE(sn->broken), sn->nsnaps, sn->cows_max);
+			   READ_ONCE(sn->broken), sn->nsnaps, sn->cows_max,
+			   atomic64_read(&sn->leaves),
+			   (unsigned long long)(sn->ndir * sizeof(*sn->odir) +
+				atomic64_read(&sn->leaves) * RK_SN_LEAF * sizeof(u32)),
+			   atomic64_read(&sn->disc_rows),
+			   atomic64_read(&sn->disc_drop));
 	list_for_each_entry(g, &sn->snaps, list)
 		n += sysfs_emit_at(page, n,
 				   "snap name=%s id=%d ctime=%lld dev=/dev/%s exc=%llu%s%s\n",

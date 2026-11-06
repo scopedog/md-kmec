@@ -1228,6 +1228,11 @@ md-kmec/
 │   ├── raidkm-test-gtc-swap.sh        # group_thread_cnt / worker_thread_cnt written under resync + I/O
 │   │                                    # (a field-reported crash; G3 deterministic on a fault-inject build)
 │   ├── raidkm-test-nowait.sh          # io_uring 1 MiB O_DIRECT reads keep up with 2 MiB / libaio (needs fio)
+│   ├── raidkm-test-csum-crashlag.sh   # --checksum: crash images (idle, bitmap, --readonly, crash in the resync)
+│   │                                    # read back with no stale CRC
+│   ├── raidkm-test-snap-convert.sh    # mdadm --grow --snapshots on an existing row-map array
+│   ├── raidkm-test-declustered-discard.sh # discards on declustered pools (row granularity, csum drop)
+│   ├── raidkm-test-bigrows.sh         # row map / snapshots on arrays past 33.5 M rows (sparse members)
 │   ├── raidkm-test-declustered-populate-window.sh  # population backpressure window, pause + retry
 │   ├── raidkm-test-declustered-row-transitions.sh  # the row layer across spare-assignment
 │   │                                    # transitions: off while POPULATING/COPYING, live while
@@ -1553,8 +1558,9 @@ without `--grow`: `mdadm /dev/md70 --add /dev/ram5`.
 
 ## Row state map and native snapshots
 
-Both are **create options** and opt-in: an array created without them is
-unchanged, and neither can be added to an existing array.  A *row* is one
+Both are opt-in: an array created without them is unchanged.  The row map
+is a create option; snapshots can also be added to a stopped row-map array
+(`mdadm --grow --snapshots`, below).  A *row* is one
 chunk on every data member — k × chunk of data (8+2 with 128 KiB chunks:
 1 MiB rows).
 
@@ -1585,6 +1591,10 @@ mdadm --create /dev/md70 --level=raidkm --parity-count=2 --chunk=128 \
 cat /sys/block/md70/md/rk_rowmap     # rows per state, skipped_rows, flushes, ...
 ```
 
+`rk_rowmap` also says where the tail regions start on every member, in sectors
+from its data offset (`-1`: none): `csum_region` (native checksums),
+`map_region` (the row map), `snap_region` (snapshot metadata).
+
 `--examine` prints a `Row Map : on` line (and `Snapshots : on` on a snapshot
 array).  Refused with the row map (v1): PPL / the raidkm journal, any reshape or
 resize, and metadata 1.0 (superblock at the device end).
@@ -1597,6 +1607,19 @@ rows, so nothing else would rewrite their slots.  When the members take a
 discard (`devices_handle_discard_safely=1`), the CRCs of the trimmed rows
 come off the region, on disk, before any member gets it; while a sync,
 rebuild or check runs the members are not sent the discard (it is a hint).
+A write that races a discard of the same rows waits for it, so no CRC is
+stored over a block the discard then trims.
+
+**After a crash** (with `--checksum`, with or without the row map): the CRCs
+reach the disk lazily (at a stop, `--readonly`, eviction), so md never marks
+a running checksum array clean: once written it shows `active` until it
+stops (writing `clean` to `array_state` returns EBUSY).  A crash therefore
+always resyncs every row with data, and that resync ignores the write-intent
+bitmap and re-derives the CRCs; reads go unverified until it completes.  A
+stop, `--readonly` or a reboot writes the CRCs back before md writes the
+superblock clean.  (Modules before 2026-11-06 could return EIO after a crash
+of an idle array, of an array with a bitmap, or during the post-crash
+resync.)
 mdadm refuses the combination when the raidkm module loaded lacks the
 read-only parameter `rowmap_csum`.
 
@@ -1606,7 +1629,10 @@ chunks); the map sits one chunk after the data, past the rkdcl block, and the
 array's bios are cut at that row.  A replacement gets the map before the
 copy from the distributed spare, as a rebuilt member does.  Population into
 the spare columns and the copy back still walk every row (correct, not yet
-faster than without the map).
+faster than without the map).  Declustered arrays take discards (a row is
+the unit, `discard_granularity` = `ngroups * k` chunks); a pool member is
+sent none while a recovery runs or a spare assignment is populating or
+copying.
 
 ### Native snapshots (`--snapshots=<reserve %>`)
 
@@ -1671,10 +1697,30 @@ journal.  A rebuilt member gets the metadata with its rebuild.
 
 **Space.**  On each member: 16 bytes per row (two map copies) plus about
 4 MiB (headers, table, page maps, journal) — 20 TB members with 128 KiB
-chunks: 2.4 GB per member, 0.012%.  In memory: 4 bytes per origin row, plus a few bytes for each
-row a snapshot holds.  When the reserve is full, a write that needs a copy
+chunks: 2.4 GB per member, 0.012%.  In memory: the origin map is a directory
+of leaves of 1024 rows, a leaf allocated only once one of its rows has moved,
+plus a few bytes for each row a snapshot holds.  When the reserve is full, a write that needs a copy
 fails with **ENOSPC**; the snapshots stay intact, and destroying one
 gives its rows back.
+
+**Adding snapshots to an existing array** (offline): `mdadm --grow <array>
+--snapshots=N <members...>` on a stopped array made with `--row-map`.  The
+reserve and the snapshot metadata come out of the end of the origin, so the
+rows past the new origin must be unwritten: mdadm refuses otherwise and
+prints the size to shrink the filesystem to.
+
+```sh
+umount /mnt; e2fsck -f /dev/md70; resize2fs /dev/md70 <size>K  # as printed
+blkdiscard -o <size in bytes> /dev/md70                        # the rest becomes unwritten
+mdadm --stop /dev/md70
+mdadm --grow /dev/md70 --snapshots=20 /dev/sd[b-k]
+mdadm --assemble /dev/md70 /dev/sd[b-k]
+```
+
+It writes every member's new tail first, then the superblocks; if it is
+interrupted, the same command finishes it (another `--snapshots` value is
+refused).  Every other `--grow` option is refused with `--snapshots`.
+Gate: `tools/raidkm-test-snap-convert.sh`.
 
 **Not yet** (refused, not run wrong): PPL / the raidkm journal, reshape
 or grow.  Native checksums work with snapshots (2026-11-03; see *Row state
@@ -1696,8 +1742,11 @@ allocated while the array runs.  On a wide pool that is real memory and a
 narrow pipe: 80 disks in 6 groups of 11+2 at 1 MiB chunks have a 66 MiB row,
 66 MiB held from assembly, at most 132 MiB in copies, and 2 copies at a time
 (each first small write to a row after a snapshot copies the whole 66 MiB).
-Pick a smaller chunk for snapshot pools that take small writes.  Discards on a snapshot array are
-ignored (a row may be shared).  The origin map is in memory, not demand
+Pick a smaller chunk for snapshot pools that take small writes.  A discard on
+a snapshot array trims the rows only the origin holds (they become
+unwritten); a row the newest snapshot still shares is left alone (the
+snapshot keeps it; a later discard trims it once the origin has its own
+copy).  The origin map is in memory, not demand
 paged; snapshots are read-only, and there is no external metadata device.
 
 **Cost.**  RAM-backed 8+2, 128 KiB chunks, RHEL 9.8 (the CPU path, not

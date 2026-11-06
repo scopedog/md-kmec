@@ -170,13 +170,17 @@ struct raidkm_snap {
 	struct r5conf		*conf;
 	u64			R, O;		/* physical rows, origin rows */
 	u64			rs;		/* row sectors (array) */
-	u32			*origin;	/* L -> P */
-	unsigned long		*shared;	/* L shared with the newest */
+	/* L -> P, sparse (rk_sn_origin()): a directory of O / RK_SN_LEAF
+	 * leaves, NULL = identity for those rows.  Shared with the newest
+	 * snapshot = the newest has no exception for L (rk_sn_shared()). */
+	u32			**odir;
+	u64			ndir;		/* directory entries */
+	atomic64_t		leaves;		/* leaves allocated */
 	unsigned long		*used;		/* P referenced */
 	u64			cursor;		/* allocator */
 	u64			redirected;	/* L with origin[L] != L */
 	unsigned int		piece;		/* pages per physical bio */
-	spinlock_t		lock;		/* origin, shared, used, busy, snaps,
+	spinlock_t		lock;		/* origin, used, busy, snaps,
 						 * pending, hold, overflow */
 	struct mutex		mutex;		/* create / destroy / rename / set */
 	struct list_head	snaps;
@@ -224,9 +228,35 @@ struct raidkm_snap {
 	atomic64_t		commits, records, ckpts, replayed;
 
 	atomic64_t		cow_whole, cow_partial, cow_fail, cow_nospc, freed;
+	/* discards: origin rows passed down to the array's discard path
+	 * (make_discard_request may still skip them: reshape, a failed CRC
+	 * drop), rows dropped as shared with the newest snapshot */
+	atomic64_t		disc_rows, disc_drop;
 };
 
 enum { RK_SNAP_GO, RK_SNAP_DONE };
+
+/*
+ * The origin map.  Almost every origin row is still its own physical row
+ * (only a COW moves one, and the reserve bounds how many), so a leaf of
+ * RK_SN_LEAF entries exists only for a range with a moved row: 8 bytes per
+ * RK_SN_LEAF rows plus 4 KiB per such range, instead of 4 bytes per row.
+ * A leaf is filled with the identity before it is published (release), so
+ * a lockless reader sees NULL (identity) or a whole leaf; a leaf is only
+ * freed at stop.  Entries change under sn->lock (rk_snap_apply()), or at
+ * assemble before any I/O (rk_sn_derive()).
+ */
+#define RK_SN_LEAF_SHIFT	10
+#define RK_SN_LEAF		(1U << RK_SN_LEAF_SHIFT)
+
+static inline u64 rk_sn_origin(struct raidkm_snap *sn, u64 L)
+{
+	u32 *leaf = smp_load_acquire(&sn->odir[L >> RK_SN_LEAF_SHIFT]);
+
+	return leaf ? READ_ONCE(leaf[L & (RK_SN_LEAF - 1)]) : L;
+}
+
+u32 *rk_sn_leaf(struct raidkm_snap *sn, u64 L, gfp_t gfp);
 
 /* raid_km-snap.c */
 int raidkm_snap_init(struct r5conf *conf);

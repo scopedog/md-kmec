@@ -34,10 +34,30 @@
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/workqueue.h>
+#include <linux/bitmap.h>
+#include <linux/slab.h>
 
 struct r5conf;
 struct mddev;
 struct stripe_head;
+
+/*
+ * One bit per row: bitmap_zalloc() is kmalloc, which fails above
+ * KMALLOC_MAX_SIZE (4 MiB, 33.5 M bits), so an array with more rows than
+ * that could not assemble with the row map or snapshots.  These fall back
+ * to vmalloc.  GFP_KERNEL only (kvmalloc and GFP_NOIO do not mix on every
+ * kernel we build for); free with rk_bitmap_free().
+ */
+static inline unsigned long *rk_bitmap_zalloc(u64 nbits)
+{
+	return kvcalloc(BITS_TO_LONGS(nbits), sizeof(unsigned long),
+			GFP_KERNEL);
+}
+
+static inline void rk_bitmap_free(unsigned long *map)
+{
+	kvfree(map);
+}
 
 #define RK_RM_U		0
 #define RK_RM_N		1
@@ -90,6 +110,12 @@ void raidkm_rowmap_member_added(struct r5conf *conf);
 void raidkm_rowmap_stripe_start(struct r5conf *conf, struct stripe_head *sh);
 void raidkm_rowmap_raid5d_round(struct r5conf *conf);
 bool raidkm_rowmap_flush(struct r5conf *conf);
+/* where a member's tail regions begin, in sectors from its data_offset:
+ * after the data, and after the rkdcl chunk on a declustered array.  The
+ * CRC region starts here; the row map after it (or here without csum). */
+sector_t raidkm_tail_start(struct r5conf *conf);
+/* the CRC region's start, or -1 (raid_km.c; rk_rowmap csum_region) */
+s64 raidkm_csum_region_start(struct r5conf *conf);
 void raidkm_rowmap_wait_row(struct r5conf *conf, sector_t msect);
 sector_t raidkm_rowmap_sync_skip(struct mddev *mddev, sector_t sector_nr,
 				 sector_t max_sector);

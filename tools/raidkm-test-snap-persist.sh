@@ -41,7 +41,7 @@ NMEM=10; MEMSZ=64		# MiB
 CSUM_OPT=(); [ "${SNAP_CSUM:-0}" = 1 ] && CSUM_OPT=(--checksum)
 ROW=$((1024 * 1024))
 CHUNK=$((128 * 1024))
-LAYOUT=(--layout=rotating); DCL_SECT=0; DCL_NAME=
+LAYOUT=(--layout=rotating); DCL_NAME=
 if [ -n "${SNAP_DCL:-}" ]; then
 	IFS=: read -r NMEM DCL_G DCL_S <<<"$SNAP_DCL"
 	[[ "$NMEM" =~ ^[0-9]+$ && "$DCL_G" =~ ^[0-9]+$ && "$DCL_S" =~ ^[0-9]+$ ]] && \
@@ -51,7 +51,6 @@ if [ -n "${SNAP_DCL:-}" ]; then
 	[ $DCL_NG -ge 1 ] && [ $(( DCL_NG * DCL_G + DCL_S )) = "$NMEM" ] || { echo "SNAP_DCL=$SNAP_DCL: N - s is not a multiple of g"; exit 1; }
 	ROW=$(( CHUNK * DCL_NG * (DCL_G - 2) ))
 	LAYOUT=(--layout=declustered --group-width=$DCL_G --spare-columns=$DCL_S)
-	DCL_SECT=$(( CHUNK / 512 ))	# the rkdcl chunk before the row map
 	DCL_NAME=" (declustered $SNAP_DCL, $DCL_NG group(s), rows of $(( ROW / 1024 )) KiB)"
 fi
 PASS=0; FAIL=0
@@ -59,6 +58,29 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $*"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $*"; }
 sn_get() { awk -v k="$1" '$1 == k {print $2}' /sys/block/$MDN/md/rk_snap; }
 rm_get() { awk -v k="$1" '$1 == k {print $2}' /sys/block/$MDN/md/rk_rowmap; }
+# mdadm --examine "Tail Regions" against md/rk_rowmap: mdadm (super1.c
+# rk_tail_sectors) and the kernel (raidkm_tail_start) work the tail layout
+# out apart and must agree.  An mdadm without the line is only noted.
+tail_agree() {
+	local ex k d out bad=0 none=0
+	k="$(rm_get csum_region) $(rm_get map_region) $(rm_get snap_region)"
+	for d in "${M[@]}"; do
+		if ! out=$($MDADM --examine "$d" 2>&1) || ! grep -q "Raid Level" <<<"$out"; then
+			fail "$1 --examine $d failed: $(head -1 <<<"$out")"; bad=1; continue
+		fi
+		ex=$(awk '/Tail Regions/ {print $5, $7, $9}' <<<"$out")
+		if [ -z "$ex" ]; then
+			none=1
+		elif [ "$ex" != "$k" ]; then
+			fail "$1 tail regions on $d: mdadm $ex, kernel $k"; bad=1
+		fi
+	done
+	if [ $none = 1 ]; then
+		echo "  note: $1 this mdadm prints no Tail Regions: not compared"
+	elif [ $bad = 0 ]; then
+		pass "$1 mdadm (every member) and the kernel agree on the tail regions ($k)"
+	fi
+}
 snap() { $MDADM --snapshot $MD "$@"; }
 idle() {
 	local t=0
@@ -307,17 +329,19 @@ $MDADM $MD --add "${M[0]}" >/dev/null 2>&1 || fail "T8 add ${M[0]}"
 $MDADM $MD --add "${M[1]}" >/dev/null 2>&1 || fail "T8 add ${M[1]}"
 idle
 snap --set s3 t8=1 || fail "T8 set"		# a record after the seed
-# where the region starts: data_offset + the kernel's component size
-# (chunk-rounded) [+ the rkdcl chunk] + the row map's pages
-SZ=$(( $(cat /sys/block/$MDN/md/component_size) * 2 / 256 * 256 ))
+# where the region starts on a member: its data_offset + the kernel's
+# snap_region (after the data [, the rkdcl chunk, the CRC region] and the
+# row map: rk_rowmap names the place, so no arithmetic to drift from it)
+SNR=$(rm_get snap_region); ROWS=$(rm_get rows); MREG=$(rm_get map_region); RMP=$(rm_get pages)
+tail_agree T8
 $MDADM --stop $MD >/dev/null
 DO=$($MDADM --examine "${M[5]}" | awk '/Data Offset/ {print $4}')
-[ -n "$DO" ] && [ "$SZ" -gt 0 ] || fail "T8 region offset (data offset '$DO', size '$SZ')"
-ROWS=$(( SZ / 256 )); RMP=$(( (ROWS + 16319) / 16320 ))
-# with --checksum the CRC region sits before the row map (km
-# raidkm_csum_reserve_sectors(): a slot per 4K, 1022 per page, 64 KiB-rounded)
-CSR=0; [ "${SNAP_CSUM:-0}" = 1 ] && CSR=$(( ( (SZ / 8 + 1021) / 1022 * 8 + 127) / 128 * 128 ))
-SNOFF=$(( (DO + SZ + DCL_SECT + CSR) / 8 + RMP ))	# 4 KiB page of the region's start
+# every place below is read from these: without them nothing is checked
+[ -n "$DO" ] && [ "${SNR:--1}" -gt 0 ] && [ "${ROWS:-0}" -gt 0 ] &&
+	[ "${MREG:--1}" -gt 0 ] && [ "${RMP:-0}" -gt 0 ] || {
+	fail "T8 region offsets (data offset '$DO', snap_region '$SNR', map_region '$MREG', pages '$RMP', rows '$ROWS')"
+	exit 1; }
+SNOFF=$(( (DO + SNR) / 8 ))	# 4 KiB page of the region's start
 NRM=$(( (ROWS + 509) / 510 )); NPM=$(( (NRM + 4079) / 4080 ))
 # header, table and pmap copies: the seed's and the stop's checkpoints write
 # both copies of each to every member.  (Not the rmap slots: the slot a page
@@ -424,7 +448,7 @@ if [ -n "${SNAP_DCL:-}" ]; then
 	r5=$(regmd5 "${M[5]}")
 	[ "$(regmd5 "$SPARE")" = "$r5" ] && pass "T13 the new disk holds the same snapshot metadata" || \
 		fail "T13 metadata on $SPARE $(regmd5 "$SPARE"), others $r5"
-	RMOFF=$(( (DO + SZ + DCL_SECT + CSR) / 8 ))	# past the CRC region with --checksum
+	RMOFF=$(( (DO + MREG) / 8 ))	# the row map (rk_rowmap map_region, read at T8)
 	rmmd5() { dd if="$1" bs=4096 skip=$RMOFF count=$RMP status=none | md5sum | cut -c1-32; }
 	[ "$(rmmd5 "$SPARE")" = "$(rmmd5 "${M[5]}")" ] && pass "T13 and the same row map" || \
 		fail "T13 row map on $SPARE differs"

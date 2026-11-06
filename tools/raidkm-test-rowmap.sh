@@ -6,9 +6,14 @@
 #   MDADM=...      a raidkm-aware mdadm with --row-map (required)
 #   RM_NO_RCW=1    negative control: load with rowmap_test_no_rcw=Y; T4 must FAIL
 #   RM_NO_RECSKIP=1 load with rowmap_test_no_recskip=Y; T10's stripe check must FAIL
-#   RM_CSUM=1      every array with --checksum too; T17 runs
+#   RM_CSUM=1      every array with --checksum too; T17-T19 run
 #   RM_NO_CSUM_DROP=1 (with RM_CSUM=1) load with csum_test_no_discard_drop=Y;
 #                  T17 must FAIL
+#   RM_DISC_RACE=1 (with RM_CSUM=1) load T18 with csum_test_discard_race=Y
+#                  (the old order); T18 must FAIL
+#   RM_T18_SECS=N  T18's write + trim race, seconds (default 20)
+#   RM_U_FIRST=1   (with RM_CSUM=1) load T19 with csum_test_u_first=Y (rows U
+#                  before their CRCs are dropped, the old order); T19 must FAIL
 #   (a module from before the 10-31 review fixes fails T9, T11 and T12;
 #   one from before the bitmap fix fails T14)
 # Ubuntu 26.04's dd is uutils coreutils, whose O_DIRECT I/O of 128 KiB and
@@ -36,15 +41,35 @@ MD=/dev/md70; MDN=md70
 NMEM=10; MEMSZ=64		# MiB
 # RM_CSUM=1: every array also gets native checksums (--checksum); T17 runs
 CSUM_OPT=(); [ "${RM_CSUM:-0}" = 1 ] && CSUM_OPT=(--checksum)
-# the CRC region's size when the row map follows it (km
-# raidkm_csum_reserve_sectors(), mdadm rkcs_reserve()), in sectors
-csum_reserve() { local p=$(( ($1 / 8 + 1021) / 1022 )); echo $(( (p * 8 + 127) / 128 * 128 )); }
 CHUNK=128			# KiB; row = 8 x 128K = 1 MiB of data
 ROW=$((1024 * 1024))
 PASS=0; FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $*"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $*"; }
 rm_get() { awk -v k="$1" '$1 == k {print $2}' /sys/block/$MDN/md/rk_rowmap; }
+# mdadm --examine "Tail Regions" against md/rk_rowmap: mdadm (super1.c
+# rk_tail_sectors) and the kernel (raidkm_tail_start) work the tail layout
+# out apart and must agree.  An mdadm without the line is only noted.
+tail_agree() {
+	local ex k d out bad=0 none=0
+	k="$(rm_get csum_region) $(rm_get map_region) $(rm_get snap_region)"
+	for d in "${M[@]}"; do
+		if ! out=$($MDADM --examine "$d" 2>&1) || ! grep -q "Raid Level" <<<"$out"; then
+			fail "$1 --examine $d failed: $(head -1 <<<"$out")"; bad=1; continue
+		fi
+		ex=$(awk '/Tail Regions/ {print $5, $7, $9}' <<<"$out")
+		if [ -z "$ex" ]; then
+			none=1
+		elif [ "$ex" != "$k" ]; then
+			fail "$1 tail regions on $d: mdadm $ex, kernel $k"; bad=1
+		fi
+	done
+	if [ $none = 1 ]; then
+		echo "  note: $1 this mdadm prints no Tail Regions: not compared"
+	elif [ $bad = 0 ]; then
+		pass "$1 mdadm (every member) and the kernel agree on the tail regions ($k)"
+	fi
+}
 idle() {	# wait for sync to finish; a missing array (failed assemble) fails, not hangs
 	local t=0
 	while ! grep -q idle /sys/block/$MDN/md/sync_action 2>/dev/null; do
@@ -384,16 +409,17 @@ $MDADM --stop $MD >/dev/null 2>&1
 teardown; members; create; PIECES=(); write_set
 echo flush > /sys/block/$MDN/md/rk_rowmap
 w16=$(rm_get written); n16=$(rm_get needsync); p16=$(rm_get pages)
-# the map sits right after each member's data: data offset + dev_sectors
-dsz=$(( $(cat /sys/block/$MDN/md/component_size) * 2 ))
+# the map's place on each member: data offset + the kernel's map_region
+# (after the data, and after the CRC region with --checksum)
+mreg=$(rm_get map_region)
+tail_agree T16
 $MDADM --stop $MD >/dev/null
 doff=$($MDADM --examine "${M[0]}" | awk '/Data Offset/ {print $4}')
-if [ -z "$doff" ] || [ "$dsz" = 0 ]; then
-	fail "T16 no data offset ($doff) or component size ($dsz)"
+if [ -z "$doff" ] || [ "${mreg:-0}" -le 0 ]; then
+	fail "T16 no data offset ($doff) or map_region ($mreg)"
 	$MDADM --examine "${M[0]}" | sed 's/^/    /'
 else
-	a=$((doff + dsz)); len=$((p16 * 8)); D=()
-	[ "${RM_CSUM:-0}" = 1 ] && a=$((a + $(csum_reserve $dsz)))	# after the CRC region
+	a=$((doff + mreg)); len=$((p16 * 8)); D=()
 	for i in "${!M[@]}"; do
 		tot=$(blockdev --getsz "${M[$i]}"); n=rm16_$i
 		printf '%s\n' "0 $a linear ${M[$i]} 0" \
@@ -449,23 +475,25 @@ n=$(dmesg | sed -n "/$mk0/,\$p" | grep -c "native csum region page rotted")
 # does.  The neighbouring rows keep theirs, and a block written after that
 # has its CRC (rot is caught).
 teardown; load devices_handle_discard_safely=Y; members; create
+creg=$(rm_get csum_region)	# the CRC region: data offset + this, on every member
+doff=$($MDADM --examine "${M[0]}" | awk '/Data Offset/ {print $4}')
 if [ "$(rm_get member_discard)" != 1 ]; then
 	fail "T17 member_discard $(rm_get member_discard) with devices_handle_discard_safely=Y"
+elif [ -z "$doff" ] || [ "${creg:--1}" -le 0 ]; then
+	fail "T17 no data offset ($doff) or csum_region ($creg): T17 skipped"
 else
 R=100; NR=64; C2=$((CHUNK * 2)); NB=$((C2 / 8))	# rows R..R+63; a chunk in sectors, 4K blocks
 b0=$((R * NB)); nb=$((NR * NB))			# their blocks on every member: 3 region pages
 mk17="raidkm-test-rowmap T17 $$.$(date +%s%N)"; echo "$mk17" > /dev/kmsg
 mm17() { dmesg | sed -n "/$mk17/,\$p" | grep -c "native csum mismatch"; }
 nz() {	# nz <member> <blk> <n>: slots of blocks blk..blk+n-1 holding a CRC, on disk
-	local d=$1 b=$2 n=$3 p base=$(( (doff + dsz) / 8 ))
+	local d=$1 b=$2 n=$3 p base=$(( (doff + creg) / 8 ))
 	for p in $(seq $((b / 1022)) $(((b + n - 1) / 1022))); do
 		dd if=$d bs=4096 skip=$((base + p)) count=1 iflag=direct status=none | od -An -v -tu4 -w4 |
 			awk -v lo=$((b - p * 1022)) -v hi=$((b + n - 1 - p * 1022)) \
 				'NR - 1 >= lo && NR - 1 <= hi && NR <= 1022 && $1 != 0 {c++} END {print c + 0}'
 	done | awk '{s += $1} END {print s + 0}'
 }
-dsz=$(( $(cat /sys/block/$MDN/md/component_size) * 2 ))
-doff=$($MDADM --examine "${M[0]}" | awk '/Data Offset/ {print $4}')
 z=0; for d in "${M[@]}"; do z=$((z + $(nz $d $b0 $nb))); done
 [ $z = 0 ] && pass "T17 a new array's CRC region is zeroed over random members" || fail "T17 $z non-zero slots in a new array's CRC region"
 wr $(((R - 1) * ROW)) $(((NR + 2) * ROW)) s17		# whole rows, a neighbour each side
@@ -509,6 +537,99 @@ else
 	[ "$(mm17)" -gt "$m0" ] && pass "T17 its CRC caught the rot" || fail "T17 no mismatch on a rotted block with a CRC"
 fi
 fi
+
+# T18 a write racing a member discard of the same rows.  The discard drops
+# the rows' CRCs and then attaches to their stripes; a write issued in
+# between used to store a CRC the trim then made stale: a block that fails
+# its CRC on every read, bad blocks, and with m of them in one stripe data
+# nobody can repair (found 11-04 on GCP NVMe).  4K random writes, whole-row
+# random writes (the row layer stores their CRCs from submit_bio, where the
+# store must not wait on region I/O) and one-row random trims over the whole
+# array at once, then every block is read: no mismatch during the race or
+# after, no bad block.  Plus 4K writes and trims on the first 16 rows only,
+# so a row is trimmed again while a write that joined its last discard is
+# still going (11-05: the discard stripe went out of the hash with that
+# write on it; the next discard of the row did not see it, and the write's
+# CRCs landed over blocks the new trim zeroed -- 3 mismatches a run at
+# 120 s without these jobs).
+teardown
+load devices_handle_discard_safely=Y \
+	$([ "${RM_DISC_RACE:-0}" = 1 ] && echo csum_test_discard_race=Y)
+members; create
+if [ "$(rm_get member_discard)" != 1 ]; then
+	fail "T18 member_discard $(rm_get member_discard) with devices_handle_discard_safely=Y"
+elif ! command -v fio >/dev/null; then
+	fail "T18 needs fio"
+else
+	mk18="raidkm-test-rowmap T18 $$.$(date +%s%N)"; echo "$mk18" > /dev/kmsg
+	mm18() { dmesg | sed -n "/$mk18/,\$p" | grep -c "native csum mismatch"; }
+	bb18() { cat /sys/block/$MDN/md/dev-*/bad_blocks 2>/dev/null | grep -c .; }
+	fio --name=fill --filename=$MD --rw=write --bs=1M --iodepth=8 --ioengine=libaio \
+		--direct=1 --size=100% --output-format=terse >/dev/null 2>&1
+	dio() { awk '{print $12}' /sys/block/$MDN/stat; }	# discard I/Os the array took
+	t0=$(dio)
+	fio --filename=$MD --ioengine=libaio --direct=1 --time_based --runtime=${RM_T18_SECS:-20} \
+		--name=wr --rw=randwrite --bs=4k --iodepth=16 --numjobs=4 \
+		--name=wrow --rw=randwrite --bs=$ROW --blockalign=$ROW --iodepth=4 \
+		--name=t --rw=randtrim --bs=$ROW --blockalign=$ROW --iodepth=1 \
+		--name=hw --rw=randwrite --bs=4k --iodepth=16 --size=$((16 * ROW)) \
+		--name=ht --rw=randtrim --bs=$ROW --blockalign=$ROW --iodepth=1 --size=$((16 * ROW)) \
+		--output-format=terse >$RK_DIR/t18.fio 2>&1
+	nt=$(dio)
+	m1=$(mm18)
+	dd if=$MD of=/dev/null bs=1M iflag=direct status=none
+	m2=$(mm18); b=$(bb18)
+	[ -n "$t0" ] && [ -n "$nt" ] && [ "$nt" -gt "$t0" ] && \
+		pass "T18 $((nt - t0)) trims raced the writes" || fail "T18 no trim reached the array ($t0 -> $nt)"
+	[ "$m1" = 0 ] && pass "T18 no csum mismatch during the race" || fail "T18 $m1 csum mismatch(es) during the race"
+	[ "$m2" = "$m1" ] && pass "T18 reading every block after it checks no stale CRC" || \
+		fail "T18 read-back: $((m2 - m1)) csum mismatch(es)"
+	[ "$b" = 0 ] && pass "T18 no bad block" || fail "T18 $b bad-block range(s)"
+	fi
+
+# T19 a crash while a discard is on its way (11-05, power-cut rm-d).  A
+# resync skips U rows, and the CRC region goes to disk lazily: a row whose
+# U reached the disk before its CRCs were dropped kept the CRC of an older
+# write over newer data.  A row written and stopped (its CRCs on disk), 4K
+# rewritten (that CRC in the cache only), then discarded with the drop held
+# back (csum_test_drop_delay_ms) past the map's lazy write-back: copies of
+# the members taken then are the crash.  Assembled, resynced and checked:
+# no csum mismatch.  RM_U_FIRST=1 marks the rows U first (the old order):
+# T19 must FAIL.
+teardown
+load devices_handle_discard_safely=Y csum_test_drop_delay_ms=8000 \
+	$([ "${RM_U_FIRST:-0}" = 1 ] && echo csum_test_u_first=Y)
+members; create
+mount -o remount,size=$(( (2 * NMEM + 2) * MEMSZ + 64 ))m $RMMEM		# room for the copies
+R=200; P=$((R * ROW + 8192))
+wr $((R * ROW)) $ROW a19				# U -> W, whole row
+$MDADM --stop $MD >/dev/null				# its CRCs go to the region
+$MDADM --assemble $MD "${M[@]}" >/dev/null 2>&1; idle
+wr $P 4096 b19						# this CRC in the cache only
+mk19="raidkm-test-rowmap T19 $$.$(date +%s%N)"; echo "$mk19" > /dev/kmsg
+mm19() { dmesg | sed -n "/$mk19/,\$p" | grep -c "native csum mismatch"; }
+blkdiscard -o $((R * ROW)) -l $ROW $MD & dpid=$!
+sleep 6.5						# the map's lazy write-back: 5 s
+st=$(cat /sys/block/$MDN/md/array_state)
+C=(); for i in "${!M[@]}"; do cp --sparse=always $RMMEM/m$i $RMMEM/c$i; done
+wait $dpid
+$MDADM --stop $MD >/dev/null
+echo 0 > /sys/module/raidkm/parameters/csum_test_drop_delay_ms
+for i in "${!M[@]}"; do C+=("$(losetup -f --show $RMMEM/c$i)"); done
+$MDADM --assemble $MD "${C[@]}" >/dev/null 2>&1; idle
+if [ ! -e /sys/block/$MDN/md/array_state ]; then
+	fail "T19 the crash copies do not assemble"
+else
+	echo check > /sys/block/$MDN/md/sync_action; sleep 1; idle
+	z4=$(dd if=/dev/zero bs=4096 count=1 status=none | md5sum | cut -c1-32)
+	r=$(rd $P 4096)
+	[ "$r" = "$(expect 0 4096 b19)" ] || [ "$r" = "$z4" ] || fail "T19 the rewritten 4K reads neither its data nor zeroes"
+	[ "$st" != clean ] || fail "T19 the array was clean at the copy (nothing to resync)"
+	[ "$(mm19)" = 0 ] && pass "T19 a crash before the drop leaves no stale CRC (map $(rm_get unwritten) U, array $st at the cut)" || \
+		fail "T19 $(mm19) csum mismatch(es) after a crash before the drop"
+	$MDADM --stop $MD >/dev/null
+fi
+for d in "${C[@]}"; do losetup -d $d; done; rm -f $RMMEM/c*
 fi
 
 dmesg | grep -E "BUG|WARNING|Oops|KASAN" | tail -5

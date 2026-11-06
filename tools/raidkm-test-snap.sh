@@ -16,6 +16,9 @@
 #   F8  attributes: replacing a key that is not the last one
 #   F9  more snapshots with attributes than md/rk_snap's one page holds:
 #       mdadm --snapshot lists, finds and destroys them all
+#   F10 discards: whole unshared rows go down (U); rows the newest
+#       snapshot shares are dropped (no reserve row taken); after a write
+#       gives the origin its own copy, or after the destroy, they go down
 #   perf (SNAP_PERF=1)  4K / 1M first and second pass after a snapshot,
 #            member bytes per user byte (rk_row_write=1)
 #
@@ -277,6 +280,47 @@ f9() {
 	teardown
 }
 
+f10() {
+	echo "== F10: discards through snapshots"
+	mk_loop 10 320; mkarray 128 || return
+	local rw=$(( ROWK * 1024 )) u0 d0 h0 A B
+	um() { awk '$1=="unwritten"{print $2}' $SYS/rk_rowmap; }
+	fio --name=f --filename=$MD --direct=1 --rw=write --bs=1M --size=32M --buffer_pattern=0x5a >/dev/null 2>&1
+	u0=$(um); d0=$(sv discard_rows)
+	blkdiscard -o 0 -l $(( 8 * rw )) $MD || fail "blkdiscard rows 0-7"
+	blkdiscard -o $(( 8 * rw + 4096 )) -l $(( rw )) $MD	# no whole row
+	[ "$(sv discard_rows)" = $(( d0 + 8 )) ] && [ "$(um)" = $(( u0 + 8 )) ] && \
+		pass "no snapshot: 8 whole rows went down and are U, a partial one nothing" || \
+		fail "no snapshot: discard_rows $d0 -> $(sv discard_rows), unwritten $u0 -> $(um)"
+	fio --name=f --filename=$MD --direct=1 --rw=write --bs=1M --size=32M --buffer_pattern=0x5a >/dev/null 2>&1
+	echo "create s1" > $SYS/rk_snap; S1=$(dev_of s1); udevadm settle; A=$(sumr $S1 0 32)
+	B=$(sumr $MD 0 32); h0=$(sv discard_shared); d0=$(sv discard_rows); u0=$(um)
+	blkdiscard -o $(( 4 * rw )) -l $(( 8 * rw )) $MD || fail "blkdiscard shared rows 4-11"
+	[ "$(sv discard_shared)" = $(( h0 + 8 )) ] && [ "$(sv discard_rows)" = $d0 ] && [ "$(um)" = $u0 ] && \
+		[ "$(sv free_rows)" = "$(sv reserve_rows)" ] && pass "8 rows the snapshot shares: dropped, no reserve row taken" || \
+		fail "shared: discard_shared $h0 -> $(sv discard_shared), discard_rows $d0 -> $(sv discard_rows), unwritten $u0 -> $(um), free $(sv free_rows)"
+	[ "$(sumr $S1 0 32)" = $A ] && [ "$(sumr $MD 0 32)" = $B ] && pass "s1 and the origin unchanged" || fail "content changed by a dropped discard"
+	# rows 4-7 written whole: the origin has its own copies, 8-11 still shared
+	fio --name=w --filename=$MD --direct=1 --rw=write --bs=1M --offset=$(( 4 * rw )) --size=$(( 4 * rw )) --buffer_pattern=0x33 >/dev/null 2>&1
+	h0=$(sv discard_shared); d0=$(sv discard_rows); u0=$(um)
+	blkdiscard -o $(( 4 * rw )) -l $(( 8 * rw )) $MD
+	[ "$(sv discard_rows)" = $(( d0 + 4 )) ] && [ "$(sv discard_shared)" = $(( h0 + 4 )) ] && [ "$(um)" = $(( u0 + 4 )) ] && \
+		pass "4 rows with their own copies went down (U), 4 shared dropped" || \
+		fail "mixed: discard_rows $d0 -> $(sv discard_rows), discard_shared $h0 -> $(sv discard_shared), unwritten $u0 -> $(um)"
+	[ "$(sumr $S1 0 32)" = $A ] && pass "s1 unchanged" || fail "s1 changed by a discard"
+	pyw $MD $(( 5 * rw + 512 )) 4096 310 && pyr $MD $(( 5 * rw + 512 )) 4096 310 && \
+		pass "a write into a discarded row reads back" || fail "write after the discard"
+	u0=$(um)
+	echo "destroy s1" > $SYS/rk_snap
+	[ "$(um)" -gt "$u0" ] && pass "destroy freed the snapshot's rows ($u0 -> $(um) U)" || fail "destroy: unwritten $u0 -> $(um)"
+	d0=$(sv discard_rows); u0=$(um)
+	blkdiscard -o $(( 8 * rw )) -l $(( 4 * rw )) $MD
+	[ "$(sv discard_rows)" = $(( d0 + 4 )) ] && [ "$(um)" = $(( u0 + 4 )) ] && \
+		pass "the once-shared rows, unshared now: went down" || \
+		fail "after destroy: discard_rows $d0 -> $(sv discard_rows), unwritten $u0 -> $(um)"
+	teardown
+}
+
 setup_content() {
 	mk_loop $NMEM $MEMSZ; mkarray 128 || exit 1
 	echo "    origin $(sv origin_rows) rows, reserve $(sv reserve_rows) rows"
@@ -291,10 +335,19 @@ content() {
 	echo "== content: chain of 3, destroy middle, destroy newest"
 	fio --name=f --filename=$MD --direct=1 --rw=write --bs=1M --size=${REG}M >/dev/null 2>&1
 	A=$(sum $MD)
+	# the origin map is sparse: a leaf only where a row moved
+	if [ "$(sv redirected)" = 0 ]; then
+		[ "$(sv origin_leaves)" = 0 ] && pass "no row moved: no origin map leaf ($(sv origin_map_bytes) bytes for $(sv origin_rows) rows)" || \
+			fail "origin_leaves '$(sv origin_leaves)' with nothing redirected"
+	fi
 	snap --create s1; S1=$(dev_of s1); udevadm settle
 	[ -b "$S1" ] && [ "$(sum $S1)" = $A ] && pass "s1 ($S1) = origin at create" || fail "s1 dev '$S1' content"
 	pat 1; B=$(sum $MD)
 	[ "$(sum $S1)" = $A ] && [ $B != $A ] && pass "origin changed (cow_whole $(sv cow_whole) cow_partial $(sv cow_partial)), s1 unchanged" || fail "s1 after writes"
+	l=$(sv origin_leaves); r=$(sv redirected); o=$(sv origin_rows)
+	[ "$r" -gt 0 ] && [ "$l" -ge 1 ] && [ "$l" -le "$r" ] && [ "$l" -le $(( (o + 1023) / 1024 )) ] && \
+		pass "COWs: $l origin map leaf(s) for $r moved rows ($(sv origin_map_bytes) bytes)" || \
+		fail "origin map: $l leaves, $r redirected, $o rows"
 	echo "create s2" > $SYS/rk_snap; S2=$(dev_of s2); pat 2; C=$(sum $MD)
 	echo "create s3" > $SYS/rk_snap; S3=$(dev_of s3); udevadm settle; pat 3; D=$(sum $MD)
 	[ "$(sum $S1)" = $A ] && [ "$(sum $S2)" = $B ] && [ "$(sum $S3)" = $C ] && pass "s1=A s2=B s3=C origin=D" || \
@@ -362,7 +415,7 @@ perf() {	# the Phase 0b cases, member bytes per user byte
 
 teardown; loadmod
 dmesg -C
-for t in content freeze f1 f2 f3 f4 f5 f6 f7 f8 f9; do
+for t in content freeze f1 f2 f3 f4 f5 f6 f7 f8 f9 f10; do
 	case " ${SKIP:-} " in *" $t "*) echo "== $t SKIPPED"; continue ;; esac
 	case $t in content|freeze) [ $t = content ] && setup_content; $t; [ $t = freeze ] && teardown ;; *) $t; teardown ;; esac
 done

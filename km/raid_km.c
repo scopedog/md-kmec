@@ -2127,6 +2127,9 @@ MODULE_PARM_DESC(native_csum,
  * whose real CRC-32C is 0 (the common all-zeroes block) must not read back as
  * absent, so a real 0 is stored as this marker and mapped back on read. */
 #define RAIDKM_CSUM_ZERO_MARK	0xffffffffU
+/* parked in `pending` in place of a CRC: the slot is to be emptied, a
+ * block being discarded (raidkm_csum_disc; beyond any u32 CRC) */
+#define RAIDKM_CSUM_PCLEAR	xa_mk_value(1UL << 32)
 
 /* Escape encoding for the marker collision: a block whose GENUINE CRC equals
  * ZERO_MARK would round-trip as expected-0 and heal-loop on every read, so
@@ -2243,6 +2246,15 @@ struct raidkm_csum_cache {
 	struct mutex		drop_mutex;
 	spinlock_t		drop_lock;	/* the pair, read and set */
 	unsigned long		drop_b0, drop_b1;
+	/* discards whose CRCs are dropped and whose stripes are not all
+	 * attached yet (struct raidkm_csum_disc, raidkm_csum_in_discard()) */
+	spinlock_t		disc_lock;
+	struct list_head	disc;
+	atomic_t		nr_disc;
+	/* parked RAIDKM_CSUM_PCLEAR entries the workers have not landed:
+	 * a discard attaches no stripe while there are any */
+	atomic_t		nr_clear;
+	wait_queue_head_t	clear_wq;
 	struct raidkm_csum_shard shards[];	/* flexible: nr_shards of them */
 };
 
@@ -2272,8 +2284,25 @@ MODULE_PARM_DESC(raidkm_csum_shards,
  */
 static bool raidkm_csum_rederive(struct r5conf *conf)
 {
-	unsigned long r = conf->mddev->recovery;
+	struct mddev *mddev = conf->mddev;
+	unsigned long r = mddev->recovery;
 
+	/* Also from an unclean start until a plain resync completes
+	 * (csum_fullsync, raidkm_csum_hold_run): before the resync starts
+	 * (read-only or auto-read-only, delayed, frozen), or when md counted
+	 * a resync as done that skipped a too-degraded array, the stored CRCs
+	 * may lag the data on EVERY member, so a verify would fail good
+	 * blocks (all copies "bad": EIO, bad blocks; on a read-only array the
+	 * unacknowledged bad blocks block the I/O).  Reads go unverified until
+	 * then (hotfix H, csum-crash-lag-2026-11-05.md).  The rule above
+	 * (FALSE for check, repair and rebuild) does not hold in this state:
+	 * no stored CRC can be trusted to locate rot until the resync has
+	 * run, so a check, repair or rebuild before it re-derives too.  Not
+	 * for a grow's new rows (recovery_cp below them, clean start): never
+	 * written, they have no CRCs to lag, and the rest must stay
+	 * verified. */
+	if (conf->csum_hold && READ_ONCE(conf->csum_fullsync))
+		return true;
 	return test_bit(MD_RECOVERY_SYNC, &r) &&
 	       !test_bit(MD_RECOVERY_REQUESTED, &r) &&
 	       !test_bit(MD_RECOVERY_RECOVER, &r);
@@ -2320,8 +2349,7 @@ struct raidkm_csum_trailer {
 static bool raidkm_csum_region(struct r5conf *conf, struct md_rdev *rdev,
 			       sector_t *start, sector_t *sectors)
 {
-	sector_t region = rdev->data_offset + conf->mddev->dev_sectors +
-			  (conf->dcl ? conf->chunk_sectors : 0);
+	sector_t region = rdev->data_offset + raidkm_tail_start(conf);
 	sector_t dev = bdev_nr_sectors(rdev->bdev);
 
 	if (dev <= region)
@@ -2334,6 +2362,28 @@ static bool raidkm_csum_region(struct r5conf *conf, struct md_rdev *rdev,
 		*sectors = min_t(sector_t, *sectors,
 				 raidkm_csum_reserve_sectors(conf->mddev->dev_sectors));
 	return true;
+}
+
+/* For rk_rowmap: where the CRC region starts on every member, in sectors
+ * from its data_offset, or -1 when the CRCs have no region (in-core only,
+ * or a member without room for it). */
+s64 raidkm_csum_region_start(struct r5conf *conf)
+{
+	struct md_rdev *rdev;
+	sector_t start, sectors;
+
+	if (!conf->csum_disk)
+		return -1;
+	rdev_for_each(rdev, conf->mddev) {
+		/* the members in the array; a spare gets its region when
+		 * it is added (raidkm_rowmap_init() skips spares too) */
+		if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags) ||
+		    test_bit(Journal, &rdev->flags) || !rdev->bdev)
+			continue;
+		if (!raidkm_csum_region(conf, rdev, &start, &sectors))
+			return -1;
+	}
+	return raidkm_tail_start(conf);
 }
 
 /* Load persisted CRCs from every member's region into the in-core xarray on
@@ -2436,9 +2486,16 @@ static bool raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 	tr->self_crc = cpu_to_le32(crc32c_le(0, crcs, RAIDKM_CSUM_BODY));
 	ok = sync_page_io(rdev, (rstart - rdev->data_offset) + off, PAGE_SIZE,
 			  s->bounce, REQ_OP_WRITE | REQ_FUA, false);
-	if (!ok)
+	if (!ok) {
+		/* the page's CRCs are not on this member: keep the page dirty
+		 * and fail the member, as md does for any write it could not
+		 * place -- left in, it would read back its old CRCs after a
+		 * crash or the next assembly (no resync covers a clean stop) */
+		set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
 		pr_warn_ratelimited("md/raid:%s: native csum page write failed disk %d\n",
 				    mdname(conf->mddev), m);
+		md_error(conf->mddev, rdev);
+	}
 	rdev_dec_pending(rdev, conf->mddev);
 	return ok;
 }
@@ -2613,6 +2670,8 @@ static int raidkm_csum_peek(struct r5conf *conf, int member, unsigned long blk,
 	u32 c;
 
 	e = xa_load(&s->pending, raidkm_csum_pkey(member, blk));
+	if (e == RAIDKM_CSUM_PCLEAR)
+		return 0;			/* being discarded: no CRC */
 	if (e) {
 		*want = (u32)xa_to_value(e);
 		return 1;
@@ -2648,6 +2707,8 @@ static bool raidkm_csum_expected(struct raidkm_csum_shard *s, int member,
 	void *e = xa_load(&s->pending, raidkm_csum_pkey(member, blk));
 	struct raidkm_csum_page *pg;
 
+	if (e == RAIDKM_CSUM_PCLEAR)
+		return false;			/* being discarded: no CRC */
 	if (e) {
 		*want = (u32)xa_to_value(e);
 		return true;
@@ -2656,6 +2717,213 @@ static bool raidkm_csum_expected(struct raidkm_csum_shard *s, int member,
 	if (!pg)
 		return false;
 	return raidkm_csum_get_slot(pg, blk, want);
+}
+
+/*
+ * A write racing a member discard of the same blocks.  make_discard_request()
+ * drops the CRCs of the rows it trims (raidkm_csum_drop_rows()) and only then
+ * attaches the discard to their stripes, one at a time.  A write that is
+ * issued in between stores its CRC after the drop; the trim then zeroes the
+ * block under it, and the block fails its CRC on every read (found 11-04:
+ * 4K random writes and one-row trims of the same rows; with m stale blocks in
+ * a stripe nothing repairs it).
+ *
+ * So the discard registers [cur, end), the blocks it has dropped and not yet
+ * attached, before the drop, and moves cur up as it attaches its stripes.  A
+ * CRC stored for a block in such a range leaves the slot empty instead: the
+ * write that stores it was issued before the discard reached its stripe,
+ * and the discard waits for it to complete (towrite, written, the row write
+ * lock) before it attaches, so the block is trimmed after it.  Empty only
+ * skips verify (the safe direction), and a crash before the trim leaves the
+ * write's data unverified, never a stale CRC.  A write issued after the
+ * discard attached waits for it (R5_Overlap) and stores its CRC normally.
+ *
+ * Declustered, ngroups stripes share a sector and the discard may sleep
+ * between them (a write in flight on the next group), so cur moves only
+ * once all are attached; `att` names the members whose stripe at cur is
+ * attached already, which a store then treats as past the range.  cur and
+ * att change together under `seq`.
+ *
+ * Ordering with the drop: the range is registered (and nr_disc raised)
+ * before the drop starts.  The drop clears resident slots under pg->slock
+ * and parked stores under s->lock; a store tests the range under pg->slock
+ * (resident) or after it parked and before it queues the worker (smp_mb),
+ * so it either sees the range or is cleared by the drop.
+ *
+ * A store that sees the range parks RAIDKM_CSUM_PCLEAR for the block, over
+ * whatever it parked: the shard worker may have landed that CRC meanwhile
+ * (queued for another entry), and even written the page back.  The worker
+ * lands PCLEAR as an empty slot and writes the page if it is dirty; the
+ * discard attaches no stripe while any PCLEAR is parked (nr_clear), so the
+ * empty slot is on disk before the trim.  The store itself never sleeps on
+ * region I/O: it runs in ops_run_io and, for the row layer, in submit_bio.
+ *
+ * The ranges are an RCU list: the store tests them on every CRC while any
+ * discard runs, so it takes no lock.
+ */
+struct raidkm_csum_disc {
+	struct list_head	l;
+	struct rcu_head		rcu;
+	seqlock_t		seq;		/* cur and att */
+	unsigned long		cur, end;	/* blocks, per member */
+	unsigned int		ndisks;
+	unsigned long		att[];		/* members attached at cur */
+};
+
+/* testing only: the old order (the store ignores the discard's range) */
+static bool csum_test_discard_race;
+module_param(csum_test_discard_race, bool, 0644);
+MODULE_PARM_DESC(csum_test_discard_race,
+		 "TESTING ONLY: let a write racing a member discard store the CRC the trim then makes stale");
+
+static bool raidkm_csum_in_discard(struct raidkm_csum_cache *c, int member,
+				   unsigned long blk)
+{
+	struct raidkm_csum_disc *d;
+	bool hit = false;
+	unsigned int sq;
+
+	if (!atomic_read(&c->nr_disc))
+		return false;
+	rcu_read_lock();
+	list_for_each_entry_rcu(d, &c->disc, l) {
+		if (blk >= d->end)
+			continue;
+		do {
+			unsigned long cur;
+
+			sq = read_seqbegin(&d->seq);
+			cur = d->cur;
+			hit = blk > cur ||
+			      (blk == cur && !test_bit(member, d->att));
+		} while (read_seqretry(&d->seq, sq));
+		if (hit)
+			break;
+	}
+	rcu_read_unlock();
+	return hit;
+}
+
+/* NULL: no memory, the caller sends no discard down (a hint) */
+static struct raidkm_csum_disc *raidkm_csum_disc_add(struct r5conf *conf,
+						     unsigned long b0,
+						     unsigned long b1)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	struct raidkm_csum_disc *d;
+
+	d = kzalloc(struct_size(d, att, BITS_TO_LONGS(conf->raid_disks)),
+		    GFP_NOIO);
+	if (!d)
+		return NULL;
+	seqlock_init(&d->seq);
+	d->cur = b0;
+	d->end = b1;
+	d->ndisks = conf->raid_disks;
+	spin_lock_irq(&c->disc_lock);
+	list_add_rcu(&d->l, &c->disc);
+	atomic_inc(&c->nr_disc);
+	spin_unlock_irq(&c->disc_lock);
+	smp_mb();	/* the range before the drop's scans; pairs with the
+			 * park-then-test in raidkm_csum_store() */
+	return d;
+}
+
+/* the discard is attached to @sh, at d->cur: its members are past the range */
+static void raidkm_csum_disc_attached(struct r5conf *conf,
+				      struct raidkm_csum_disc *d,
+				      struct stripe_head *sh)
+{
+	int i;
+
+	write_seqlock(&d->seq);
+	for (i = 0; i < sh->disks; i++)
+		__set_bit(raidkm_sh_pdisk_rw(conf, sh, i, true), d->att);
+	write_sequnlock(&d->seq);
+}
+
+/* every stripe at d->cur is attached: on to @next */
+static void raidkm_csum_disc_advance(struct raidkm_csum_disc *d,
+				     unsigned long next)
+{
+	write_seqlock(&d->seq);
+	d->cur = next;
+	bitmap_zero(d->att, d->ndisks);
+	write_sequnlock(&d->seq);
+}
+
+static void raidkm_csum_disc_del(struct raidkm_csum_cache *c,
+				 struct raidkm_csum_disc *d)
+{
+	spin_lock_irq(&c->disc_lock);
+	list_del_rcu(&d->l);
+	atomic_dec(&c->nr_disc);
+	spin_unlock_irq(&c->disc_lock);
+	kfree_rcu(d, rcu);
+}
+
+/* a parked PCLEAR left `pending` (landed, superseded or dropped) */
+static void raidkm_csum_clear_done(struct raidkm_csum_cache *c)
+{
+	if (atomic_dec_and_test(&c->nr_clear))
+		wake_up_all(&c->clear_wq);
+}
+
+/* a discard is about to attach a stripe: the PCLEARs parked so far are on
+ * disk first.  Sleeps (on the shard workers, which do the region I/O in
+ * their own context, so it is safe in submit_bio). */
+static void raidkm_csum_wait_clears(struct raidkm_csum_cache *c)
+{
+	if (c && atomic_read(&c->nr_clear))
+		wait_event(c->clear_wq, !atomic_read(&c->nr_clear));
+}
+
+/* empty the slot of @blk in resident page @pg (pg->slock held); true when
+ * it held a CRC (the page is then dirty) */
+static bool raidkm_csum_clear_slot_locked(struct raidkm_csum_page *pg,
+					  unsigned long blk)
+{
+	__le32 *crcs = kmap_local_page(pg->page);
+	bool had = crcs[raidkm_csum_slot(blk)] != 0;
+
+	crcs[raidkm_csum_slot(blk)] = 0;
+	kunmap_local(crcs);
+	if (had)
+		set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+	return had;
+}
+
+/*
+ * The CRC of @blk on @member is about to be trimmed: park PCLEAR over any
+ * parked store, for the worker to land as an empty slot, on disk before the
+ * discard attaches (see raidkm_csum_disc).  Never sleeps on region I/O.  A
+ * failed insert (no memory) erases the parked store instead, which leaves
+ * only a CRC the worker landed already and wrote back in the few
+ * instructions since: warned about.
+ */
+static void raidkm_csum_park_clear(struct raidkm_csum_cache *c,
+				   struct raidkm_csum_shard *s,
+				   unsigned long pk)
+{
+	void *old = xa_store(&s->pending, pk, RAIDKM_CSUM_PCLEAR, GFP_NOIO);
+
+	if (xa_is_err(old)) {
+		old = xa_erase(&s->pending, pk);
+		if (old) {
+			atomic_dec(&s->pending_nr);
+			if (old == RAIDKM_CSUM_PCLEAR)
+				raidkm_csum_clear_done(c);
+			wake_up(&s->pending_waitq);
+		}
+		pr_warn_ratelimited("md/raid:%s: native csum: no memory to clear the CRC of a block being discarded\n",
+				    mdname(c->conf->mddev));
+		return;
+	}
+	if (!old)
+		atomic_inc(&s->pending_nr);
+	if (old != RAIDKM_CSUM_PCLEAR)
+		atomic_inc(&c->nr_clear);
+	queue_work(c->wq, &s->work);
 }
 
 /* Called from ops_run_io (write issue; stripe path, must not block on region
@@ -2686,12 +2954,17 @@ static void raidkm_csum_store(struct r5conf *conf, int member,
 	 * landed + erased the entry between the load and the cmpxchg, fall
 	 * through to the normal paths (the landing is complete, so a direct
 	 * slot write can no longer be overtaken). */
+	/* the discard guard (raidkm_csum_disc); off only for the negative
+	 * control */
+	bool guard = !csum_test_discard_race;
+
 	e = xa_load(&s->pending, pk);
 	if (e) {
 		if (xa_cmpxchg(&s->pending, pk, e, xa_mk_value(crc),
 			       GFP_NOWAIT) == e) {
-			queue_work(c->wq, &s->work);
-			return;
+			if (e == RAIDKM_CSUM_PCLEAR)
+				raidkm_csum_clear_done(c);
+			goto parked;
 		}
 	}
 	rcu_read_lock();
@@ -2700,14 +2973,32 @@ static void raidkm_csum_store(struct r5conf *conf, int member,
 		spin_lock(&pg->slock);
 		/* still resident? (eviction erases under slock) */
 		if (xa_load(&s->pages, raidkm_csum_key(member, blk)) == pg) {
-			raidkm_csum_set_slot(pg, blk, crc);
+			/* a discard about to trim the block: leave it empty
+			 * (raidkm_csum_disc above).  Tested under slock: the
+			 * drop clears this page under it after registering.
+			 * A CRC found there the worker landed meanwhile: the
+			 * page may have been written back since, so it is
+			 * written again before the trim (PCLEAR) */
+			bool had = false, hit = guard &&
+				raidkm_csum_in_discard(c, member, blk);
+
+			if (hit)
+				had = raidkm_csum_clear_slot_locked(pg, blk);
+			else
+				raidkm_csum_set_slot(pg, blk, crc);
 			spin_unlock(&pg->slock);
 			rcu_read_unlock();
+			if (had)
+				raidkm_csum_park_clear(c, s, pk);
 			return;
 		}
 		spin_unlock(&pg->slock);
 	}
 	rcu_read_unlock();
+	if (guard && raidkm_csum_in_discard(c, member, blk)) {
+		raidkm_csum_park_clear(c, s, pk);
+		return;
+	}
 	/* Bounded park: at the per-shard cap, THROTTLE the writer until the
 	 * worker drains below it.  ops_run_io may sleep (GFP_NOIO below is
 	 * precedent), and the worker's progress -- region faults straight to
@@ -2730,6 +3021,15 @@ static void raidkm_csum_store(struct r5conf *conf, int member,
 	if (xa_err(xa_store(&s->pending, pk, xa_mk_value(crc), GFP_NOIO)))
 		return;
 	atomic_inc(&s->pending_nr);
+parked:
+	/* parked, then tested, then queued: a range registered before the
+	 * test is seen here (and the CRC, landed or not, replaced by PCLEAR);
+	 * one after it, the drop's scan of `pending` erases the entry */
+	smp_mb();
+	if (guard && raidkm_csum_in_discard(c, member, blk)) {
+		raidkm_csum_park_clear(c, s, pk);
+		return;
+	}
 	queue_work(c->wq, &s->work);
 }
 
@@ -2746,6 +3046,18 @@ static bool csum_test_no_discard_drop;
 module_param(csum_test_no_discard_drop, bool, 0644);
 MODULE_PARM_DESC(csum_test_no_discard_drop,
 		 "TESTING ONLY: do not drop the native CRCs of blocks the members are sent a discard for");
+
+/* testing only: the old order, rows U before their CRCs are dropped (the
+ * map may reach the disk first), and a pause before each drop that holds
+ * that window open (raidkm-test-rowmap.sh T19) */
+static bool csum_test_u_first;
+module_param(csum_test_u_first, bool, 0644);
+MODULE_PARM_DESC(csum_test_u_first,
+		 "TESTING ONLY: mark discarded rows unwritten before their native CRCs are dropped");
+static unsigned int csum_test_drop_delay_ms;
+module_param(csum_test_drop_delay_ms, uint, 0644);
+MODULE_PARM_DESC(csum_test_drop_delay_ms,
+		 "TESTING ONLY: sleep this long before dropping the native CRCs of discarded rows");
 
 /*
  * Native checksums, discard: the members are about to be sent a discard of
@@ -2808,8 +3120,11 @@ static bool raidkm_csum_drop_rows_io(struct r5conf *conf, u64 first_row,
 			}
 			xa_for_each_range(&s->pending, k, e, mk + b0,
 					  mk + b1 - 1) {
-				if (xa_erase(&s->pending, k)) {
+				e = xa_erase(&s->pending, k);
+				if (e) {
 					atomic_dec(&s->pending_nr);
+					if (e == RAIDKM_CSUM_PCLEAR)
+						raidkm_csum_clear_done(c);
 					woke = true;
 				}
 			}
@@ -2905,6 +3220,8 @@ static bool raidkm_csum_drop_rows(struct r5conf *conf, u64 first_row,
 
 	if (!conf->csum || first_row >= last_row)
 		return true;
+	if (unlikely(READ_ONCE(csum_test_drop_delay_ms)))
+		msleep(READ_ONCE(csum_test_drop_delay_ms));
 	INIT_WORK_ONSTACK(&d.work, raidkm_csum_drop_fn);
 	queue_work(conf->csum->abio_wq, &d.work);
 	flush_work(&d.work);
@@ -3016,10 +3333,23 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 				continue;
 			}
 			pg = raidkm_csum_get(s, raidkm_csum_key(member, blk));
-			if (pg) {
+			if (pg && e == RAIDKM_CSUM_PCLEAR) {
+				/* a block being discarded: empty, on disk
+				 * before the discard attaches (raidkm_csum_disc) */
+				spin_lock(&pg->slock);
+				raidkm_csum_clear_slot_locked(pg, blk);
+				spin_unlock(&pg->slock);
+				if (test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags) &&
+				    !raidkm_csum_page_flush(s, pg))
+					pr_warn_ratelimited("md/raid:%s: native csum: a CRC of a block being discarded could not be cleared on disk\n",
+							    mdname(conf->mddev));
+			} else if (pg) {
 				spin_lock(&pg->slock);
 				raidkm_csum_set_slot(pg, blk, (u32)xa_to_value(e));
 				spin_unlock(&pg->slock);
+			} else if (e == RAIDKM_CSUM_PCLEAR) {
+				pr_warn_ratelimited("md/raid:%s: native csum: a CRC of a block being discarded could not be cleared\n",
+						    mdname(conf->mddev));
 			}
 			mutex_unlock(&s->lock);
 			/* slot-store BEFORE pending-erase (pairs with peek's
@@ -3029,8 +3359,11 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 			 * which a later read false-mismatches on and the
 			 * confirmed heal-rewrite then repairs. */
 			if (xa_cmpxchg(&s->pending, idx, e, NULL,
-				       GFP_NOWAIT) == e)
+				       GFP_NOWAIT) == e) {
 				atomic_dec(&s->pending_nr);
+				if (e == RAIDKM_CSUM_PCLEAR)
+					raidkm_csum_clear_done(s->cache);
+			}
 			did = true;
 			if (!--budget)
 				/* bounded pass: a sustained store flood must
@@ -3108,6 +3441,83 @@ static void raidkm_csum_writeback(struct r5conf *conf)
 	}
 }
 
+/* Hotfix H for the CRC write-back lag (notes csum-crash-lag-2026-11-05.md).
+ * The region is written back lazily (quiesce, stop, eviction, drops), and
+ * a crash re-derives CRCs only over the resync's scope.  md shrinks that
+ * scope by itself: safe mode marks the superblock clean ~200 ms after the
+ * last write (no resync at all), and while the array is dirty the resync
+ * offset it saves is a checkpoint past CRCs the cache alone holds.  Both
+ * need md's set_in_sync(), which succeeds only with writes_pending at
+ * zero: hold one reference while the array runs.  That also covers a
+ * sysfs safe_mode_delay or array_state=clean write and the reboot
+ * notifier's safe mode; md's forced clean at stop (__md_stop_writes) comes
+ * after quiesce, which writes the CRCs back (raidkm_pers_quiesce).  Cost: once
+ * written, the array stays "active" until it stops, and a crash resyncs
+ * every row with data even after a long idle.
+ *
+ * The write-intent bitmap shrinks it too: a chunk's bit clears seconds
+ * after its last write, CRCs still in the cache.  An unclean start
+ * therefore resyncs without the bitmap (csum_fullsync) until a resync
+ * completes.  The row map still skips U rows (their CRCs were dropped on
+ * disk before they became U). */
+static bool csum_test_no_hold;	/* testing only: the old behaviour */
+module_param(csum_test_no_hold, bool, 0644);
+MODULE_PARM_DESC(csum_test_no_hold,
+		 "TESTING ONLY: let md mark a native-csum array clean and scope its resync by the bitmap (CRCs may lag on disk)");
+
+static void raidkm_csum_hold_run(struct r5conf *conf)
+{
+	struct mddev *mddev = conf->mddev;
+
+	if (!conf->csum || !conf->csum_disk || conf->csum_hold ||
+	    csum_test_no_hold)
+		return;
+	percpu_ref_get(&mddev->writes_pending);
+	conf->csum_hold = true;
+	if (mddev->recovery_cp != MaxSector) {
+		conf->csum_fullsync = true;
+		pr_info("md/raid:%s: native csum: unclean start, resync ignores the write-intent bitmap\n",
+			mdname(mddev));
+	}
+}
+
+/* md_run() leaves the array in_sync whatever the superblock said, and an
+ * in_sync array's superblock records the resync's progress (its
+ * checkpoints, then "clean" at the end) although the CRCs it re-derived are
+ * in the cache only: a second crash would resume past stale CRCs.  A
+ * resync marks the array dirty, as a write would (md_write_start); the
+ * hold keeps it so until a stop writes the CRCs back. */
+static void raidkm_csum_sync_dirty(struct r5conf *conf)
+{
+	struct mddev *mddev = conf->mddev;
+
+	if (!conf->csum_hold || !READ_ONCE(mddev->in_sync) ||
+	    !raidkm_csum_rederive(conf))
+		return;
+	spin_lock(&mddev->lock);
+	if (mddev->in_sync) {
+		mddev->in_sync = 0;
+		/* not MD_SB_CHANGE_PENDING, unlike md_write_start(): nothing
+		 * has to wait for this superblock write (any later one,
+		 * checkpoints included, carries the dirty state), and PENDING
+		 * defers every stripe in handle_stripe() until md writes it --
+		 * which a store holding reconfig_mutex in raid5_quiesce()
+		 * (group_thread_cnt, ...) would never let happen: deadlock */
+		set_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags);
+		md_wakeup_thread(mddev->thread);
+	}
+	spin_unlock(&mddev->lock);
+	sysfs_notify_dirent_safe(mddev->sysfs_state);
+}
+
+static void raidkm_csum_hold_free(struct r5conf *conf)
+{
+	if (!conf->csum_hold)
+		return;
+	conf->csum_hold = false;
+	percpu_ref_put(&conf->mddev->writes_pending);
+}
+
 /* Auto-size the region-page cache from the array geometry: enough pages to
  * cover EVERY member's whole CRC region (member_blocks/1022 per member --
  * that is data+parity blocks, ~1 page per 4 MiB of member capacity), clamped
@@ -3163,6 +3573,11 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 	c->nr_shards = nsh;
 	mutex_init(&c->drop_mutex);
 	spin_lock_init(&c->drop_lock);
+	spin_lock_init(&c->disc_lock);
+	INIT_LIST_HEAD(&c->disc);
+	atomic_set(&c->nr_disc, 0);
+	atomic_set(&c->nr_clear, 0);
+	init_waitqueue_head(&c->clear_wq);
 	/* split the total soft ceiling across shards (>=16 each so tiny caches work) */
 	per = max(max(total, 64u) / nsh, 16u);
 	for (i = 0; i < nsh; i++) {
@@ -6562,6 +6977,18 @@ schedule_reconstruction(struct stripe_head *sh, struct stripe_head_state *s,
 		s->locked, s->ops_request);
 }
 
+/*
+ * A discard is done with @sh and took it out of the hash (stripe_lock held):
+ * whoever still holds it from before must get the sector's stripe again
+ * (raid5_get_active_stripe) instead of joining this one
+ * (stripe_bio_overlaps()).  Only the discard's clean event unhashes a stripe
+ * in use.
+ */
+static bool raidkm_stripe_gone(struct stripe_head *sh)
+{
+	return hlist_unhashed(&sh->hash);
+}
+
 static bool stripe_bio_overlaps(struct stripe_head *sh, struct bio *bi,
 				int dd_idx, int forwrite)
 {
@@ -6601,6 +7028,26 @@ static bool stripe_bio_overlaps(struct stripe_head *sh, struct bio *bi,
 	if ((forwrite || conf->csum ||
 	     test_bit(STRIPE_ROW_SYNC_RD, &sh->state)) &&
 	    test_bit(STRIPE_ROW_SYNC, &sh->state))
+		return true;
+
+	/*
+	 * A discard is on the stripe: nothing joins it until the discard is
+	 * done.  handle_stripe_clean_event() then takes the stripe out of the
+	 * hash with whatever joined still on it, which goes on unhashed: the
+	 * next discard of the row gets a new stripe of the same sector and
+	 * does not wait for it, a row write's walk (raidkm_row_write_lock)
+	 * does not see it, and any write gets a new stripe next to it.  Found
+	 * 11-05 (rowmap T18 at 120 s): a write that joined stored its CRCs
+	 * and wrote while the next discard trimmed the same blocks, three
+	 * mismatches and bad blocks per stripe; under a row write the joined
+	 * read-modify-write builds parity from the half-written row, and with
+	 * native CRCs a read's mismatch there heals with old data.  The clean
+	 * event takes the stripe out of the hash and then clears
+	 * STRIPE_DISCARD under stripe_lock and wakes R5_Overlap, so a bounce
+	 * here is woken, and a caller that sees the flag clear sees the
+	 * stripe unhashed (raidkm_stripe_gone()).
+	 */
+	if ((forwrite || conf->csum) && test_bit(STRIPE_DISCARD, &sh->state))
 		return true;
 
 	if (forwrite)
@@ -6771,6 +7218,10 @@ static bool add_stripe_bio(struct stripe_head *sh, struct bio *bi,
 {
 	spin_lock_irq(&sh->stripe_lock);
 
+	if (raidkm_stripe_gone(sh)) {
+		spin_unlock_irq(&sh->stripe_lock);
+		return false;
+	}
 	if (stripe_bio_overlaps(sh, bi, dd_idx, forwrite)) {
 		set_bit(R5_Overlap, &sh->dev[dd_idx].flags);
 		spin_unlock_irq(&sh->stripe_lock);
@@ -6876,6 +7327,9 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 		/* and fail all 'written' */
 		bi = sh->dev[i].written;
 		sh->dev[i].written = NULL;
+		/* a discard waits for written to clear (make_discard_request) */
+		if (bi && test_and_clear_bit(R5_Overlap, &sh->dev[i].flags))
+			wake_up_bit(&sh->dev[i].flags, R5_Overlap);
 		if (test_and_clear_bit(R5_SkipCopy, &sh->dev[i].flags)) {
 			WARN_ON(test_bit(R5_UPTODATE, &sh->dev[i].flags));
 			sh->dev[i].page = sh->dev[i].orig_page;
@@ -6922,6 +7376,18 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 		 * still be locked - so just clear all R5_LOCKED flags
 		 */
 		clear_bit(R5_LOCKED, &sh->dev[i].flags);
+	}
+	/* the discard failed with the writes: the stripe stays in the hash,
+	 * and what bounced off the discard (stripe_bio_overlaps) may join
+	 * now.  The flag under stripe_lock, then the wake-up, as the clean
+	 * event does */
+	if (test_bit(STRIPE_DISCARD, &sh->state)) {
+		spin_lock_irq(&sh->stripe_lock);
+		clear_bit(STRIPE_DISCARD, &sh->state);
+		spin_unlock_irq(&sh->stripe_lock);
+		for (i = disks; i--; )
+			if (test_and_clear_bit(R5_Overlap, &sh->dev[i].flags))
+				wake_up_bit(&sh->dev[i].flags, R5_Overlap);
 	}
 	s->to_write = 0;
 	s->written = 0;
@@ -7594,6 +8060,21 @@ returnbi:
 
 	log_stripe_write_finished(sh);
 
+	/* a discard waits for an in-flight write (written) of this stripe
+	 * before it attaches, with native CRCs (make_discard_request); it
+	 * registered its range before it looked at written, so with none
+	 * registered nobody waits here.  The barrier: written cleared above,
+	 * then nr_disc */
+	if (do_endio && conf->csum) {
+		smp_mb();
+		if (atomic_read(&conf->csum->nr_disc))
+			for (i = disks; i--; )
+				if (test_and_clear_bit(R5_Overlap,
+						       &sh->dev[i].flags))
+					wake_up_bit(&sh->dev[i].flags,
+						    R5_Overlap);
+	}
+
 	if (!discard_pending &&
 	    test_bit(R5_Discard, &sh->dev[sh->pd_idx].flags)) {
 		int hash, p, j;
@@ -7611,8 +8092,6 @@ returnbi:
 			clear_bit(R5_Discard, &sh->dev[sh->qd_idx].flags);
 			clear_bit(R5_UPTODATE, &sh->dev[sh->qd_idx].flags);
 		}
-		/* now that discard is done we can proceed with any sync */
-		clear_bit(STRIPE_DISCARD, &sh->state);
 		/*
 		 * SCSI discard will change some bio fields and the stripe has
 		 * no updated data, so remove it from hash list and the stripe
@@ -7630,6 +8109,19 @@ unhash:
 					goto unhash;
 		}
 		sh = head_sh;
+
+		/* now that discard is done we can proceed with any sync.  Out
+		 * of the hash first, then the flag under stripe_lock, then the
+		 * wake-up: a write or read that bounced off the discard
+		 * (stripe_bio_overlaps) set R5_Overlap before the flag went,
+		 * and one that sees the flag gone sees the stripe gone too
+		 * (raidkm_stripe_gone) and gets a new one */
+		spin_lock_irq(&sh->stripe_lock);
+		clear_bit(STRIPE_DISCARD, &sh->state);
+		spin_unlock_irq(&sh->stripe_lock);
+		for (p = disks; p--; )
+			if (test_and_clear_bit(R5_Overlap, &sh->dev[p].flags))
+				wake_up_bit(&sh->dev[p].flags, R5_Overlap);
 
 		if (test_bit(STRIPE_SYNC_REQUESTED, &sh->state))
 			set_bit(STRIPE_HANDLE, &sh->state);
@@ -8860,6 +9352,53 @@ static void break_stripe_batch_list(struct stripe_head *head_sh,
 		set_bit(STRIPE_HANDLE, &head_sh->state);
 }
 
+/* A resync re-derives the native CRCs of the blocks it READS
+ * (raidkm_csum_verify_stripe on a SYNCING stripe).  A block already up to
+ * date in the stripe cache -- read before the resync reached it, verify
+ * skipped in the resync window (udev's probe of block 0 at assembly) -- is
+ * not read again, so its stale CRC would outlive the resync: a mismatch
+ * (healed) at the first read after it, EIO if every copy is stale.  Before
+ * a stripe starts syncing in that window, drop R5_UPTODATE from its clean
+ * blocks so the sync reads them from disk.  Only on a quiet stripe (no
+ * block I/O or queued verify, no compute, check, reconstruct or biofill
+ * running): false
+ * leaves STRIPE_SYNC_REQUESTED for the re-handle that the running work
+ * ends with.  Called under sh->stripe_lock. */
+static bool csum_test_no_reread;	/* testing only: the old behaviour */
+module_param(csum_test_no_reread, bool, 0644);
+MODULE_PARM_DESC(csum_test_no_reread,
+		 "TESTING ONLY: a resync keeps blocks cached before it reached them (their native CRCs are not re-derived)");
+
+static bool raidkm_csum_sync_reread(struct r5conf *conf, struct stripe_head *sh)
+{
+	int i;
+
+	if (!conf->csum || !raidkm_csum_rederive(conf) || csum_test_no_reread)
+		return true;
+	if (sh->check_state || sh->reconstruct_state ||
+	    test_bit(STRIPE_BIOFILL_RUN, &sh->state) ||
+	    test_bit(STRIPE_COMPUTE_RUN, &sh->state))
+		return false;
+	/* R5_CsumPending: a read done whose verify is queued; the worker
+	 * skips a block that is not up to date and leaves the gate for an
+	 * endio that would never come -- wait for the verify instead */
+	for (i = sh->disks; i--; )
+		if (test_bit(R5_LOCKED, &sh->dev[i].flags) ||
+		    test_bit(R5_CsumPending, &sh->dev[i].flags))
+			return false;
+	for (i = sh->disks; i--; ) {
+		struct r5dev *dev = &sh->dev[i];
+
+		if (test_bit(R5_UPTODATE, &dev->flags) &&
+		    test_bit(R5_Insync, &dev->flags) &&
+		    !dev->towrite && !dev->written &&
+		    !test_bit(R5_Wantwrite, &dev->flags) &&
+		    !test_bit(R5_InJournal, &dev->flags))
+			clear_bit(R5_UPTODATE, &dev->flags);
+	}
+	return true;
+}
+
 static void handle_stripe(struct stripe_head *sh)
 {
 	struct stripe_head_state s;
@@ -8899,6 +9438,7 @@ static void handle_stripe(struct stripe_head *sh)
 		if (!test_bit(STRIPE_R5C_PARTIAL_STRIPE, &sh->state) &&
 		    !test_bit(STRIPE_R5C_FULL_STRIPE, &sh->state) &&
 		    !test_bit(STRIPE_DISCARD, &sh->state) &&
+		    raidkm_csum_sync_reread(conf, sh) &&
 		    test_and_clear_bit(STRIPE_SYNC_REQUESTED, &sh->state)) {
 			set_bit(STRIPE_SYNCING, &sh->state);
 			clear_bit(STRIPE_INSYNC, &sh->state);
@@ -13595,16 +14135,186 @@ static void release_stripe_plug(struct mddev *mddev,
 		raid5_release_stripe(sh);
 }
 
+/*
+ * make_discard_request(): attach discard @bi to the stripe at member sector
+ * @sector of declustered group @grp (0 on a classic array), once nothing
+ * else is in its way.  @disc_on: native CRCs with a raidkm_csum_disc range,
+ * which also waits for a write in flight.
+ */
+static void raidkm_discard_stripe(struct r5conf *conf, struct bio *bi,
+				  sector_t logical_sector, int grp,
+				  struct raidkm_csum_disc *disc)
+{
+	struct mddev *mddev = conf->mddev;
+	struct stripe_head *sh;
+	int d;
+
+again:
+	/* the empty slots of racing writes on disk first (raidkm_csum_disc);
+	 * every retry below comes back here, after the write it waited for */
+	if (disc)
+		raidkm_csum_wait_clears(conf->csum);
+	sh = raid5_get_active_stripe(conf, NULL, logical_sector,
+				     grp, 0);
+	set_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags);
+	if (test_bit(STRIPE_SYNCING, &sh->state)) {
+		raid5_release_stripe(sh);
+		wait_on_bit(&sh->dev[sh->pd_idx].flags, R5_Overlap,
+			    TASK_UNINTERRUPTIBLE);
+		goto again;
+	}
+	clear_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags);
+	spin_lock_irq(&sh->stripe_lock);
+	/*
+	 * Still in a write batch: handle_stripe_clean_event() returns the
+	 * batch's writes (written, and the Overlap wake-up the test below
+	 * waits for) before it breaks the batch, so the stripe can look idle
+	 * here with batch_head still set.  A discard attached then makes a
+	 * batch head with STRIPE_DISCARD, which break_stripe_batch_list()
+	 * spreads over the members: init_stripe() found towrite set and
+	 * handle_stripe() hit its parity BUG_ON (found 11-05, rowmap T18).
+	 * break_stripe_batch_list() clears batch_head under stripe_lock and
+	 * then wakes R5_Overlap on every dev: set under the lock, the bit is
+	 * seen.  The timeout is the same backstop as below.
+	 */
+	if (sh->batch_head) {
+		set_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags);
+		spin_unlock_irq(&sh->stripe_lock);
+		raid5_release_stripe(sh);
+		wait_on_bit_timeout(&sh->dev[sh->pd_idx].flags, R5_Overlap,
+				    TASK_UNINTERRUPTIBLE, HZ);
+		goto again;
+	}
+	/* the last discard of this stripe is still on it, or done and the
+	 * stripe out of the hash (stripe_bio_overlaps, raidkm_stripe_gone):
+	 * attached to either, this one would go on unhashed beside the
+	 * sector's next stripe */
+	if (raidkm_stripe_gone(sh)) {
+		spin_unlock_irq(&sh->stripe_lock);
+		raid5_release_stripe(sh);
+		goto again;
+	}
+	if (test_bit(STRIPE_DISCARD, &sh->state)) {
+		set_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags);
+		spin_unlock_irq(&sh->stripe_lock);
+		raid5_release_stripe(sh);
+		wait_on_bit_timeout(&sh->dev[sh->pd_idx].flags, R5_Overlap,
+				    TASK_UNINTERRUPTIBLE, HZ);
+		goto again;
+	}
+	for (d = 0; d < sh->disks; d++) {
+		if (is_parity_disk(sh, d))
+			continue;
+		/* a row rebuild owns this chunk: discarding the
+		 * survivors under its reads would leave the member it
+		 * rebuilds holding decoded stale data.  Same bounce
+		 * the normal write path takes. */
+		if (sh->dev[d].towrite || sh->dev[d].toread ||
+		    test_bit(STRIPE_ROW_SYNC, &sh->state)) {
+			set_bit(R5_Overlap, &sh->dev[d].flags);
+			spin_unlock_irq(&sh->stripe_lock);
+			raid5_release_stripe(sh);
+			wait_on_bit(&sh->dev[d].flags, R5_Overlap,
+				    TASK_UNINTERRUPTIBLE);
+			goto again;
+		}
+		/* With native CRCs also a write still in flight
+		 * (written): it may store its CRC after the drop, which
+		 * is only safe while this stripe is ahead of disc->cur
+		 * (raidkm_csum_disc).  handle_stripe_clean_event() and
+		 * handle_failed_stripe() clear written without
+		 * stripe_lock and then test-and-clear R5_Overlap (fully
+		 * ordered), so the bit goes up before written is looked
+		 * at: either the test sees the clear or the clear sees
+		 * the bit and wakes us.  The timeout is a backstop for
+		 * any other path that returns a write. */
+		if (disc) {
+			set_bit(R5_Overlap, &sh->dev[d].flags);
+			smp_mb__after_atomic();
+			if (READ_ONCE(sh->dev[d].written)) {
+				spin_unlock_irq(&sh->stripe_lock);
+				raid5_release_stripe(sh);
+				wait_on_bit_timeout(&sh->dev[d].flags,
+					R5_Overlap, TASK_UNINTERRUPTIBLE, HZ);
+				goto again;
+			}
+			/* others may wait on the bit too */
+			clear_and_wake_up_bit(R5_Overlap, &sh->dev[d].flags);
+		}
+	}
+	/*
+	 * A write that ran into the range parked its PCLEAR after the wait at
+	 * the top (in ops_run_io, or the row layer's go, both before its
+	 * member writes), possibly while we slept in raid5_get_active_stripe:
+	 * the empty slot must be on disk before the trim.  The write's
+	 * written (or row lock) is gone, which we saw above, so its PCLEAR is
+	 * counted by now.
+	 */
+	if (disc) {
+		smp_rmb();	/* written, then nr_clear */
+		if (atomic_read(&conf->csum->nr_clear)) {
+			spin_unlock_irq(&sh->stripe_lock);
+			raid5_release_stripe(sh);
+			goto again;
+		}
+	}
+	set_bit(STRIPE_DISCARD, &sh->state);
+	sh->overwrite_disks = 0;
+	for (d = 0; d < sh->disks; d++) {
+		if (is_parity_disk(sh, d))
+			continue;
+		sh->dev[d].towrite = bi;
+		set_bit(R5_OVERWRITE, &sh->dev[d].flags);
+		bio_inc_remaining(bi);
+		md_write_inc(mddev, bi);
+		sh->overwrite_disks++;
+	}
+	spin_unlock_irq(&sh->stripe_lock);
+	if (disc)
+		raidkm_csum_disc_attached(conf, disc, sh);
+	if (conf->mddev->bitmap) {
+#ifndef RAIDKM_MD_COUNTS_BITMAP	/* else md core counted the discard */
+		for (d = 0; d < sh->overwrite_disks; d++)
+			raidkm_bitmap_startwrite(mddev, sh->sector,
+				RAID5_STRIPE_SECTORS(conf));
+#endif
+		sh->bm_seq = conf->seq_flush + 1;
+		set_bit(STRIPE_BIT_DELAY, &sh->state);
+	}
+
+	set_bit(STRIPE_HANDLE, &sh->state);
+	clear_bit(STRIPE_DELAYED, &sh->state);
+	if (!test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+		atomic_inc(&conf->preread_active_stripes);
+	release_stripe_plug(mddev, sh);
+}
+
+/* declustered: a population or copy-back is moving a spare redirect */
+static bool raidkm_dcl_reb_transient(struct r5conf *conf)
+{
+	int nreb = smp_load_acquire(&conf->nreb), i;
+
+	for (i = 0; i < nreb; i++)
+		switch (READ_ONCE(conf->reb[i].state)) {
+		case RKDCL_ASSIGN_POPULATING:
+		case RKDCL_ASSIGN_COPYING:
+			return true;
+		default:
+			break;
+		}
+	return false;
+}
+
 static void make_discard_request(struct mddev *mddev, struct bio *bi)
 {
 	struct r5conf *conf = mddev->private;
 	sector_t logical_sector, last_sector;
 	sector_t first_stripe, last_stripe;
-	struct stripe_head *sh;
 	struct bvec_iter bi_iter;
 	struct bio *orig_bi = bi;
-	bool pass_down;
-	int stripe_sectors;
+	struct raidkm_csum_disc *disc = NULL;
+	bool pass_down, mark_u;
+	int stripe_sectors, ngroups, grp;
 
 	/*
 	 * We need to handle this when io_uring supports discard/trim.  The bio
@@ -13622,8 +14332,12 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 		return;
 	}
 
-	stripe_sectors = conf->chunk_sectors *
-		(conf->raid_disks - conf->max_degraded);
+	/* a "stripe" here is a device row: one chunk of every member, its
+	 * data columns all of the array's sectors in it (declustered: ngroups
+	 * groups of k, each its own stripe_head at the same sh->sector) */
+	ngroups = conf->dcl ? conf->dcl->ngroups : 1;
+	stripe_sectors = conf->dcl ? raidkm_row_data_sectors(conf) :
+		conf->chunk_sectors * (conf->raid_disks - conf->max_degraded);
 	first_stripe = DIV_ROUND_UP_SECTOR_T(bi->bi_iter.bi_sector,
 					     stripe_sectors);
 	last_stripe = bio_end_sector(bi);
@@ -13634,33 +14348,86 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 		return;
 	}
 
-	/* row map: whole rows discarded are U (content undefined), and the
-	 * members see the discard only when they can take one */
+	/* row map: whole rows discarded are U (content undefined; below, once
+	 * their CRCs are off the disk), and the members see the discard only
+	 * when they can take one */
+	mark_u = !!conf->rowmap;
 	pass_down = !conf->rowmap || conf->rowmap->member_discard;
-	if (conf->rowmap)
+	if (mark_u && conf->csum && csum_test_u_first) {
 		raidkm_rowmap_note_discard(conf, first_stripe, last_stripe);
+		mark_u = false;
+	}
 
 	/*
-	 * Native checksums: the CRCs of the blocks the members are about to
-	 * trim go first, on disk.  Not while a sync, rebuild or check runs:
-	 * one already in these rows stores their CRCs again (rederive, a
-	 * repaired parity, a rebuilt chunk) while it holds their stripes,
-	 * which can be after the drop -- the loop below only waits for it to
-	 * let go.  One that starts after the test sees the rows U (above)
-	 * and skips them; with no row map there are no U rows, but nothing
-	 * trims while one runs either.  The discard is a hint: the members
-	 * just do not get it.  Nor when the drop fails.
+	 * Declustered: a spare column holds data only while a rebuild has
+	 * redirected a group column into it, and the redirect moves while a
+	 * population or copy-back runs (raidkm_dcl_redirect()).  A discard
+	 * goes through the write map like a write (ops_run_io), so it is
+	 * right in the steady states; not while one of those runs, nor any
+	 * other sync (as the CRC drop below).  The test is a caution, not a
+	 * lock: one that starts after it meets the discard stripe by stripe
+	 * (the stripe or row lock orders them) and the discard trims every
+	 * column of a stripe, the redirected one on the spare, as a full-stripe
+	 * write writes them -- which the population design allows at any time.
 	 */
-	if (pass_down && conf->csum) {
-		smp_mb();	/* the U states before the test */
-		if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
-			pass_down = false;
-		else if (!csum_test_no_discard_drop &&
-			 !raidkm_csum_drop_rows(conf, first_stripe,
-						last_stripe))
-			pass_down = false;
+	if (pass_down && conf->dcl &&
+	    (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) ||
+	     raidkm_dcl_reb_transient(conf)))
+		pass_down = false;
+
+	/*
+	 * Native checksums: the CRCs of the rows go first, on disk, before
+	 * the members trim them and before the rows are U.  A resync after a
+	 * crash skips U rows, and the region is written back lazily: a row
+	 * whose U reached the disk ahead of the drop kept the CRC of an older
+	 * write over newer data, which the next check or read failed (found
+	 * 11-05 by the power-cut suite, rm-d: the map page went out for
+	 * another row's U -> N while the drop was still to come).  So with
+	 * the row map they are dropped even when the members take no
+	 * discard, and rows whose CRCs could not be dropped stay as they are.
+	 *
+	 * No trim while a sync, rebuild or check runs: one already in these
+	 * rows stores their CRCs again (rederive, a repaired parity, a rebuilt
+	 * chunk) while it holds their stripes, which can be after the drop --
+	 * the loop below only waits for it to let go.  One that starts after
+	 * the test stores into the range registered below (an empty slot,
+	 * raidkm_csum_disc) or before it (cleared by the drop).  The drop and
+	 * the U still happen: a CRC stored again over untrimmed data is right.
+	 * The discard is a hint: the members just do not get it, and when
+	 * the drop fails, nor the map.
+	 */
+	if (conf->csum && pass_down &&
+	    test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+		pass_down = false;
+	if (conf->csum && (pass_down || mark_u)) {
+		if (!csum_test_no_discard_drop) {
+			/* a write in these rows from here until the discard
+			 * reaches its stripe stores no CRC (raidkm_csum_disc) */
+			unsigned long nb = conf->chunk_sectors >>
+					   RAID5_STRIPE_SHIFT(conf);
+
+			/* the range only where the members trim: with
+			 * nothing trimmed, a CRC stored after the drop is
+			 * right and stays (else the block goes unverified
+			 * until it is written again) */
+			if (pass_down) {
+				disc = raidkm_csum_disc_add(conf,
+							    first_stripe * nb,
+							    last_stripe * nb);
+				if (!disc)
+					pass_down = false;
+			}
+			if ((pass_down || mark_u) &&
+			    !raidkm_csum_drop_rows(conf, first_stripe,
+						   last_stripe))
+				pass_down = mark_u = false;
+		}
 	}
+	if (mark_u)
+		raidkm_rowmap_note_discard(conf, first_stripe, last_stripe);
 	if (!pass_down) {
+		if (disc)
+			raidkm_csum_disc_del(conf->csum, disc);
 		bio_endio(bi);
 		return;
 	}
@@ -13685,67 +14452,18 @@ static void make_discard_request(struct mddev *mddev, struct bio *bi)
 
 	for (; logical_sector < last_sector;
 	     logical_sector += RAID5_STRIPE_SECTORS(conf)) {
-		DEFINE_WAIT(w);
-		int d;
-	again:
-		sh = raid5_get_active_stripe(conf, NULL, logical_sector,
-					     0 /* dcl group: 1c step 3 */, 0);
-		set_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags);
-		if (test_bit(STRIPE_SYNCING, &sh->state)) {
-			raid5_release_stripe(sh);
-			wait_on_bit(&sh->dev[sh->pd_idx].flags, R5_Overlap,
-				    TASK_UNINTERRUPTIBLE);
-			goto again;
-		}
-		clear_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags);
-		spin_lock_irq(&sh->stripe_lock);
-		for (d = 0; d < conf->raid_disks; d++) {
-			if (is_parity_disk(sh, d))
-				continue;
-			/* a row rebuild owns this chunk: discarding the
-			 * survivors under its reads would leave the member it
-			 * rebuilds holding decoded stale data.  Same bounce
-			 * the normal write path takes. */
-			if (sh->dev[d].towrite || sh->dev[d].toread ||
-			    test_bit(STRIPE_ROW_SYNC, &sh->state)) {
-				set_bit(R5_Overlap, &sh->dev[d].flags);
-				spin_unlock_irq(&sh->stripe_lock);
-				raid5_release_stripe(sh);
-				wait_on_bit(&sh->dev[d].flags, R5_Overlap,
-					    TASK_UNINTERRUPTIBLE);
-				goto again;
-			}
-		}
-		set_bit(STRIPE_DISCARD, &sh->state);
-		sh->overwrite_disks = 0;
-		for (d = 0; d < conf->raid_disks; d++) {
-			if (is_parity_disk(sh, d))
-				continue;
-			sh->dev[d].towrite = bi;
-			set_bit(R5_OVERWRITE, &sh->dev[d].flags);
-			bio_inc_remaining(bi);
-			md_write_inc(mddev, bi);
-			sh->overwrite_disks++;
-		}
-		spin_unlock_irq(&sh->stripe_lock);
-		if (conf->mddev->bitmap) {
-#ifndef RAIDKM_MD_COUNTS_BITMAP	/* else md core counted the discard */
-			for (d = 0; d < conf->raid_disks - conf->max_degraded;
-			     d++)
-				raidkm_bitmap_startwrite(mddev, sh->sector,
-					RAID5_STRIPE_SECTORS(conf));
-#endif
-			sh->bm_seq = conf->seq_flush + 1;
-			set_bit(STRIPE_BIT_DELAY, &sh->state);
-		}
-
-		set_bit(STRIPE_HANDLE, &sh->state);
-		clear_bit(STRIPE_DELAYED, &sh->state);
-		if (!test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
-			atomic_inc(&conf->preread_active_stripes);
-		release_stripe_plug(mddev, sh);
+		for (grp = 0; grp < ngroups; grp++)
+			raidkm_discard_stripe(conf, bi, logical_sector, grp,
+					      disc);
+		/* attached in every group: a write of these blocks now
+		 * waits for the discard, and its CRC is the one to keep */
+		if (disc)
+			raidkm_csum_disc_advance(disc,
+				(logical_sector >> RAID5_STRIPE_SHIFT(conf)) + 1);
 	}
 
+	if (disc)
+		raidkm_csum_disc_del(conf->csum, disc);
 	bio_endio(bi);
 }
 
@@ -13851,6 +14569,14 @@ static int add_all_stripe_bios(struct r5conf *conf,
 	int dd_idx, nfirst = 0;
 
 	spin_lock_irq(&sh->stripe_lock);
+
+	/* the discard's clean event took it out of the hash: get the
+	 * sector's stripe again (a new one) */
+	if (raidkm_stripe_gone(sh)) {
+		spin_unlock_irq(&sh->stripe_lock);
+		raid5_release_stripe(sh);
+		return 0;
+	}
 
 	for (dd_idx = 0; dd_idx < sh->disks; dd_idx++) {
 		struct r5dev *dev = &sh->dev[dd_idx];
@@ -14255,13 +14981,6 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 	}
 
 	if (unlikely(bio_op(bi) == REQ_OP_DISCARD)) {
-		if (conf->dcl) {
-			/* declustered v1: no discard fan-out yet */
-			bi->bi_status = BLK_STS_NOTSUPP;
-			bio_endio(bi);
-			md_write_end(mddev);
-			return true;
-		}
 		make_discard_request(mddev, bi);
 		md_write_end(mddev);
 		return true;
@@ -17288,7 +18007,7 @@ static sector_t raidkm_row_bitmap_run_end(struct mddev *mddev,
 	struct r5conf *conf = mddev->private;
 	sector_t s = sector_nr, blocks, end;
 
-	if (!mddev->bitmap || conf->fullsync ||
+	if (!mddev->bitmap || conf->fullsync || conf->csum_fullsync ||
 	    test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
 		return max_sector;
 	end = min(max_sector, sector_nr + (sector_t)win * conf->chunk_sectors);
@@ -17372,6 +18091,9 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	 */
 	smp_mb();
 	wait_event(conf->row_write_wait, !atomic_read(&conf->row_writes));
+
+	if (sector_nr < max_sector)
+		raidkm_csum_sync_dirty(conf);
 
 	/*
 	 * raid_km redesign: m > 2 resync/scrub goes through the synchronous
@@ -17482,8 +18204,16 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 			if (mddev->bitmap)
 				mddev->bitmap_ops->end_sync(mddev,
 						mddev->curr_resync, &sync_blocks);
-		} else /* completed sync */
+		} else { /* completed sync */
 			conf->fullsync = 0;
+			/* a whole resync re-derived every CRC in its scope
+			 * -- unless it skipped the array (too degraded) */
+			if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
+			    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
+			    !conf->csum_sync_skipped)
+				conf->csum_fullsync = false;
+		}
+		conf->csum_sync_skipped = false;
 		if (mddev->bitmap)
 			mddev->bitmap_ops->close_sync(mddev);
 
@@ -17570,6 +18300,8 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	if (mddev->degraded >= conf->max_degraded &&
 	    test_bit(MD_RECOVERY_SYNC, &mddev->recovery)) {
 		sector_t rv = mddev->dev_sectors - sector_nr;
+		/* nothing re-derived: the CRCs still lag (csum_fullsync) */
+		conf->csum_sync_skipped = true;
 		*skipped = 1;
 		return rv;
 	}
@@ -17579,7 +18311,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	 * apply (matches the NULL-bitmap behaviour of the upstream helper). */
 	if (mddev->bitmap &&
 	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
-	    !conf->fullsync &&
+	    !conf->fullsync && !conf->csum_fullsync &&
 	    !mddev->bitmap_ops->start_sync(mddev, sector_nr, &sync_blocks,
 					   true) &&
 	    sync_blocks >= RAID5_STRIPE_SECTORS(conf)) {
@@ -21430,9 +22162,11 @@ static int raid5_set_limits(struct mddev *mddev)
 
 	/*
 	 * We can only discard a whole stripe. It doesn't make sense to
-	 * discard data disk but write parity disk
+	 * discard data disk but write parity disk.  Declustered: a discard
+	 * takes whole device rows, ngroups x k chunks (make_discard_request)
 	 */
-	stripe = roundup_pow_of_two(data_disks * (mddev->chunk_sectors << 9));
+	stripe = roundup_pow_of_two((conf->dcl ? conf->dcl->ngroups * conf->dcl->k :
+				     data_disks) * (mddev->chunk_sectors << 9));
 
 	md_init_stacking_limits(&lim);
 	/* the current chunk (conf's: the new one mid chunk-size reshape), as
@@ -21504,12 +22238,11 @@ static int raid5_set_limits(struct mddev *mddev)
 	 * might be to turn DISCARD into WRITE_ZEROES requests, as that is
 	 * required to be safe.
 	 */
-	if (conf->rowmap && !conf->dcl) {
+	if (conf->rowmap) {
 		/*
 		 * With the row map a discarded row is U, so the array can
-		 * always take a discard.  (Declustered: no discard fan-out
-		 * yet, raid5_make_request refuses them; limits as without
-		 * the map.)  The members get it only under the
+		 * always take a discard (declustered too: a row is one chunk
+		 * of every member there as well).  The members get it only under the
 		 * same rule as without the map (devices_handle_discard_safely):
 		 * a trimmed block that does not read back the same twice
 		 * breaks the parity a later reconstruct-write builds over it
@@ -21962,6 +22695,7 @@ static int raid5_run(struct mddev *mddev)
 		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	}
 
+	raidkm_csum_hold_run(conf);
 	return 0;
 abort:
 	md_unregister_thread(mddev, &mddev->thread);
@@ -21984,6 +22718,7 @@ static void raid5_free(struct mddev *mddev, void *priv)
 	/* Native checksum: drain the workqueue + flush dirty region pages on a
 	 * clean stop, before the conf and its rdevs go away. */
 	raidkm_csum_writeback(conf);
+	raidkm_csum_hold_free(conf);
 	raidkm_snap_stop(conf);
 	raidkm_snap_free(conf);
 	raidkm_rowmap_stop(conf);
@@ -23280,6 +24015,20 @@ static void raid5_quiesce(struct mddev *mddev, int quiesce)
 	log_quiesce(conf, quiesce);
 }
 
+/* md core's ->quiesce (stop, readonly, suspend, the reboot notifier):
+ * with native CRCs, write them back while quiesced, so they are on disk
+ * before md may write the superblock clean (__md_stop_writes quiesces
+ * first; hotfix H, raidkm_csum_hold_run).  raidkm's own quiesces (row and
+ * declustered state changes) call raid5_quiesce() and skip this. */
+static void raidkm_pers_quiesce(struct mddev *mddev, int quiesce)
+{
+	struct r5conf *conf = mddev->private;
+
+	raid5_quiesce(mddev, quiesce);
+	if (quiesce && conf && !csum_test_no_hold)
+		raidkm_csum_writeback(conf);
+}
+
 static void *raid45_takeover_raid0(struct mddev *mddev, int level)
 {
 	struct r0conf *raid0_conf = mddev->private;
@@ -23843,7 +24592,7 @@ static struct md_personality raid_km_personality =
 	.check_reshape	= raidkm_check_reshape,
 	.start_reshape  = raid5_start_reshape,
 	.finish_reshape = raid5_finish_reshape,
-	.quiesce	= raid5_quiesce,
+	.quiesce	= raidkm_pers_quiesce,
 	.takeover	= NULL,
 	.change_consistency_policy = raid5_change_consistency_policy,
 	.prepare_suspend = raid5_prepare_suspend,

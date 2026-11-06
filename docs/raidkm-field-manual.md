@@ -700,6 +700,17 @@ faults, never correctness; override with `raidkm_csum_cache_pages`.
 > buys. If torn-write atomicity across power loss is a requirement, native
 > checksums are not the mechanism to reach for.
 
+**After a crash.** CRCs reach the disk lazily (at a stop, `--readonly`,
+eviction), so md never marks a running checksum array clean: once written,
+`array_state` stays `active` until the array stops (writing `clean` returns
+EBUSY). Every crash therefore resyncs every row with data (with the row map,
+only those), ignoring the write-intent bitmap, and re-derives the CRCs on the
+way; reads are not verified against stored CRCs until that resync completes.
+A stop, `--readonly` or reboot writes the CRCs back before md writes the
+superblock clean. Modules before 2026-11-06 could return EIO after a crash of
+an idle array, of an array with a bitmap, or during the post-crash resync.
+Gate: `tools/raidkm-test-csum-crashlag.sh`.
+
 ---
 
 ## 8 device-mapper & LVM
@@ -1133,6 +1144,10 @@ tools/raidkm-test-row-dread-wide.sh    # degraded span read once per row: unalig
 NATIVE=1 tools/raidkm-test-row-csum.sh # checksum verified/published through the row paths
 tools/raidkm-test-gtc-swap.sh          # group_thread_cnt / worker_thread_cnt under resync + I/O (a field-reported crash)
 tools/raidkm-test-nowait.sh            # io_uring 1 MiB reads vs 2 MiB / libaio (fio; no REQ_NOWAIT)
+tools/raidkm-test-csum-crashlag.sh     # --checksum crash images read back with no stale CRC
+tools/raidkm-test-snap-convert.sh      # mdadm --grow --snapshots on an existing row-map array
+tools/raidkm-test-declustered-discard.sh # discards on declustered pools
+tools/raidkm-test-bigrows.sh           # row map / snapshots past 33.5 M rows
 tools/raidkm-test-scrub-badblocks.sh   # check/repair over a live member's recorded bad blocks
 tools/raidkm-test-degraded-trust-disk.sh # a readable block is read from disk, never decoded from parity
 tools/raidkm-test-row-rebuild-load.sh  # row rebuild under a degraded read: every chunk accounted, data intact

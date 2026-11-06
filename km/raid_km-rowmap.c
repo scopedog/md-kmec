@@ -336,6 +336,11 @@ void raidkm_rowmap_note_row_written(struct r5conf *conf, u64 row)
 		queue_delayed_work(system_wq, &rm->lazy, RK_RM_LAZY_DELAY);
 }
 
+sector_t raidkm_tail_start(struct r5conf *conf)
+{
+	return conf->mddev->dev_sectors + (conf->dcl ? conf->chunk_sectors : 0);
+}
+
 /* rows [first_row, last_row) were discarded whole: content undefined */
 void raidkm_rowmap_note_discard(struct r5conf *conf, u64 first_row,
 				u64 last_row)
@@ -791,7 +796,7 @@ int raidkm_rowmap_init(struct r5conf *conf)
 	 * at dev_sectors (raidkm_csum_region() makes the same step); with
 	 * native checksums after their region, which then has a fixed size
 	 * (raidkm_csum_reserve_sectors(), mdadm rkrm_off1() the same) */
-	rm->region = mddev->dev_sectors + (conf->dcl ? conf->chunk_sectors : 0);
+	rm->region = raidkm_tail_start(conf);
 	if (raidkm_layout_has_csum(mddev->new_layout))
 		rm->region += raidkm_csum_reserve_sectors(mddev->dev_sectors);
 	rm->id = crc32c(0, mddev->uuid, sizeof(mddev->uuid));
@@ -816,8 +821,8 @@ int raidkm_rowmap_init(struct r5conf *conf)
 		}
 	}
 	rm->map = vzalloc((size_t)rm->npages * RK_RM_BODY);
-	rm->dirty = bitmap_zalloc(rm->npages, GFP_KERNEL);
-	rm->rec_skipped = bitmap_zalloc(rm->nrows, GFP_KERNEL);
+	rm->dirty = rk_bitmap_zalloc(rm->npages);
+	rm->rec_skipped = rk_bitmap_zalloc(rm->nrows);
 	rm->need = kvcalloc(rm->npages, sizeof(*rm->need), GFP_KERNEL);
 	rm->bounce = alloc_page(GFP_KERNEL);
 	if (!rm->map || !rm->dirty || !rm->rec_skipped || !rm->need ||
@@ -851,8 +856,8 @@ void raidkm_rowmap_free(struct r5conf *conf)
 		return;
 	cancel_delayed_work_sync(&rm->lazy);
 	vfree(rm->map);
-	bitmap_free(rm->dirty);
-	bitmap_free(rm->rec_skipped);
+	rk_bitmap_free(rm->dirty);
+	rk_bitmap_free(rm->rec_skipped);
 	kvfree(rm->need);
 	if (rm->bounce)
 		__free_page(rm->bounce);
@@ -867,6 +872,7 @@ ssize_t raidkm_rowmap_show(struct mddev *mddev, char *page)
 	struct r5conf *conf;
 	struct raidkm_rowmap *rm;
 	u64 cnt[4] = { 0 }, r;
+	s64 csum_region, snap_region;
 	ssize_t ret;
 
 	ret = mddev_lock(mddev);
@@ -880,11 +886,21 @@ ssize_t raidkm_rowmap_show(struct mddev *mddev, char *page)
 	rm = conf->rowmap;
 	for (r = 0; r < rm->nrows; r++)
 		cnt[rk_rm_get(rm, r)]++;
+	/*
+	 * Where the tail regions start on every member, in sectors from its
+	 * data_offset (-1: none): the CRCs (raidkm_csum_region()), the row map
+	 * (rm->region), the snapshot metadata (raidkm_snap's region).  Tools
+	 * and tests read these instead of repeating the reserve arithmetic.
+	 * csum_region is -1 also when a member has no room for the CRCs.
+	 */
+	csum_region = raidkm_csum_region_start(conf);
+	snap_region = conf->snap ? (s64)conf->snap->region : -1;
 	ret = sprintf(page,
 		      "rows %llu\nunwritten %llu\nneedsync %llu\nsyncing %llu\nwritten %llu\n"
 		      "to_n %lld\nto_w %lld\nto_u %lld\npromoted %lld\nskipped_rows %lld\n"
 		      "flushes %lld\npage_writes %lld\nwrite_errors %lld\nwaits %lld\n"
-		      "pages %u\ngeneration %llu\nmember_discard %d\n",
+		      "pages %u\ngeneration %llu\nmember_discard %d\n"
+		      "csum_region %lld\nmap_region %llu\nsnap_region %lld\n",
 		      rm->nrows, cnt[RK_RM_U], cnt[RK_RM_N], cnt[RK_RM_S],
 		      cnt[RK_RM_W],
 		      atomic64_read(&rm->to_n), atomic64_read(&rm->to_w),
@@ -892,7 +908,8 @@ ssize_t raidkm_rowmap_show(struct mddev *mddev, char *page)
 		      atomic64_read(&rm->skipped_rows),
 		      atomic64_read(&rm->flushes), atomic64_read(&rm->page_writes),
 		      atomic64_read(&rm->write_errors), atomic64_read(&rm->waits),
-		      rm->npages, rm->gen, rm->member_discard);
+		      rm->npages, rm->gen, rm->member_discard,
+		      csum_region, (unsigned long long)rm->region, snap_region);
 	mddev_unlock(mddev);
 	return ret;
 }
