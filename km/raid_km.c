@@ -2199,6 +2199,29 @@ struct raidkm_csum_page {
 #define RAIDKM_CSUM_P_REBUILD	1	/* rotted on load; slots absent until a
 					 * scrub/write repopulates them */
 
+/* Batched region I/O: up to this many dirty pages of one shard are written
+ * back as async writes at once (raidkm_csum_flush_batch), and the pages a
+ * write stripe needs are read in parallel (raidkm_csum_fault_batch) --
+ * instead of one synchronous FUA write per evicted page and one synchronous
+ * read per fault, which made a cache smaller than the region (auto-sized
+ * caches are clamped to ~1.6% of RAM) a 10x random-write cliff. */
+#define RAIDKM_CSUM_WB_BATCH	64
+
+struct raidkm_csum_wb_ent {
+	struct raidkm_csum_page	*pg;
+	struct md_rdev		*rdev;
+	struct bio		bio;
+	struct bio_vec		bvec;
+};
+
+struct raidkm_csum_wb {
+	atomic_t		inflight;
+	struct completion	done;
+	unsigned int		nsnap;	/* snapshot pages allocated so far */
+	struct page		*snap[RAIDKM_CSUM_WB_BATCH];
+	struct raidkm_csum_wb_ent ent[RAIDKM_CSUM_WB_BATCH];
+};
+
 /* The cache is SHARDED by region-page index (page_index % nr_shards): a region
  * page (member,page_index) is owned by exactly one shard, so it is
  * cache-coherent (never faulted into two shards).  Shard workers do the
@@ -2214,7 +2237,9 @@ struct raidkm_csum_shard {
 	atomic_t		pending_nr;	/* entries in `pending` (soft cap) */
 	wait_queue_head_t	pending_waitq;	/* writers throttled at the cap */
 	struct page		*bounce;	/* flush snapshot (under lock) */
-	struct mutex		lock;	/* guards pages + lru + nr + bounce */
+	struct raidkm_csum_wb	*wb;	/* batched region I/O buffers
+					 * (raidkm_csum_wb_get, under lock) */
+	struct mutex		lock;	/* guards pages + lru + nr + bounce + wb */
 	struct list_head	lru;	/* head = most-recently-used */
 	unsigned int		nr;	/* resident pages */
 	unsigned int		max;	/* soft ceiling (total / nr_shards) */
@@ -2246,6 +2271,12 @@ struct raidkm_csum_cache {
 	struct mutex		drop_mutex;
 	spinlock_t		drop_lock;	/* the pair, read and set */
 	unsigned long		drop_b0, drop_b1;
+	/* bumped (under drop_lock) when a drop sets its range and when it
+	 * clears it: a region page read that saw it change may hold CRCs
+	 * the drop zeroed on disk after the read, with the range no longer
+	 * there to clear them at install -- such a read is done again
+	 * (raidkm_csum_drop_seq) */
+	unsigned int		drop_seq;
 	/* discards whose CRCs are dropped and whose stripes are not all
 	 * attached yet (struct raidkm_csum_disc, raidkm_csum_in_discard()) */
 	spinlock_t		disc_lock;
@@ -2255,6 +2286,10 @@ struct raidkm_csum_cache {
 	 * a discard attaches no stripe while there are any */
 	atomic_t		nr_clear;
 	wait_queue_head_t	clear_wq;
+	/* region page reads (faults), pages written back, pages evicted:
+	 * printed at stop when the cache evicted (a cache smaller than the
+	 * region) */
+	atomic64_t		nr_fault, nr_wb, nr_evict;
 	struct raidkm_csum_shard shards[];	/* flexible: nr_shards of them */
 };
 
@@ -2440,6 +2475,29 @@ static bool raidkm_csum_page_read(struct r5conf *conf, int m,
 	return ok;
 }
 
+/* Snapshot region page @pg into @dst for a write-back: DIRTY is cleared
+ * under pg->slock first (a store racing the write re-sets it, and its slot
+ * lands in the next write-back), then the trailer (generation, self-CRC)
+ * is filled in.  Caller holds the page's shard lock. */
+static void raidkm_csum_snapshot(struct r5conf *conf,
+				 struct raidkm_csum_page *pg, struct page *dst)
+{
+	void *crcs = page_address(dst);
+	struct raidkm_csum_trailer *tr = crcs + RAIDKM_CSUM_BODY;
+	u32 g;
+
+	spin_lock(&pg->slock);
+	clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+	memcpy(crcs, page_address(pg->page), RAIDKM_CSUM_BODY);
+	spin_unlock(&pg->slock);
+	g = conf->csum_gen + 1;
+	if (!g)
+		g = 1;
+	conf->csum_gen = g;
+	tr->gen = cpu_to_le32(g);
+	tr->self_crc = cpu_to_le32(crc32c_le(0, crcs, RAIDKM_CSUM_BODY));
+}
+
 /* Snapshot-and-write a dirty page to its region.  DIRTY is cleared under
  * pg->slock BEFORE the snapshot: a store racing this flush re-sets DIRTY and
  * its slot lands either in this snapshot or in the next flush -- never lost
@@ -2454,10 +2512,7 @@ static bool raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 	unsigned long pgidx = pg->key & ((1UL << 40) - 1);
 	struct md_rdev *rdev = conf->disks[m].rdev;
 	sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
-	struct raidkm_csum_trailer *tr;
-	void *crcs;
 	bool ok;
-	u32 g;
 
 	if (!conf->csum_disk || !rdev || test_bit(Faulty, &rdev->flags)) {
 		clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
@@ -2471,21 +2526,19 @@ static bool raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 		clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
 		return true;
 	}
-	spin_lock(&pg->slock);
-	clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
-	memcpy(page_address(s->bounce), page_address(pg->page),
-	       RAIDKM_CSUM_BODY);
-	spin_unlock(&pg->slock);
-	crcs = page_address(s->bounce);
-	tr = crcs + RAIDKM_CSUM_BODY;
-	g = conf->csum_gen + 1;
-	if (!g)
-		g = 1;
-	conf->csum_gen = g;
-	tr->gen = cpu_to_le32(g);
-	tr->self_crc = cpu_to_le32(crc32c_le(0, crcs, RAIDKM_CSUM_BODY));
+	raidkm_csum_snapshot(conf, pg, s->bounce);
+	/* PREFLUSH too: eviction writes region pages without a flush
+	 * (raidkm_csum_evict_locked), and FUA alone does not order this
+	 * write after them -- an older image of this very page, written
+	 * back earlier and still in a volatile cache, could reach the media
+	 * after it.  A discard's dropped CRCs (raidkm_csum_drop_rows_io,
+	 * the PCLEAR landing) would come back over the trimmed blocks, in U
+	 * rows that no resync re-derives (found by the power-cut harness,
+	 * whose dm-log-writes logs a plain write only at the next flush). */
 	ok = sync_page_io(rdev, (rstart - rdev->data_offset) + off, PAGE_SIZE,
-			  s->bounce, REQ_OP_WRITE | REQ_FUA, false);
+			  s->bounce, REQ_OP_WRITE | REQ_PREFLUSH | REQ_FUA,
+			  false);
+	atomic64_inc(&s->cache->nr_wb);
 	if (!ok) {
 		/* the page's CRCs are not on this member: keep the page dirty
 		 * and fail the member, as md does for any write it could not
@@ -2497,6 +2550,176 @@ static bool raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 		md_error(conf->mddev, rdev);
 	}
 	rdev_dec_pending(rdev, conf->mddev);
+	return ok;
+}
+
+/* The device sector sync_page_io() sends a data_offset-relative @sector to:
+ * the batched region writes below must land exactly where the region page
+ * faults (sync_page_io) read them back. */
+static sector_t raidkm_csum_io_sector(struct md_rdev *rdev, sector_t sector)
+{
+	struct mddev *mddev = rdev->mddev;
+
+	if (mddev->reshape_position != MaxSector &&
+	    (mddev->reshape_backwards == (sector >= mddev->reshape_position)))
+		return sector + rdev->new_data_offset;
+	return sector + rdev->data_offset;
+}
+
+static void raidkm_csum_wb_endio(struct bio *bio)
+{
+	struct raidkm_csum_wb *wb = bio->bi_private;
+
+	if (atomic_dec_and_test(&wb->inflight))
+		complete(&wb->done);
+}
+
+/* The shard's batch buffers (allocated with the cache), with the snapshot
+ * pages a write-back batch needs: made on first use, an eighth of the
+ * shard's ceiling (8..RAIDKM_CSUM_WB_BATCH), so a small cache does not pin
+ * more for them than it holds.  NULL if there are none (callers fall back
+ * to one synchronous I/O per page, and say so once).  @snaps: false for a
+ * read batch, which needs none.  Caller holds s->lock. */
+static struct raidkm_csum_wb *raidkm_csum_wb_get(struct raidkm_csum_shard *s,
+						 bool snaps)
+{
+	struct raidkm_csum_wb *wb = s->wb;
+	unsigned int want = clamp_t(unsigned int, s->max / 8, 8,
+				    RAIDKM_CSUM_WB_BATCH);
+
+	if (wb && snaps)
+		while (wb->nsnap < want) {
+			struct page *p = alloc_page(GFP_NOIO | __GFP_NOWARN);
+
+			if (!p)
+				break;
+			wb->snap[wb->nsnap++] = p;
+		}
+	if (!wb || (snaps && !wb->nsnap)) {
+		pr_warn_once("md/raid:%s: native csum: no memory for batched region I/O, one page at a time\n",
+			     mdname(s->cache->conf->mddev));
+		return NULL;
+	}
+	return wb;
+}
+
+static void raidkm_csum_wb_free(struct raidkm_csum_shard *s)
+{
+	unsigned int i;
+
+	if (!s->wb)
+		return;
+	for (i = 0; i < s->wb->nsnap; i++)
+		__free_page(s->wb->snap[i]);
+	kvfree(s->wb);
+	s->wb = NULL;
+}
+
+/* Write back the dirty pages among @pgs[0..n) (one shard's, caller holds
+ * s->lock): each one snapshotted as raidkm_csum_page_flush() does (DIRTY
+ * cleared under pg->slock first, so a racing store re-dirties it and lands
+ * in the next write-back), all of them submitted at once under one plug,
+ * and waited for.  No member cache flush: the pages may sit in volatile
+ * caches until the next one (raidkm_csum_evict_locked says why that is
+ * enough; raidkm_csum_writeback flushes every member at the end).  A page
+ * whose write failed is left dirty and its member failed, as
+ * raidkm_csum_page_flush() does.  Returns false if any page failed. */
+static bool raidkm_csum_flush_batch(struct raidkm_csum_shard *s,
+				    struct raidkm_csum_page **pgs,
+				    unsigned int n)
+{
+	struct r5conf *conf = s->cache->conf;
+	struct raidkm_csum_wb *wb = n > 1 ? raidkm_csum_wb_get(s, true) : NULL;
+	unsigned int i, k, done = 0, ne;
+	struct blk_plug plug;
+	bool ok = true;
+
+	if (!wb) {
+		for (i = 0; i < n; i++)
+			if (test_bit(RAIDKM_CSUM_P_DIRTY, &pgs[i]->flags) &&
+			    !raidkm_csum_page_flush(s, pgs[i]))
+				ok = false;
+		return ok;
+	}
+	while (done < n) {
+		ne = 0;
+		atomic_set(&wb->inflight, 1);
+		reinit_completion(&wb->done);
+		blk_start_plug(&plug);
+		for (; done < n && ne < wb->nsnap; done++) {
+			struct raidkm_csum_page *pg = pgs[done];
+			struct raidkm_csum_wb_ent *e = &wb->ent[ne];
+			int m = pg->key >> 40;
+			unsigned long pgidx = pg->key & ((1UL << 40) - 1);
+			struct md_rdev *rdev = conf->disks[m].rdev;
+			sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
+
+			if (!test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
+				continue;
+			if (!conf->csum_disk || !rdev ||
+			    test_bit(Faulty, &rdev->flags)) {
+				/* nowhere to write it: as raidkm_csum_page_flush */
+				clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+				continue;
+			}
+			/* pin across the write, as raidkm_csum_page_flush */
+			atomic_inc(&rdev->nr_pending);
+			if (!raidkm_csum_region(conf, rdev, &rstart, &rsec) ||
+			    off + (PAGE_SIZE >> 9) > rsec) {
+				rdev_dec_pending(rdev, conf->mddev);
+				clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+				continue;
+			}
+			raidkm_csum_snapshot(conf, pg, wb->snap[ne]);
+			/* REQ_SYNC as sync_page_io: the worker waits on it
+			 * holding the shard lock, so no write throttling */
+			bio_init(&e->bio, rdev->bdev, &e->bvec, 1,
+				 REQ_OP_WRITE | REQ_SYNC);
+			e->bio.bi_iter.bi_sector = raidkm_csum_io_sector(rdev,
+					(rstart - rdev->data_offset) + off);
+			__bio_add_page(&e->bio, wb->snap[ne], PAGE_SIZE, 0);
+			e->bio.bi_private = wb;
+			e->bio.bi_end_io = raidkm_csum_wb_endio;
+			e->pg = pg;
+			e->rdev = rdev;
+			ne++;
+			atomic_inc(&wb->inflight);
+			submit_bio(&e->bio);
+			atomic64_inc(&s->cache->nr_wb);
+		}
+		blk_finish_plug(&plug);
+		if (!atomic_dec_and_test(&wb->inflight))
+			wait_for_completion_io(&wb->done);
+		/* a member a write failed on is failed, and its pages stay
+		 * dirty */
+		for (i = 0; i < ne; i++) {
+			struct md_rdev *rdev = wb->ent[i].rdev;
+			bool bad = false;
+
+			if (!rdev)
+				continue;		/* member done below */
+			for (k = i; k < ne; k++)
+				if (wb->ent[k].rdev == rdev &&
+				    wb->ent[k].bio.bi_status)
+					bad = true;
+			if (bad) {
+				pr_warn_ratelimited("md/raid:%s: native csum page write failed %pg\n",
+						    mdname(conf->mddev), rdev->bdev);
+				md_error(conf->mddev, rdev);
+				ok = false;
+			}
+			for (k = i; k < ne; k++) {
+				if (wb->ent[k].rdev != rdev)
+					continue;
+				if (bad)
+					set_bit(RAIDKM_CSUM_P_DIRTY,
+						&wb->ent[k].pg->flags);
+				bio_uninit(&wb->ent[k].bio);
+				wb->ent[k].rdev = NULL;
+				rdev_dec_pending(rdev, conf->mddev);
+			}
+		}
+	}
 	return ok;
 }
 
@@ -2544,23 +2767,48 @@ static void raidkm_csum_set_slot(struct raidkm_csum_page *pg,
 }
 
 /* --- the cache (per-shard mutex-guarded; workqueue-only) --------------- */
-/* Evict clean LRU pages until nr <= max; write dirty ones back first so they
- * become evictable.  Caller holds s->lock. */
+/* Over the ceiling: evict the coldest pages down to a low watermark (an
+ * eighth of the ceiling below it, at most a write-back batch), writing the
+ * dirty ones back first in one batch so they become evictable.  Evicting a
+ * batch at a time spreads one batched write-back over the next faults
+ * instead of paying a synchronous write per fault.  The page at the LRU
+ * head (the one just faulted in) is never evicted.  Caller holds s->lock.
+ *
+ * The write-back does not flush the members' caches: a page read back
+ * after its write completed reads the new image whatever the cache, and
+ * stable media matter only across a power loss.  A crash while the array
+ * runs resyncs every row with data and re-derives its CRCs from the data
+ * (hotfix H, raidkm_csum_hold_run), so CRCs there are not trusted anyway;
+ * a clean stop writes back the rest and flushes every member
+ * (raidkm_csum_writeback), which covers these writes too.  The CRC drops
+ * of discarded rows must reach stable media before the trim and are never
+ * re-derived (a resync skips U rows): they write with PREFLUSH|FUA
+ * (raidkm_csum_page_flush), so no older image of the page written here
+ * can land after them, or zero whole pages and then flush. */
 static void raidkm_csum_evict_locked(struct raidkm_csum_shard *s)
 {
-	struct raidkm_csum_page *pg, *tmp;
+	struct raidkm_csum_page *pg, *head, *cand[RAIDKM_CSUM_WB_BATCH];
+	unsigned int low, want, n = 0, i;
 
-	list_for_each_entry_safe_reverse(pg, tmp, &s->lru, lru) {
-		if (s->nr <= s->max)
+	if (s->nr <= s->max)
+		return;
+	low = s->max - min_t(unsigned int, s->max / 8, RAIDKM_CSUM_WB_BATCH - 1);
+	want = min_t(unsigned int, s->nr - low, RAIDKM_CSUM_WB_BATCH);
+	head = list_first_entry(&s->lru, struct raidkm_csum_page, lru);
+	list_for_each_entry_reverse(pg, &s->lru, lru) {
+		if (n == want || pg == head)
 			break;
-		if (test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
-			raidkm_csum_page_flush(s, pg);
-		/* A store may have re-dirtied the page while the flush's
-		 * sync_page_io ran unlocked; keep such a page resident (the
-		 * next pass flushes it) so its slot is never lost.  The
-		 * erase runs under pg->slock so a concurrent store either
-		 * saw the page resident (its slot is covered by the DIRTY
-		 * re-check here) or falls back to the pending xarray. */
+		cand[n++] = pg;
+	}
+	raidkm_csum_flush_batch(s, cand, n);
+	for (i = 0; i < n; i++) {
+		pg = cand[i];
+		/* A store may have re-dirtied the page while the write-back
+		 * ran unlocked; keep such a page resident (the next pass
+		 * writes it) so its slot is never lost.  The erase runs
+		 * under pg->slock so a concurrent store either saw the page
+		 * resident (its slot is covered by the DIRTY re-check here)
+		 * or falls back to the pending xarray. */
 		spin_lock(&pg->slock);
 		if (test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags)) {
 			spin_unlock(&pg->slock);
@@ -2570,6 +2818,7 @@ static void raidkm_csum_evict_locked(struct raidkm_csum_shard *s)
 		spin_unlock(&pg->slock);
 		list_del(&pg->lru);
 		s->nr--;
+		atomic64_inc(&s->cache->nr_evict);
 		call_rcu(&pg->rcu, raidkm_csum_page_free_rcu);
 	}
 }
@@ -2594,20 +2843,26 @@ static void raidkm_csum_drop_range_locked(struct raidkm_csum_cache *c,
 		memset(&crcs[lo - p0], 0, (hi - lo) * sizeof(*crcs));
 }
 
-/* Return the resident region page for `key`, faulting it in on a miss.  NULL on
- * OOM (caller skips verify/store).  BLOCKING; caller holds s->lock. */
-static struct raidkm_csum_page *raidkm_csum_get(struct raidkm_csum_shard *s,
-						unsigned long key)
+/* The drop sequence (raidkm_csum_cache.drop_seq), read before a region
+ * page read is issued and again after it completed: different means a
+ * drop ran to its end meanwhile -- the read may have taken the page before
+ * the drop zeroed it on disk, and the drop's range is gone, so installing
+ * it would bring dropped CRCs back.  (A drop still running when the page
+ * is installed clears its range itself: raidkm_csum_drop_range_locked.) */
+static unsigned int raidkm_csum_drop_seq(struct raidkm_csum_cache *c)
 {
-	struct r5conf *conf = s->cache->conf;
-	struct raidkm_csum_page *pg;
+	unsigned int seq;
 
-	pg = xa_load(&s->pages, key);
-	if (pg) {
-		list_move(&pg->lru, &s->lru);
-		return pg;
-	}
-	pg = kzalloc(sizeof(*pg), GFP_NOIO);
+	spin_lock(&c->drop_lock);
+	seq = c->drop_seq;
+	spin_unlock(&c->drop_lock);
+	return seq;
+}
+
+static struct raidkm_csum_page *raidkm_csum_page_alloc(unsigned long key)
+{
+	struct raidkm_csum_page *pg = kzalloc(sizeof(*pg), GFP_NOIO);
+
 	if (!pg)
 		return NULL;
 	pg->page = alloc_page(GFP_NOIO);
@@ -2617,12 +2872,24 @@ static struct raidkm_csum_page *raidkm_csum_get(struct raidkm_csum_shard *s,
 	}
 	pg->key = key;
 	spin_lock_init(&pg->slock);
+	return pg;
+}
+
+/* Publish region page @pg, its image just read from disk (@read_ok) or, with
+ * no on-disk region, to be zeroed; NULL (and @pg freed) if it cannot be.
+ * Does not evict.  Caller holds s->lock. */
+static struct raidkm_csum_page *raidkm_csum_install(struct raidkm_csum_shard *s,
+						    struct raidkm_csum_page *pg,
+						    bool read_ok)
+{
+	struct r5conf *conf = s->cache->conf;
+	unsigned long key = pg->key;
+
 	if (conf->csum_disk) {
 		void *crcs = page_address(pg->page);
 		struct raidkm_csum_trailer *tr = crcs + RAIDKM_CSUM_BODY;
 
-		if (!raidkm_csum_page_read(conf, key >> 40,
-					   key & ((1UL << 40) - 1), pg->page)) {
+		if (!read_ok) {
 			/* Transient region-I/O failure: do NOT publish a clean
 			 * zero page -- it would silently shadow the real
 			 * on-region tags, and once a store dirtied it, the
@@ -2652,8 +2919,151 @@ static struct raidkm_csum_page *raidkm_csum_get(struct raidkm_csum_shard *s,
 	}
 	list_add(&pg->lru, &s->lru);
 	s->nr++;
-	raidkm_csum_evict_locked(s);
 	return pg;
+}
+
+/* Return the resident region page for `key`, faulting it in on a miss.  NULL on
+ * OOM (caller skips verify/store).  BLOCKING; caller holds s->lock. */
+static struct raidkm_csum_page *raidkm_csum_get(struct raidkm_csum_shard *s,
+						unsigned long key)
+{
+	struct r5conf *conf = s->cache->conf;
+	struct raidkm_csum_page *pg;
+	bool ok = true;
+
+	pg = xa_load(&s->pages, key);
+	if (pg) {
+		list_move(&pg->lru, &s->lru);
+		return pg;
+	}
+	pg = raidkm_csum_page_alloc(key);
+	if (!pg)
+		return NULL;
+	if (conf->csum_disk) {
+		unsigned int seq, tries = 0;
+
+		do {
+			seq = raidkm_csum_drop_seq(s->cache);
+			ok = raidkm_csum_page_read(conf, key >> 40,
+						   key & ((1UL << 40) - 1),
+						   pg->page);
+			atomic64_inc(&s->cache->nr_fault);
+		} while (ok && raidkm_csum_drop_seq(s->cache) != seq &&
+			 ++tries < 16);
+		if (tries == 16)
+			ok = false;	/* drops back to back: fail the lookup */
+	}
+	pg = raidkm_csum_install(s, pg, ok);
+	if (pg)
+		raidkm_csum_evict_locked(s);
+	return pg;
+}
+
+/* Fault in, with reads in parallel, those of the region pages @keys[0..n)
+ * (distinct, one shard's) that are not resident, then one eviction round.
+ * At most a quarter of the ceiling is read, so that round cannot evict
+ * what it just read; the rest are left to fault one at a time.  Used for a
+ * write stripe's verify (raidkm_csum_verify_stripe): its blocks' CRCs sit
+ * in one page index of every member, and faulting those pages one
+ * synchronous read at a time (the reads' members first, then the written
+ * ones' as their stores landed) was what a cache smaller than the region
+ * spent its time on.  Caller holds s->lock. */
+#define RAIDKM_CSUM_RA_BATCH	32
+#define RAIDKM_CSUM_VBATCH	8	/* stripes verified per fault batch */
+
+static bool csum_test_no_group_fault;	/* testing only: one read per fault */
+module_param(csum_test_no_group_fault, bool, 0644);
+MODULE_PARM_DESC(csum_test_no_group_fault,
+		 "TESTING ONLY: fault a write stripe's native-csum region pages one synchronous read at a time");
+
+static void raidkm_csum_fault_batch(struct raidkm_csum_shard *s,
+				    const unsigned long *keys, unsigned int n)
+{
+	struct r5conf *conf = s->cache->conf;
+	struct raidkm_csum_page *pgs[RAIDKM_CSUM_RA_BATCH];
+	unsigned int np = 0, i, lim, seq;
+	struct raidkm_csum_wb *wb;
+	struct blk_plug plug;
+	bool stale;
+
+	if (!conf->csum_disk)
+		return;
+	lim = min_t(unsigned int, RAIDKM_CSUM_RA_BATCH, s->max / 4);
+	for (i = 0; i < n && np < lim; i++) {
+		struct raidkm_csum_page *r = xa_load(&s->pages, keys[i]);
+
+		if (r) {
+			/* in use: keep it out of this round's eviction */
+			list_move(&r->lru, &s->lru);
+			continue;
+		}
+		pgs[np] = raidkm_csum_page_alloc(keys[i]);
+		if (!pgs[np])
+			break;
+		np++;
+	}
+	wb = np > 1 ? raidkm_csum_wb_get(s, false) : NULL;
+	if (!wb) {
+		/* one page (or no buffers): it faults on its own */
+		for (i = 0; i < np; i++)
+			raidkm_csum_page_free(pgs[i]);
+		return;
+	}
+	seq = raidkm_csum_drop_seq(s->cache);
+	atomic_set(&wb->inflight, 1);
+	reinit_completion(&wb->done);
+	blk_start_plug(&plug);
+	for (i = 0; i < np; i++) {
+		struct raidkm_csum_wb_ent *we = &wb->ent[i];
+		struct raidkm_csum_page *pg = pgs[i];
+		int m = pg->key >> 40;
+		unsigned long pgidx = pg->key & ((1UL << 40) - 1);
+		struct md_rdev *rdev = conf->disks[m].rdev;
+		sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
+
+		we->pg = pg;
+		we->rdev = NULL;
+		/* as raidkm_csum_page_read */
+		if (!rdev || test_bit(Faulty, &rdev->flags))
+			continue;
+		atomic_inc(&rdev->nr_pending);
+		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec) ||
+		    off + (PAGE_SIZE >> 9) > rsec) {
+			rdev_dec_pending(rdev, conf->mddev);
+			continue;
+		}
+		we->rdev = rdev;
+		bio_init(&we->bio, rdev->bdev, &we->bvec, 1, REQ_OP_READ);
+		we->bio.bi_iter.bi_sector = raidkm_csum_io_sector(rdev,
+				(rstart - rdev->data_offset) + off);
+		__bio_add_page(&we->bio, pg->page, PAGE_SIZE, 0);
+		we->bio.bi_private = wb;
+		we->bio.bi_end_io = raidkm_csum_wb_endio;
+		atomic_inc(&wb->inflight);
+		submit_bio(&we->bio);
+		atomic64_inc(&s->cache->nr_fault);
+	}
+	blk_finish_plug(&plug);
+	if (!atomic_dec_and_test(&wb->inflight))
+		wait_for_completion_io(&wb->done);
+	/* a drop ended meanwhile: install none (they fault on their own) */
+	stale = raidkm_csum_drop_seq(s->cache) != seq;
+	for (i = 0; i < np; i++) {
+		struct raidkm_csum_wb_ent *we = &wb->ent[i];
+		bool ok = false;
+
+		if (we->rdev) {
+			ok = !we->bio.bi_status;
+			bio_uninit(&we->bio);
+			rdev_dec_pending(we->rdev, conf->mddev);
+			we->rdev = NULL;
+		}
+		if (ok && !stale)
+			raidkm_csum_install(s, we->pg, true);
+		else
+			raidkm_csum_page_free(we->pg);	/* faults on its own */
+	}
+	raidkm_csum_evict_locked(s);
 }
 
 /* Lock-free, non-blocking expected-CRC lookup for the inline (completion
@@ -3097,6 +3507,7 @@ static bool raidkm_csum_drop_rows_io(struct r5conf *conf, u64 first_row,
 	spin_lock(&c->drop_lock);
 	c->drop_b0 = b0;
 	c->drop_b1 = b1;
+	WRITE_ONCE(c->drop_seq, c->drop_seq + 1);
 	spin_unlock(&c->drop_lock);
 
 	/* in core; a page faulted in from here on clears the range itself */
@@ -3186,6 +3597,7 @@ static bool raidkm_csum_drop_rows_io(struct r5conf *conf, u64 first_row,
 
 	spin_lock(&c->drop_lock);
 	c->drop_b0 = c->drop_b1 = 0;
+	WRITE_ONCE(c->drop_seq, c->drop_seq + 1);
 	spin_unlock(&c->drop_lock);
 	mutex_unlock(&c->drop_mutex);
 	return ok;
@@ -3229,19 +3641,69 @@ static bool raidkm_csum_drop_rows(struct r5conf *conf, u64 first_row,
 	return d.ok;
 }
 
+/* Add to @keys[0..nk) (distinct, at most RAIDKM_CSUM_RA_BATCH) the region
+ * pages a stripe's verify and stores use, all at one page index: those of
+ * the blocks being verified (read map) and, with writes queued, those of
+ * the blocks to be written and the parity (write map), whose stores come
+ * next -- so they are faulted in one parallel batch
+ * (raidkm_csum_fault_batch).  A hint only (towrite read unlocked): a wrong
+ * guess costs a page read, never correctness.  Returns the new count. */
+static unsigned int raidkm_csum_stripe_keys(struct r5conf *conf,
+					    struct stripe_head *sh,
+					    unsigned long *keys, unsigned int nk)
+{
+	unsigned long k, blk = raidkm_csum_blkidx(conf, sh->sector);
+	bool wr = false;
+	unsigned int j;
+	int i, t;
+
+	if (READ_ONCE(csum_test_no_group_fault))
+		return nk;
+	for (i = 0; i < sh->disks; i++)
+		if (READ_ONCE(sh->dev[i].towrite))
+			wr = true;
+	for (i = 0; i < sh->disks; i++) {
+		struct r5dev *dev = &sh->dev[i];
+		int pd[2] = { -1, -1 };
+
+		if (test_bit(R5_CsumPending, &dev->flags))
+			pd[0] = raidkm_sh_pdisk(conf, sh, i);
+		if (wr && (READ_ONCE(dev->towrite) || is_parity_disk(sh, i)))
+			pd[1] = raidkm_sh_pdisk_w(conf, sh, i);
+		for (t = 0; t < 2 && nk < RAIDKM_CSUM_RA_BATCH; t++) {
+			if (pd[t] < 0)
+				continue;
+			k = raidkm_csum_key(pd[t], blk);
+			for (j = 0; j < nk && keys[j] != k; j++)
+				;
+			if (j == nk)
+				keys[nk++] = k;
+		}
+	}
+	return nk;
+}
+
 /* Verify one stripe's R5_CsumPending blocks (workqueue, sleepable).  Blocks
  * that could not be verified inline at completion land here: the tag fetch may
  * block, and this pass doubles as the RECHECK for an inline mismatch (under
  * the shard lock, pending-aware) -- only a mismatch confirmed here feeds the
  * shipped R5_ReadError/R5_IntegrityHeal heal.  Data AND parity are verified
  * (matches the load-all path). */
-static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s, struct stripe_head *sh)
+static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s,
+				      struct stripe_head *sh, bool prefaulted)
 {
 	struct r5conf *conf = s->cache->conf;
 	bool rederive = raidkm_csum_rederive(conf);
 	int i;
 
 	mutex_lock(&s->lock);
+	if (!rederive && !prefaulted) {
+		unsigned long keys[RAIDKM_CSUM_RA_BATCH];
+		unsigned int nk = raidkm_csum_stripe_keys(conf, sh, keys, 0);
+
+		if (nk > 1)
+			raidkm_csum_fault_batch(s, keys, nk);
+	}
 	for (i = 0; i < sh->disks; i++) {
 		struct r5dev *dev = &sh->dev[i];
 		struct raidkm_csum_page *pg;
@@ -3312,7 +3774,8 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 	struct r5conf *conf = s->cache->conf;
 
 	for (;;) {
-		struct stripe_head *sh = NULL;
+		struct stripe_head *sh = NULL, *shs[RAIDKM_CSUM_VBATCH];
+		unsigned int nsh = 0;
 		unsigned long flags, idx;
 		int budget = 256;
 		bool did = false;
@@ -3374,16 +3837,39 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 		if (did)
 			wake_up(&s->pending_waitq);	/* writers at the cap */
 
+		/* up to RAIDKM_CSUM_VBATCH queued stripes at a time: the
+		 * region pages of all of them are faulted in one parallel
+		 * batch before they are verified one by one */
 		spin_lock_irqsave(&s->qlock, flags);
-		if (!list_empty(&s->vstripes)) {
+		while (nsh < RAIDKM_CSUM_VBATCH && !list_empty(&s->vstripes)) {
 			sh = list_first_entry(&s->vstripes, struct stripe_head, csum_list);
 			list_del_init(&sh->csum_list);
+			shs[nsh++] = sh;
 		}
 		spin_unlock_irqrestore(&s->qlock, flags);
-		if (sh) {
-			raidkm_csum_verify_stripe(s, sh);
-			set_bit(STRIPE_HANDLE, &sh->state);
-			raid5_release_stripe(sh);	/* the ref taken at queue */
+		if (nsh) {
+			bool pre = nsh > 1 && !raidkm_csum_rederive(conf);
+			unsigned int i;
+
+			if (pre) {
+				unsigned long keys[RAIDKM_CSUM_RA_BATCH];
+				unsigned int nk = 0;
+
+				for (i = 0; i < nsh; i++)
+					nk = raidkm_csum_stripe_keys(conf, shs[i],
+								     keys, nk);
+				if (nk > 1) {
+					mutex_lock(&s->lock);
+					raidkm_csum_fault_batch(s, keys, nk);
+					mutex_unlock(&s->lock);
+				}
+			}
+			for (i = 0; i < nsh; i++) {	/* in queue order */
+				sh = shs[i];
+				raidkm_csum_verify_stripe(s, sh, pre);
+				set_bit(STRIPE_HANDLE, &sh->state);
+				raid5_release_stripe(sh);	/* the ref taken at queue */
+			}
 			md_wakeup_thread(conf->mddev->thread);
 			continue;
 		}
@@ -3423,6 +3909,7 @@ static void raidkm_csum_queue_verify(struct r5conf *conf, struct stripe_head *sh
 static void raidkm_csum_writeback(struct r5conf *conf)
 {
 	struct raidkm_csum_cache *c = conf->csum;
+	struct md_rdev *rdev;
 	struct raidkm_csum_page *pg;
 	unsigned long key;
 	unsigned int i;
@@ -3432,12 +3919,46 @@ static void raidkm_csum_writeback(struct r5conf *conf)
 	flush_workqueue(c->wq);				/* land parked stores */
 	for (i = 0; i < c->nr_shards; i++) {
 		struct raidkm_csum_shard *s = &c->shards[i];
+		struct raidkm_csum_page *batch[RAIDKM_CSUM_WB_BATCH];
+		unsigned int n = 0;
 
+		/* in batches (raidkm_csum_flush_batch): a full-coverage cache
+		 * holds ~1 page per 4 MiB of member capacity, and one FUA
+		 * write per page made a stop or quiesce take minutes */
 		mutex_lock(&s->lock);
-		xa_for_each(&s->pages, key, pg)
-			if (test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
-				raidkm_csum_page_flush(s, pg);
+		xa_for_each(&s->pages, key, pg) {
+			if (!test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
+				continue;
+			batch[n++] = pg;
+			if (n == RAIDKM_CSUM_WB_BATCH) {
+				raidkm_csum_flush_batch(s, batch, n);
+				n = 0;
+			}
+		}
+		raidkm_csum_flush_batch(s, batch, n);
 		mutex_unlock(&s->lock);
+	}
+	/* then every member's cache, once: the pages above, and what
+	 * eviction wrote back without a flush since the array started */
+	for (i = 0; i < max(conf->raid_disks, conf->previous_raid_disks); i++) {
+		/* the members region pages are written to (conf->disks[],
+		 * as raidkm_csum_page_flush), pinned before use: this may run
+		 * from mddev_suspend without reconfig_mutex */
+		rcu_read_lock();
+		rdev = READ_ONCE(conf->disks[i].rdev);
+		if (rdev && !test_bit(Faulty, &rdev->flags))
+			atomic_inc(&rdev->nr_pending);
+		else
+			rdev = NULL;
+		rcu_read_unlock();
+		if (!rdev)
+			continue;
+		if (blkdev_issue_flush(rdev->bdev)) {
+			pr_warn_ratelimited("md/raid:%s: native csum: cache flush failed %pg\n",
+					    mdname(conf->mddev), rdev->bdev);
+			md_error(conf->mddev, rdev);
+		}
+		rdev_dec_pending(rdev, conf->mddev);
 	}
 }
 
@@ -3527,12 +4048,18 @@ static void raidkm_csum_hold_free(struct r5conf *conf)
  * csum enable; a later --grow raises the need, so a grown array may want an
  * explicit raidkm_csum_cache_pages (the ceiling is soft -- being under it is
  * a performance, never a correctness, matter). */
-static unsigned int raidkm_csum_auto_pages(struct r5conf *conf)
+static unsigned int raidkm_csum_auto_pages(struct r5conf *conf,
+					   unsigned int nsh)
 {
 	struct mddev *mddev = conf->mddev;
 	u64 blocks = mddev->dev_sectors >> RAID5_STRIPE_SHIFT(conf);
-	u64 need = DIV_ROUND_UP_ULL(blocks, RAIDKM_CSUM_PER_PAGE) *
-		   mddev->raid_disks;
+	/* page p of every member lives in shard p % nsh, and each shard has
+	 * its own ceiling (total / nsh): the shard holding page 0 needs
+	 * ceil(pages per member / nsh) per member.  Sized from the plain
+	 * total, it came out a few pages short and every shard evicted. */
+	u64 need = DIV_ROUND_UP_ULL(DIV_ROUND_UP_ULL(blocks,
+						     RAIDKM_CSUM_PER_PAGE),
+				    nsh) * nsh * mddev->raid_disks;
 	u64 cap = totalram_pages() / 64;		/* ~1.6% of RAM */
 	u64 pages = clamp_t(u64, need, 64, max_t(u64, cap, 64));
 
@@ -3554,9 +4081,6 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 	unsigned int i, per;
 	struct raidkm_csum_cache *c;
 
-	if (!total)					/* 0 = auto (default) */
-		total = raidkm_csum_auto_pages(conf);
-
 	if (!nsh) {					/* auto: one shard per cpu, capped */
 		nsh = num_online_cpus();
 		if (nsh > 16)
@@ -3566,6 +4090,8 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 		nsh = 1;
 	if (nsh > 64)
 		nsh = 64;
+	if (!total)					/* 0 = auto (default) */
+		total = raidkm_csum_auto_pages(conf, nsh);
 	c = kzalloc(struct_size(c, shards, nsh), GFP_KERNEL);
 	if (!c)
 		return NULL;
@@ -3597,6 +4123,10 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 		s->bounce = alloc_page(GFP_KERNEL);
 		if (!s->bounce)
 			goto fail;
+		s->wb = kvzalloc(sizeof(*s->wb), GFP_KERNEL);
+		if (!s->wb)
+			goto fail;
+		init_completion(&s->wb->done);
 	}
 	/* max_active = nr_shards: every shard can verify/store in parallel, off the
 	 * stripe path.  WQ_MEM_RECLAIM: it does region I/O under pressure. */
@@ -3611,9 +4141,11 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 		goto fail;
 	return c;
 fail:
-	for (i = 0; i < nsh; i++)
+	for (i = 0; i < nsh; i++) {
 		if (c->shards[i].bounce)
 			__free_page(c->shards[i].bounce);
+		kvfree(c->shards[i].wb);
+	}
 	if (c->wq)
 		destroy_workqueue(c->wq);
 	kfree(c);
@@ -3630,6 +4162,12 @@ static void raidkm_csum_cache_free(struct r5conf *conf)
 
 	if (!c)
 		return;
+	if (atomic64_read(&c->nr_evict))
+		pr_info("md/raid:%s: native csum cache: %lld region page reads, %lld written back, %lld evicted\n",
+			mdname(conf->mddev),
+			(long long)atomic64_read(&c->nr_fault),
+			(long long)atomic64_read(&c->nr_wb),
+			(long long)atomic64_read(&c->nr_evict));
 	if (c->abio_wq)
 		destroy_workqueue(c->abio_wq);		/* drains bypass verifies */
 	if (c->wq)
@@ -3646,6 +4184,7 @@ static void raidkm_csum_cache_free(struct r5conf *conf)
 		xa_destroy(&s->pages);
 		if (s->bounce)
 			__free_page(s->bounce);
+		raidkm_csum_wb_free(s);
 	}
 	kfree(c);
 	conf->csum = NULL;
@@ -6199,7 +6738,7 @@ static void raid5_end_read_request(struct bio * bi)
 			clear_bit(R5_ReWrite, &sh->dev[i].flags);
 			if (!(set_bad
 			      && test_bit(In_sync, &rdev->flags)
-			      && rdev_set_badblocks(
+			      && rk_set_badblocks(
 				      rdev, sh->sector, RAID5_STRIPE_SECTORS(conf), 0)))
 				md_error(conf->mddev, rdev);
 		}
@@ -7291,7 +7830,7 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 			else
 				rdev = NULL;
 			if (rdev) {
-				if (!rdev_set_badblocks(
+				if (!rk_set_badblocks(
 					    rdev,
 					    sh->sector,
 					    RAID5_STRIPE_SECTORS(conf), 0))
@@ -7427,7 +7966,7 @@ handle_failed_sync(struct r5conf *conf, struct stripe_head *sh,
 			if (rdev
 			    && !test_bit(Faulty, &rdev->flags)
 			    && !test_bit(In_sync, &rdev->flags)
-			    && !rdev_set_badblocks(rdev, sh->sector,
+			    && !rk_set_badblocks(rdev, sh->sector,
 						   RAID5_STRIPE_SECTORS(conf), 0))
 				abort = 1;
 			rdev = conf->disks[i].replacement;
@@ -7435,7 +7974,7 @@ handle_failed_sync(struct r5conf *conf, struct stripe_head *sh,
 			if (rdev
 			    && !test_bit(Faulty, &rdev->flags)
 			    && !test_bit(In_sync, &rdev->flags)
-			    && !rdev_set_badblocks(rdev, sh->sector,
+			    && !rk_set_badblocks(rdev, sh->sector,
 						   RAID5_STRIPE_SECTORS(conf), 0))
 				abort = 1;
 		}
@@ -9855,7 +10394,7 @@ finish:
 			if (test_and_clear_bit(R5_WriteError, &dev->flags)) {
 				/* We own a safe reference to the rdev */
 				rdev = conf->disks[pd].rdev;
-				if (!rdev_set_badblocks(rdev, sh->sector,
+				if (!rk_set_badblocks(rdev, sh->sector,
 							RAID5_STRIPE_SECTORS(conf), 0))
 					md_error(conf->mddev, rdev);
 				rdev_dec_pending(rdev, conf->mddev);
@@ -13491,7 +14030,7 @@ static void raidkm_row_write_done(struct work_struct *work)
 			set_bit(WriteErrorSeen, &rdev->flags);
 			if (!test_and_set_bit(WantReplacement, &rdev->flags))
 				set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
-			if (!rdev_set_badblocks(rdev, w->msect,
+			if (!rk_set_badblocks(rdev, w->msect,
 						w->chunk_sectors, 0))
 				md_error(mddev, rdev);
 		}
@@ -18953,6 +19492,7 @@ static void raid5d(struct md_thread *thread)
 		mddev_unlock(mddev);
 	}
 
+	rk_ro_ack_pending(mddev);
 	md_check_recovery(mddev);
 
 	blk_start_plug(&plug);

@@ -1230,6 +1230,8 @@ md-kmec/
 │   ├── raidkm-test-nowait.sh          # io_uring 1 MiB O_DIRECT reads keep up with 2 MiB / libaio (needs fio)
 │   ├── raidkm-test-csum-crashlag.sh   # --checksum: crash images (idle, bitmap, --readonly, crash in the resync)
 │   │                                    # read back with no stale CRC
+│   ├── raidkm-test-csum-readonly.sh   # --checksum mismatch past the parity on a read-only / read-auto
+│   │                                    # array: EIO, no hang (bad blocks unacknowledged until read-write)
 │   ├── raidkm-test-snap-convert.sh    # mdadm --grow --snapshots on an existing row-map array
 │   ├── raidkm-test-declustered-discard.sh # discards on declustered pools (row granularity, csum drop)
 │   ├── raidkm-test-bigrows.sh         # row map / snapshots on arrays past 33.5 M rows (sparse members)

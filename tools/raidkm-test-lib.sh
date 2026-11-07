@@ -295,6 +295,17 @@ rk_wait_idle() {
 	done
 }
 
+# rk_freeze_sync / rk_thaw_sync: hold md's sync thread (resync, reshape,
+# a failed reshape band's automatic retry) off the array and let it go again.
+# "frozen" stops the running sync thread before the write returns; "idle"
+# clears the freeze, and md restarts an unfinished reshape by itself.
+rk_freeze_sync() {
+	echo frozen | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
+}
+rk_thaw_sync() {
+	echo idle | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
+}
+
 # rk_wait_full : wait until the array is fully in-sync — no recovery in flight
 # AND no degraded/rebuilding slot.  Robust against the gap between issuing
 # --add / --replace and md actually starting the recovery (rk_wait_idle alone

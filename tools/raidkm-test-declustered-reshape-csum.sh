@@ -203,6 +203,13 @@ for i in $(seq 1 60); do
 done
 [ "$hit" = 1 ] && rk_pass "T3: migrate band failed closed on the rotted source block" \
 	       || rk_fail "T3: band never reported the CRC mismatch"
+# Freeze the reshape for the heal: md restarts a failed band within
+# milliseconds, and once the heal lands the next try migrates the row and
+# overwrites the old-geometry location the raw check below reads (the heal
+# was there; the check raced it -- 2026-11-06 trace: "read error corrected"
+# and the restart in the same millisecond, the frontier 23 rows past the
+# rotted row 30 ms later).  Thawed after the raw check.
+rk_freeze_sync
 # heal through the array: the un-migrated region still serves the OLD
 # geometry, so a read detects + heals from the OLD parity
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
@@ -226,6 +233,7 @@ for i in $(seq 1 ${HEAL_POLL_TRIES:-480}); do
 done
 [ "$healed" = 1 ] && rk_pass "T3: raw block rewritten on disk $DSK" \
 		  || rk_fail "T3: raw block not healed"
+rk_thaw_sync
 echo 500000 | sudo tee /sys/block/$MDNAME/md/sync_speed_max >/dev/null
 wait_trigger_idle 150 kick || { rk_fail "T3: reshape did not resume/finish after heal"; rk_summary; exit 1; }
 rk_pass "T3: reshape resumed and completed after the heal"

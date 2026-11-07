@@ -208,6 +208,10 @@ for i in $(seq 1 300); do
 done
 [ "$hit" = 1 ] && rk_pass "S3: migrate band failed closed on the rotted source block" \
 	       || rk_fail "S3: band never reported the CRC mismatch"
+# Freeze the shrink for the heal, as T3 of the forward gate
+# (raidkm-test-declustered-reshape-csum.sh) does and says why: the next band
+# would migrate the healed row before the raw check reads it.
+rk_freeze_sync
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 evict_stripes
 rk_rdchunk "$LC" "$RK_TMP/rb$LC"
@@ -222,6 +226,7 @@ for i in $(seq 1 ${HEAL_POLL_TRIES:-480}); do
 done
 [ "$healed" = 1 ] && rk_pass "S3: raw block rewritten on disk $DSK" \
 		  || rk_fail "S3: raw block not healed"
+rk_thaw_sync
 echo 500000 | sudo tee /sys/block/$MDNAME/md/sync_speed_max >/dev/null
 wait_trigger_idle 150 kick || { rk_fail "S3: shrink did not resume/finish after heal"; rk_summary; exit 1; }
 rk_pass "S3: shrink resumed and completed after the heal"

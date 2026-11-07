@@ -1695,8 +1695,72 @@ static inline int rk_has_badblock(struct md_rdev *rdev, sector_t s,
 	read_sequnlock_excl_irqrestore(&rdev->badblocks.lock, flags);
 	return rv;
 }
+
+/*
+ * rdev_set_badblocks() that cannot stall a read-only array.
+ *
+ * md core records a new bad block unacknowledged and sets
+ * MD_SB_CHANGE_PENDING; md_update_sb() acknowledges and writes it.  While
+ * the array is read-only (or read-auto) md_update_sb() never runs, and
+ * md_check_recovery() does not even look at the array unless
+ * MD_RECOVERY_NEEDED is set: the flag stays, handle_stripe() holds every
+ * stripe and raid5d() stops handling them -- all I/O hangs.  A read the
+ * parity cannot repair on a read-only array gets there: a native CRC
+ * mismatch on more members than the parity count (handle_failed_stripe),
+ * or a read error on a degraded one (raid5_end_read_request).
+ * On a read-only array raid5d() clears the flag (rk_ro_ack_pending()), as
+ * md_check_recovery()'s read-only branch does unconditionally (it is only
+ * reached when MD_RECOVERY_NEEDED is set, and not at all while a queued
+ * sync_work holds MD_RECOVERY_RUNNING), and wakes sb_wait, which
+ * raid5_do_work() sleeps on.  Not here: this runs from bio completion,
+ * where the read-only test cannot be made atomic with the clear, and a
+ * read-auto array's first write (md_write_start() stores MD_RDWR, then
+ * sets its own MD_SB_CHANGE_PENDING) could lose its flag and land before
+ * md records the array dirty.  Nothing is held back by the clear: a
+ * read-only array takes no writes, and a write after it goes read-write
+ * waits on the unacknowledged bad block (BlockedBadBlocks) instead.
+ * MD_RECOVERY_NEEDED is set and raid5d() woken whatever the mode, as
+ * md_error() does: an array switched to read-only after the test still
+ * gets its flag cleared.  The bad block stays recorded in memory,
+ * unacknowledged: the read fails with EIO, and md_update_sb() writes it if
+ * the array goes read-write.
+ */
+static inline bool rk_set_badblocks(struct md_rdev *rdev, sector_t s,
+				    int sectors, int is_new)
+{
+	struct mddev *mddev = rdev->mddev;
+
+	if (!rdev_set_badblocks(rdev, s, sectors, is_new))
+		return false;
+	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	md_wakeup_thread(mddev->thread);
+	return true;
+}
+
+/*
+ * raid5d(), on every wakeup: the read-only half of rk_set_badblocks().
+ * md_write_start() switches a read-auto array with a plain store of
+ * MD_RDWR and then, under mddev->lock, sets MD_SB_CHANGE_PENDING and
+ * waits for md_update_sb() to record the array dirty before its write
+ * goes out.  Under mddev->lock, an array still seen read-only has had no
+ * such section yet (it would have published MD_RDWR before taking the
+ * lock), so the flag is not a writer's and clearing it cannot let a
+ * write overtake the superblock.  mddev->lock is only ever taken in
+ * process context.
+ */
+static inline void rk_ro_ack_pending(struct mddev *mddev)
+{
+	if (md_is_rdwr(mddev) ||
+	    !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
+		return;
+	spin_lock(&mddev->lock);
+	if (!md_is_rdwr(mddev))
+		clear_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags);
+	spin_unlock(&mddev->lock);
+	wake_up(&mddev->sb_wait);
+}
 /* every lookup, in every object that includes this after md.h, goes
- * through the lock above */
-#pragma GCC poison rdev_has_badblock is_badblock
+ * through the lock above; every new bad block through rk_set_badblocks */
+#pragma GCC poison rdev_has_badblock is_badblock rdev_set_badblocks
 
 #endif

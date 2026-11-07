@@ -33,7 +33,8 @@
 # CL_NEG=1: csum_test_no_hold=Y, the old behaviour; L1, L4 and L5 must fail
 # (the run reports "NEG control: failed as expected" and exits 0 then).  L6
 # and L7 are skipped: their read-only start of a clean image with stale CRCs
-# blocks on the bad blocks md cannot acknowledge read-only.
+# fails with EIO (before raidkm-test-csum-readonly.sh's fix it blocked on the
+# bad blocks md cannot acknowledge read-only).
 #
 #   sudo RAIDKM_KO=.../raidkm.ko ISAL_KO=.../isal_lib.ko MDADM=.../mdadm \
 #        [CL_NEG=1] bash tools/raidkm-test-csum-crashlag.sh

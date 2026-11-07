@@ -690,8 +690,19 @@ new disk detects the mismatch and heals by decode.
 **Cache sizing.** The region is served through a bounded demand-paged cache,
 auto-sized at array start to cover every member's whole CRC region — roughly one
 page per 4 MiB of member capacity — clamped to ~1.6% of RAM with a logged hint
-when a huge array is clamped below full coverage. Undersizing costs region-page
-faults, never correctness; override with `raidkm_csum_cache_pages`.
+when a huge array is clamped below full coverage (past ~16× RAM of total member
+capacity). Undersizing costs region-page faults, never correctness; override
+with `raidkm_csum_cache_pages`. Below full coverage, small random writes pay
+for it: a 4 KiB write touches the CRC page of every member at that offset, and
+each one not resident is read in (a write stripe's pages in one parallel batch)
+while cold dirty pages are written back in batches. Measured on 4+2 over
+virtio NVMe, random 4K writes: full coverage ~27-31K IOPS (= no checksums),
+42% coverage 10.7K, 10% coverage 7.8K (before 2026-11-07: 2.8K and 2.2K —
+one synchronous read per fault and one synchronous write per evicted page). Sequential writes are unaffected. If
+random-write speed matters, keep the cache at full coverage: set
+`raidkm_csum_cache_pages` to the "full region coverage" figure the clamp hint
+logs, RAM permitting. At a stop the stats line `native csum cache: N region
+page reads, ... evicted` shows whether the cache was evicting.
 
 > **Crash semantics — know what you bought.** Native checksums recompute CRCs
 > over the resync window after an unclean shutdown. That is the same class of
@@ -710,6 +721,16 @@ A stop, `--readonly` or reboot writes the CRCs back before md writes the
 superblock clean. Modules before 2026-11-06 could return EIO after a crash of
 an idle array, of an array with a bitmap, or during the post-crash resync.
 Gate: `tools/raidkm-test-csum-crashlag.sh`.
+
+**Read-only arrays.** A CRC mismatch on more members of a stripe than the
+parity count fails the read with EIO and records a bad block on each, as on a
+read-write array. md cannot write a read-only (or read-auto) superblock, so
+the bad blocks stay unacknowledged in memory (`unacknowledged_bad_blocks`)
+until the array goes read-write, when they are written. The rest of the array
+reads normally; a mismatch the parity can repair is repaired in the read but
+not rewritten. Earlier modules hung every I/O to the array instead (including
+`mdadm --assemble --readonly`'s own probe of block 0), and only a reboot
+cleared it. Gate: `tools/raidkm-test-csum-readonly.sh`.
 
 ---
 
@@ -1145,6 +1166,7 @@ NATIVE=1 tools/raidkm-test-row-csum.sh # checksum verified/published through the
 tools/raidkm-test-gtc-swap.sh          # group_thread_cnt / worker_thread_cnt under resync + I/O (a field-reported crash)
 tools/raidkm-test-nowait.sh            # io_uring 1 MiB reads vs 2 MiB / libaio (fio; no REQ_NOWAIT)
 tools/raidkm-test-csum-crashlag.sh     # --checksum crash images read back with no stale CRC
+tools/raidkm-test-csum-readonly.sh     # --checksum mismatch past the parity on a read-only array: EIO, no hang
 tools/raidkm-test-snap-convert.sh      # mdadm --grow --snapshots on an existing row-map array
 tools/raidkm-test-declustered-discard.sh # discards on declustered pools
 tools/raidkm-test-bigrows.sh           # row map / snapshots past 33.5 M rows
