@@ -2576,15 +2576,18 @@ static void raidkm_csum_wb_endio(struct bio *bio)
 
 /* The shard's batch buffers (allocated with the cache), with the snapshot
  * pages a write-back batch needs: made on first use, an eighth of the
- * shard's ceiling (8..RAIDKM_CSUM_WB_BATCH), so a small cache does not pin
- * more for them than it holds.  NULL if there are none (callers fall back
+ * shard's ceiling (2 or more: a shard holds 16 pages or more; at most
+ * RAIDKM_CSUM_WB_BATCH), the eviction round after a single fault, so a
+ * small cache does not pin more for them than it holds.  The round after
+ * a fault batch (up to a quarter of the ceiling over it) writes in two
+ * or three rounds of that size.  NULL if there are none (callers fall back
  * to one synchronous I/O per page, and say so once).  @snaps: false for a
  * read batch, which needs none.  Caller holds s->lock. */
 static struct raidkm_csum_wb *raidkm_csum_wb_get(struct raidkm_csum_shard *s,
 						 bool snaps)
 {
 	struct raidkm_csum_wb *wb = s->wb;
-	unsigned int want = clamp_t(unsigned int, s->max / 8, 8,
+	unsigned int want = clamp_t(unsigned int, s->max / 8, 2,
 				    RAIDKM_CSUM_WB_BATCH);
 
 	if (wb && snaps)
@@ -2962,8 +2965,10 @@ static struct raidkm_csum_page *raidkm_csum_get(struct raidkm_csum_shard *s,
 /* Fault in, with reads in parallel, those of the region pages @keys[0..n)
  * (distinct, one shard's) that are not resident, then one eviction round.
  * At most a quarter of the ceiling is read, so that round cannot evict
- * what it just read; the rest are left to fault one at a time.  Used for a
- * write stripe's verify (raidkm_csum_verify_stripe): its blocks' CRCs sit
+ * what it just read; the rest fault one at a time (or in the next batch:
+ * the shard worker batches a group of queued stripes, and each stripe's
+ * verify then batches what the group missed).  One miss is not batched.
+ * Used for a write stripe's verify (raidkm_csum_verify_stripe): its blocks' CRCs sit
  * in one page index of every member, and faulting those pages one
  * synchronous read at a time (the reads' members first, then the written
  * ones' as their stores landed) was what a cache smaller than the region
@@ -2981,6 +2986,7 @@ static void raidkm_csum_fault_batch(struct raidkm_csum_shard *s,
 {
 	struct r5conf *conf = s->cache->conf;
 	struct raidkm_csum_page *pgs[RAIDKM_CSUM_RA_BATCH];
+	unsigned long miss[RAIDKM_CSUM_RA_BATCH];
 	unsigned int np = 0, i, lim, seq;
 	struct raidkm_csum_wb *wb;
 	struct blk_plug plug;
@@ -2989,6 +2995,9 @@ static void raidkm_csum_fault_batch(struct raidkm_csum_shard *s,
 	if (!conf->csum_disk)
 		return;
 	lim = min_t(unsigned int, RAIDKM_CSUM_RA_BATCH, s->max / 4);
+	/* the misses first, allocated only if there are two or more: a
+	 * stripe after the worker's group batch usually misses none or one,
+	 * which faults on its own */
 	for (i = 0; i < n && np < lim; i++) {
 		struct raidkm_csum_page *r = xa_load(&s->pages, keys[i]);
 
@@ -2997,11 +3006,16 @@ static void raidkm_csum_fault_batch(struct raidkm_csum_shard *s,
 			list_move(&r->lru, &s->lru);
 			continue;
 		}
-		pgs[np] = raidkm_csum_page_alloc(keys[i]);
-		if (!pgs[np])
-			break;
-		np++;
+		miss[np++] = keys[i];
 	}
+	if (np < 2)
+		return;
+	for (i = 0; i < np; i++) {
+		pgs[i] = raidkm_csum_page_alloc(miss[i]);
+		if (!pgs[i])
+			break;
+	}
+	np = i;
 	wb = np > 1 ? raidkm_csum_wb_get(s, false) : NULL;
 	if (!wb) {
 		/* one page (or no buffers): it faults on its own */
@@ -3690,14 +3704,18 @@ static unsigned int raidkm_csum_stripe_keys(struct r5conf *conf,
  * shipped R5_ReadError/R5_IntegrityHeal heal.  Data AND parity are verified
  * (matches the load-all path). */
 static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s,
-				      struct stripe_head *sh, bool prefaulted)
+				      struct stripe_head *sh)
 {
 	struct r5conf *conf = s->cache->conf;
 	bool rederive = raidkm_csum_rederive(conf);
 	int i;
 
 	mutex_lock(&s->lock);
-	if (!rederive && !prefaulted) {
+	/* after the worker's group batch too: that one is capped (keys,
+	 * the shard's read limit), and what it missed would otherwise
+	 * fault one synchronous read at a time; resident pages cost a
+	 * lookup here */
+	if (!rederive) {
 		unsigned long keys[RAIDKM_CSUM_RA_BATCH];
 		unsigned int nk = raidkm_csum_stripe_keys(conf, sh, keys, 0);
 
@@ -3839,7 +3857,8 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 
 		/* up to RAIDKM_CSUM_VBATCH queued stripes at a time: the
 		 * region pages of all of them are faulted in one parallel
-		 * batch before they are verified one by one */
+		 * batch (capped: raidkm_csum_fault_batch) before they are
+		 * verified one by one; each verify batches what it missed */
 		spin_lock_irqsave(&s->qlock, flags);
 		while (nsh < RAIDKM_CSUM_VBATCH && !list_empty(&s->vstripes)) {
 			sh = list_first_entry(&s->vstripes, struct stripe_head, csum_list);
@@ -3866,7 +3885,7 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 			}
 			for (i = 0; i < nsh; i++) {	/* in queue order */
 				sh = shs[i];
-				raidkm_csum_verify_stripe(s, sh, pre);
+				raidkm_csum_verify_stripe(s, sh);
 				set_bit(STRIPE_HANDLE, &sh->state);
 				raid5_release_stripe(sh);	/* the ref taken at queue */
 			}
@@ -16739,9 +16758,10 @@ static int raidkm_reshape_verify_src(struct r5conf *conf, int disk,
 		return 0;
 	got = raidkm_block_crc(conf, pg, 0);
 	if (got != want) {
-		pr_err("md/raid:%s: dcl reshape: CRC mismatch on migrate read (disk %d sector %llu, stored %08x got %08x) — failing the band; scrub/heal the array and resume\n",
-		       mdname(conf->mddev), disk,
-		       (unsigned long long)dev_sector, want, got);
+		/* md restarts a failed band within milliseconds: ratelimited */
+		pr_err_ratelimited("md/raid:%s: reshape: CRC mismatch on migrate read (disk %d sector %llu, stored %08x got %08x) — failing the band; scrub/heal the array and resume\n",
+				   mdname(conf->mddev), disk,
+				   (unsigned long long)dev_sector, want, got);
 		return -EIO;
 	}
 	return 0;

@@ -698,7 +698,10 @@ each one not resident is read in (a write stripe's pages in one parallel batch)
 while cold dirty pages are written back in batches. Measured on 4+2 over
 virtio NVMe, random 4K writes: full coverage ~27-31K IOPS (= no checksums),
 42% coverage 10.7K, 10% coverage 7.8K (before 2026-11-07: 2.8K and 2.2K —
-one synchronous read per fault and one synchronous write per evicted page). Sequential writes are unaffected. If
+one synchronous read per fault and one synchronous write per evicted page).
+A follow-up that also batches what each stripe's group read missed measured,
+on a second, slower rig (RHEL 10.2 guest): 10% coverage 5.1K -> 7.8K, 42%
+coverage 7.3K -> 10.5K. Sequential writes are unaffected. If
 random-write speed matters, keep the cache at full coverage: set
 `raidkm_csum_cache_pages` to the "full region coverage" figure the clamp hint
 logs, RAM permitting. At a stop the stats line `native csum cache: N region
