@@ -16406,6 +16406,51 @@ static int raidkm_reshape_write_units(struct r5conf *conf, struct page **band,
 	return nfail ? -EIO : 0;
 }
 
+/*
+ * A band that failed made no progress, and md asks for the same band again at
+ * once.  The usual cause is a source block that fails its CRC check (or its
+ * read): the band then fails every time until the block is healed, which a
+ * read through the array of the not yet migrated region does from the old
+ * geometry's parity, and the reshape resumes by itself.  Any other band error
+ * (memory, a member write, the journal) is retried the same way.  Without a
+ * pause each retry came within milliseconds: re-read, quiesce pulse, fail.
+ * Wait before it, 10 ms doubling to 1 s; a band that migrates, or a new
+ * reshape (raid5_start_reshape), resets it.  md ends the sync pass when a
+ * band returns no progress and starts a new one from sector 0 at once, so
+ * the back-off carries over passes.  There is no give-up: a block nothing
+ * can heal costs one try a second until the array is stopped.  An
+ * interrupted sync (stop, frozen, an inject park) does not wait and does not
+ * double.  Called from the sync thread, the band unclaimed.
+ */
+#define RAIDKM_RESHAPE_RETRY_MIN_MS	10
+#define RAIDKM_RESHAPE_RETRY_MAX_MS	1000
+
+static bool raidkm_reshape_interrupted(struct mddev *mddev)
+{
+	return test_bit(MD_RECOVERY_INTR, &mddev->recovery) ||
+	       kthread_should_stop() || signal_pending(current);
+}
+
+static void raidkm_reshape_band_backoff(struct r5conf *conf)
+{
+	struct mddev *mddev = conf->mddev;
+	unsigned long end;
+	unsigned int ms;
+
+	if (raidkm_reshape_interrupted(mddev))
+		return;
+	ms = conf->reshape_retry_ms;
+	ms = ms ? min(ms * 2, (unsigned int)RAIDKM_RESHAPE_RETRY_MAX_MS) :
+		  RAIDKM_RESHAPE_RETRY_MIN_MS;
+	conf->reshape_retry_ms = ms;
+	/* in 10 ms slices: not every path that interrupts a sync wakes this
+	 * thread (raid5_error sets MD_RECOVERY_INTR only), and interruptible,
+	 * so a reshape waiting on an unhealable block is not a D-state task */
+	end = jiffies + msecs_to_jiffies(ms);
+	while (time_before(jiffies, end) && !raidkm_reshape_interrupted(mddev))
+		schedule_timeout_interruptible(msecs_to_jiffies(10));
+}
+
 /* csum × reshape helpers (defined with the dcl band code below; both are
  * layout-agnostic — CRCs are keyed by PHYSICAL (disk, block), which is the
  * same key space for classic and declustered bands). */
@@ -17217,9 +17262,11 @@ static sector_t raidkm_reshape_cow(struct mddev *mddev, sector_t sector_nr,
 		conf->reshape_progress = (sector_t)sector_nr * k;
 		spin_unlock_irq(&conf->device_lock);
 		wake_up(&conf->wait_for_reshape);
+		raidkm_reshape_band_backoff(conf);
 		*skipped = 1;
 		return 0;
 	}
+	conf->reshape_retry_ms = 0;
 
 	/*
 	 * RELEASE the band: its DONE record is journaled, so crash recovery
@@ -17346,9 +17393,11 @@ static sector_t raidkm_reshape_cow_shrink(struct mddev *mddev,
 		conf->reshape_progress = (sector_t)(row + 1) * k * chunk;
 		spin_unlock_irq(&conf->device_lock);
 		wake_up(&conf->wait_for_reshape);
+		raidkm_reshape_band_backoff(conf);
 		*skipped = 1;
 		return 0;
 	}
+	conf->reshape_retry_ms = 0;
 
 	/* RELEASE: the DONE record is journaled; publish the descent */
 	spin_lock_irq(&conf->device_lock);
@@ -17410,10 +17459,15 @@ static int raidkm_reshape_verify_src(struct r5conf *conf, int disk,
 		return 0;
 	got = raidkm_block_crc(conf, pg, 0);
 	if (got != want) {
-		/* md restarts a failed band within milliseconds: ratelimited */
-		pr_err_ratelimited("md/raid:%s: reshape: CRC mismatch on migrate read (disk %d sector %llu, stored %08x got %08x) — failing the band; scrub/heal the array and resume\n",
-				   mdname(conf->mddev), disk,
-				   (unsigned long long)dev_sector, want, got);
+		/* the band is retried, up to once a second, until the block is
+		 * healed (raidkm_reshape_band_backoff): the first failure of a
+		 * run of retries always, then a few lines a minute */
+		static DEFINE_RATELIMIT_STATE(rs, 60 * HZ, 3);
+
+		if (!conf->reshape_retry_ms || __ratelimit(&rs))
+			pr_err("md/raid:%s: reshape: CRC mismatch on migrate read (disk %d sector %llu, stored %08x got %08x) — failing the band, retried until the block reads back right; read that region through the array to heal it (check/repair cannot run while the reshape is pending)\n",
+			       mdname(conf->mddev), disk,
+			       (unsigned long long)dev_sector, want, got);
 		return -EIO;
 	}
 	return 0;
@@ -17741,9 +17795,11 @@ static sector_t raidkm_reshape_dcl_cow(struct mddev *mddev, sector_t sector_nr,
 				(sector_t)row * new_span * chunk;
 		spin_unlock_irq(&conf->device_lock);
 		wake_up(&conf->wait_for_reshape);
+		raidkm_reshape_band_backoff(conf);
 		*skipped = 1;
 		return 0;
 	}
+	conf->reshape_retry_ms = 0;
 
 	/*
 	 * RELEASE: publish the frontier move to the map selectors FIRST
@@ -24782,6 +24838,12 @@ static int raid5_start_reshape(struct mddev *mddev)
 	struct md_rdev *rdev;
 	int spares = 0;
 
+	/* no back-off left from an earlier reshape of this array
+	 * (raidkm_reshape_band_backoff).  Not at sector 0 of a sync pass:
+	 * a failed band returns no progress, md ends the pass and starts it
+	 * again from 0 at once, and the back-off has to carry over that.
+	 * An assembled array starts with a fresh conf. */
+	conf->reshape_retry_ms = 0;
 	if (conf->dcl)
 		return raidkm_dcl_start_reshape(mddev);
 	int i;

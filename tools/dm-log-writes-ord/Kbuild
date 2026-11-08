@@ -1,0 +1,1 @@
+obj-m := dm-log-writes-ord.o

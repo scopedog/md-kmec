@@ -1068,6 +1068,11 @@ struct r5conf {
 	 */
 	struct dcl_geom		*dcl_retired;
 	sector_t		reshape_frontier_row;
+	/* back-off before md retries a band that failed (usually a source
+	 * block that fails its CRC or its read; any band error): ms,
+	 * doubling, 0 after a band migrates or a new reshape starts
+	 * (raidkm_reshape_band_backoff) */
+	unsigned int		reshape_retry_ms;
 	u64			reshape_new_seed;	/* NEW-geometry permutation
 							 * seed, staged by the
 							 * reshape trigger, consumed
