@@ -2290,8 +2290,70 @@ struct raidkm_csum_cache {
 	 * printed at stop when the cache evicted (a cache smaller than the
 	 * region) */
 	atomic64_t		nr_fault, nr_wb, nr_evict;
+	/* plan A, the CRC write-back epoch (raidkm_csum_epoch_note): while
+	 * RAIDKM_CSUM_EPOCH_OPEN is set, the open epoch holds one
+	 * mddev->writes_pending reference, so md cannot mark the array
+	 * clean; its pass (epoch_dw, raidkm_csum_epoch_fn) closes it, writes
+	 * every dirty page back and only then drops the reference */
+	/* read by every store, written at open and close */
+	unsigned long		epoch_flags ____cacheline_aligned_in_smp;
+	unsigned long		epoch_start;	/* jiffies: the open epoch opened */
+	/* written by stores, at most once a jiffy each */
+	unsigned long		epoch_last ____cacheline_aligned_in_smp;
+	struct delayed_work	epoch_dw ____cacheline_aligned_in_smp;
+	atomic64_t		nr_pass;	/* passes that closed an epoch */
+	/* plan A step 2, a resync's re-derived CRCs (raidkm_csum_sync_note):
+	 * while RAIDKM_CSUM_SYNC_OPEN is set, one sector is counted in
+	 * mddev->recovery_active, so md moves no resync checkpoint (nor ends
+	 * the resync) until sync_dw's pass has written them back */
+	unsigned long		sync_flags;
+	struct delayed_work	sync_dw;
+	/* plan A step 3, the write-intent bitmap (raidkm_csum_bmh_mark): per
+	 * bitmap chunk with a stored CRC, the latest epoch generation that
+	 * stored there and whether bmh_work holds the chunk (xa value:
+	 * gen << 2 | RAIDKM_CSUM_BMH_*); each entry pins mddev->active_io.
+	 * Under bmh_lock. */
+	unsigned long		epoch_gen;	/* the open (or next) epoch's */
+	struct mutex		bmh_lock;
+	struct xarray		bmh;
+	struct work_struct	bmh_work;
 	struct raidkm_csum_shard shards[];	/* flexible: nr_shards of them */
 };
+
+#define RAIDKM_CSUM_EPOCH_OPEN	0	/* an epoch is open, its ref held */
+#define RAIDKM_CSUM_EPOCH_KICK	1	/* a quiesce closed one: let md retry
+					 * the clean mark at its end */
+#define RAIDKM_CSUM_SYNC_OPEN	0	/* sync_flags: re-derived CRCs not
+					 * written back yet, a sector held */
+/* bmh entry value: gen << RAIDKM_CSUM_BMH_SHIFT | flags */
+#define RAIDKM_CSUM_BMH_HELD	1UL	/* bmh_work took the bitmap hold */
+#define RAIDKM_CSUM_BMH_TAKING	2UL	/* bmh_work is taking it, unlocked */
+#define RAIDKM_CSUM_BMH_FLAGS	3UL
+#define RAIDKM_CSUM_BMH_SHIFT	2
+
+static void raidkm_csum_epoch_note(struct r5conf *conf);
+static void raidkm_csum_epoch_fn(struct work_struct *w);
+static void raidkm_csum_sync_note(struct r5conf *conf);
+static void raidkm_csum_sync_fn(struct work_struct *w);
+static void raidkm_csum_bmh_mark(struct r5conf *conf, unsigned long blk);
+static void raidkm_csum_bmh_fn(struct work_struct *w);
+
+/* A store in progress holds md's writes_pending, as a write does from
+ * md_write_start() to md_write_end(): md cannot mark the array clean while
+ * its CRC is in the cache only and no epoch holds it yet. */
+static bool raidkm_csum_epoch_pin(struct r5conf *conf)
+{
+	if (!conf->csum_epoch)
+		return false;
+	percpu_ref_get(&conf->mddev->writes_pending);
+	return true;
+}
+
+static void raidkm_csum_epoch_unpin(struct r5conf *conf, bool pin)
+{
+	if (pin)
+		percpu_ref_put(&conf->mddev->writes_pending);
+}
 
 static unsigned int raidkm_csum_cache_pages;	/* 0 = auto-size (default) */
 module_param(raidkm_csum_cache_pages, uint, 0644);
@@ -2323,7 +2385,7 @@ static bool raidkm_csum_rederive(struct r5conf *conf)
 	unsigned long r = mddev->recovery;
 
 	/* Also from an unclean start until a plain resync completes
-	 * (csum_fullsync, raidkm_csum_hold_run): before the resync starts
+	 * (csum_fullsync, raidkm_csum_epoch_run): before the resync starts
 	 * (read-only or auto-read-only, delayed, frozen), or when md counted
 	 * a resync as done that skipped a too-degraded array, the stored CRCs
 	 * may lag the data on EVERY member, so a verify would fail good
@@ -2336,7 +2398,7 @@ static bool raidkm_csum_rederive(struct r5conf *conf)
 	 * for a grow's new rows (recovery_cp below them, clean start): never
 	 * written, they have no CRCs to lag, and the rest must stay
 	 * verified. */
-	if (conf->csum_hold && READ_ONCE(conf->csum_fullsync))
+	if (conf->csum_epoch && READ_ONCE(conf->csum_fullsync))
 		return true;
 	return test_bit(MD_RECOVERY_SYNC, &r) &&
 	       !test_bit(MD_RECOVERY_REQUESTED, &r) &&
@@ -2452,18 +2514,47 @@ static struct raidkm_csum_shard *raidkm_csum_shard_for(struct raidkm_csum_cache 
 }
 
 /* --- region page I/O (BLOCKING; workqueue context only) ---------------- */
+
+/* Member @m's device for region I/O, pinned (rdev_dec_pending when done), or
+ * NULL if it has none that works.  raid5_remove_disk() frees an rdev whose
+ * nr_pending stayed 0 over its grace period, so it is pinned under RCU.  When
+ * a replacement takes over, remove_disk clears disks[m].rdev, then moves the
+ * replacement there, then clears disks[m].replacement: a reader may see the
+ * slot empty in between.  An epoch's pass runs beside that (and writes the
+ * array clean after it), so it takes the replacement then -- the member the
+ * slot is getting -- and reads rdev again after a replacement read empty. */
+static struct md_rdev *raidkm_csum_rdev_get(struct r5conf *conf, int m)
+{
+	struct disk_info *p = &conf->disks[m];
+	struct md_rdev *rdev;
+
+	rcu_read_lock();
+	rdev = READ_ONCE(p->rdev);
+	if (!rdev) {
+		smp_rmb();
+		rdev = READ_ONCE(p->replacement);
+		if (!rdev) {
+			smp_rmb();
+			rdev = READ_ONCE(p->rdev);
+		}
+	}
+	if (rdev && !test_bit(Faulty, &rdev->flags))
+		atomic_inc(&rdev->nr_pending);
+	else
+		rdev = NULL;
+	rcu_read_unlock();
+	return rdev;
+}
+
 static bool raidkm_csum_page_read(struct r5conf *conf, int m,
 				  unsigned long pgidx, struct page *page)
 {
-	struct md_rdev *rdev = conf->disks[m].rdev;
+	struct md_rdev *rdev = raidkm_csum_rdev_get(conf, m);
 	sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
 	bool ok;
 
-	if (!rdev || test_bit(Faulty, &rdev->flags))
+	if (!rdev)
 		return false;
-	/* pin across the (sleeping) region I/O: raid5_remove_disk frees the
-	 * rdev once nr_pending drops (same pattern as raid5_read_one_chunk) */
-	atomic_inc(&rdev->nr_pending);
 	if (!raidkm_csum_region(conf, rdev, &rstart, &rsec) ||
 	    off + (PAGE_SIZE >> 9) > rsec) {		/* past region end */
 		rdev_dec_pending(rdev, conf->mddev);
@@ -2510,16 +2601,15 @@ static bool raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 	struct r5conf *conf = s->cache->conf;
 	int m = pg->key >> 40;
 	unsigned long pgidx = pg->key & ((1UL << 40) - 1);
-	struct md_rdev *rdev = conf->disks[m].rdev;
+	struct md_rdev *rdev = conf->csum_disk ? raidkm_csum_rdev_get(conf, m) :
+						 NULL;
 	sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
 	bool ok;
 
-	if (!conf->csum_disk || !rdev || test_bit(Faulty, &rdev->flags)) {
+	if (!rdev) {
 		clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
 		return true;
 	}
-	/* pin across the (sleeping) region write -- see raidkm_csum_page_read */
-	atomic_inc(&rdev->nr_pending);
 	if (!raidkm_csum_region(conf, rdev, &rstart, &rsec) ||
 	    off + (PAGE_SIZE >> 9) > rsec) {		/* past region end */
 		rdev_dec_pending(rdev, conf->mddev);
@@ -2654,19 +2744,19 @@ static bool raidkm_csum_flush_batch(struct raidkm_csum_shard *s,
 			struct raidkm_csum_wb_ent *e = &wb->ent[ne];
 			int m = pg->key >> 40;
 			unsigned long pgidx = pg->key & ((1UL << 40) - 1);
-			struct md_rdev *rdev = conf->disks[m].rdev;
+			struct md_rdev *rdev;
 			sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
 
 			if (!test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
 				continue;
-			if (!conf->csum_disk || !rdev ||
-			    test_bit(Faulty, &rdev->flags)) {
+			rdev = raidkm_csum_rdev_get(conf, m);
+			if (!conf->csum_disk || !rdev) {
 				/* nowhere to write it: as raidkm_csum_page_flush */
+				if (rdev)
+					rdev_dec_pending(rdev, conf->mddev);
 				clear_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
 				continue;
 			}
-			/* pin across the write, as raidkm_csum_page_flush */
-			atomic_inc(&rdev->nr_pending);
 			if (!raidkm_csum_region(conf, rdev, &rstart, &rsec) ||
 			    off + (PAGE_SIZE >> 9) > rsec) {
 				rdev_dec_pending(rdev, conf->mddev);
@@ -2757,6 +2847,12 @@ static bool raidkm_csum_get_slot(struct raidkm_csum_page *pg,
 	return true;
 }
 
+/* A NEW CRC set here must be pinned and noted (raidkm_csum_epoch_pin,
+ * raidkm_csum_epoch_note), as raidkm_csum_store() does, or, for a resync's
+ * re-derive, held against md's checkpoint (raidkm_csum_sync_note, as in
+ * raidkm_csum_verify_stripe()): otherwise md may mark the array clean, or
+ * record a resync checkpoint past it, with it in the cache only (plan A).  Landing a parked store needs neither: it
+ * was noted when it parked. */
 static void raidkm_csum_set_slot(struct raidkm_csum_page *pg,
 				 unsigned long blk, u32 crc)
 {
@@ -2779,11 +2875,12 @@ static void raidkm_csum_set_slot(struct raidkm_csum_page *pg,
  *
  * The write-back does not flush the members' caches: a page read back
  * after its write completed reads the new image whatever the cache, and
- * stable media matter only across a power loss.  A crash while the array
- * runs resyncs every row with data and re-derives its CRCs from the data
- * (hotfix H, raidkm_csum_hold_run), so CRCs there are not trusted anyway;
- * a clean stop writes back the rest and flushes every member
- * (raidkm_csum_writeback), which covers these writes too.  The CRC drops
+ * stable media matter only across a power loss.  The page was dirtied in an
+ * epoch that holds the array dirty (raidkm_csum_epoch_note) until its pass,
+ * which ends with a cache flush of every member (raidkm_csum_writeback),
+ * issued after this write completed (both run under the shard lock): md
+ * marks the array clean only after that flush, and a crash before it
+ * resyncs and re-derives these CRCs.  A clean stop does the same.  The CRC drops
  * of discarded rows must reach stable media before the trim and are never
  * re-derived (a resync skips U rows): they write with PREFLUSH|FUA
  * (raidkm_csum_page_flush), so no older image of the page written here
@@ -3032,15 +3129,13 @@ static void raidkm_csum_fault_batch(struct raidkm_csum_shard *s,
 		struct raidkm_csum_page *pg = pgs[i];
 		int m = pg->key >> 40;
 		unsigned long pgidx = pg->key & ((1UL << 40) - 1);
-		struct md_rdev *rdev = conf->disks[m].rdev;
+		struct md_rdev *rdev = raidkm_csum_rdev_get(conf, m);
 		sector_t rstart, rsec, off = pgidx * (PAGE_SIZE >> 9);
 
 		we->pg = pg;
 		we->rdev = NULL;
-		/* as raidkm_csum_page_read */
-		if (!rdev || test_bit(Faulty, &rdev->flags))
+		if (!rdev)
 			continue;
-		atomic_inc(&rdev->nr_pending);
 		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec) ||
 		    off + (PAGE_SIZE >> 9) > rsec) {
 			rdev_dec_pending(rdev, conf->mddev);
@@ -3358,8 +3453,8 @@ static void raidkm_csum_park_clear(struct raidkm_csum_cache *c,
  * pending xarray (checked first by every verify path) for the worker to land.
  * An xa_store failure drops the store -- the absent-slot re-derive backstop
  * keeps that safe, exactly as the old dropped-kzalloc path did. */
-static void raidkm_csum_store(struct r5conf *conf, int member,
-			      unsigned long blk, u32 crc)
+static void raidkm_csum_store_one(struct r5conf *conf, int member,
+				  unsigned long blk, u32 crc)
 {
 	struct raidkm_csum_cache *c = conf->csum;
 	struct raidkm_csum_shard *s = raidkm_csum_shard_for(c, blk);
@@ -3455,6 +3550,26 @@ parked:
 		return;
 	}
 	queue_work(c->wq, &s->work);
+}
+
+/* Every CRC store, in any of its forms (a slot written, a parked store, a
+ * slot emptied for a discard), then opens the write-back epoch or joins the
+ * open one: the store is visible (the page dirty, or the entry parked) before
+ * raidkm_csum_epoch_note() tests the epoch.  It is pinned throughout
+ * (raidkm_csum_epoch_pin): a store with no write of its own behind it
+ * (reshape, rebuild, declustered copy, re-derive) could otherwise sit in the
+ * cache while md marks the array clean -- before its note opens the epoch, or
+ * after it joined one whose opener has not taken the epoch's reference
+ * yet. */
+static void raidkm_csum_store(struct r5conf *conf, int member,
+			      unsigned long blk, u32 crc)
+{
+	bool pin = raidkm_csum_epoch_pin(conf);
+
+	raidkm_csum_store_one(conf, member, blk, crc);
+	raidkm_csum_epoch_note(conf);
+	raidkm_csum_bmh_mark(conf, blk);
+	raidkm_csum_epoch_unpin(conf, pin);
 }
 
 /* read-only: this module takes native checksums together with the row map
@@ -3561,14 +3676,13 @@ static bool raidkm_csum_drop_rows_io(struct r5conf *conf, u64 first_row,
 
 	/* on disk */
 	for (m = 0; conf->csum_disk && m < conf->raid_disks; m++) {
-		struct md_rdev *rdev = conf->disks[m].rdev;
+		struct md_rdev *rdev = raidkm_csum_rdev_get(conf, m);
 		unsigned long mk = (unsigned long)m << 40, p, np, ends[2];
 		sector_t rstart, rsec;
 		int j;
 
-		if (!rdev || test_bit(Faulty, &rdev->flags))
+		if (!rdev)
 			continue;
-		atomic_inc(&rdev->nr_pending);	/* see raidkm_csum_page_read */
 		if (!raidkm_csum_region(conf, rdev, &rstart, &rsec)) {
 			rdev_dec_pending(rdev, conf->mddev);
 			continue;		/* no region: in core only */
@@ -3754,6 +3868,9 @@ static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s,
 				raidkm_csum_set_slot(pg, blk,
 					raidkm_block_crc(conf, dev->page, dev->offset));
 				spin_unlock(&pg->slock);
+				/* not an epoch's: the resync checkpoint
+				 * waits for it (raidkm_csum_sync_note) */
+				raidkm_csum_sync_note(conf);
 			}
 		} else if (raidkm_csum_expected(s, pd, blk, &want)) {
 			got = raidkm_block_crc(conf, dev->page, dev->offset);
@@ -3781,6 +3898,59 @@ static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s,
 	mutex_unlock(&s->lock);
 }
 
+/* Land parked store @e of block key @idx (raidkm_csum_pkey) in shard @s: its
+ * CRC into the region page, faulted in if need be, then the entry erased
+ * unless a newer store replaced it meanwhile.  Sleeps (region I/O).  The
+ * shard worker lands them, and so does an epoch's pass (raidkm_csum_land_all),
+ * which must not wait for the worker under a store flood. */
+static void raidkm_csum_land(struct raidkm_csum_shard *s, unsigned long idx,
+			     void *e)
+{
+	struct r5conf *conf = s->cache->conf;
+	int member = idx >> 40;
+	unsigned long blk = idx & ((1UL << 40) - 1);
+	struct raidkm_csum_page *pg;
+
+	mutex_lock(&s->lock);
+	/* still parked?  raidkm_csum_drop_rows() erases entries under this
+	 * lock: landing one it erased would put a dropped CRC back */
+	if (xa_load(&s->pending, idx) != e) {
+		mutex_unlock(&s->lock);
+		return;
+	}
+	pg = raidkm_csum_get(s, raidkm_csum_key(member, blk));
+	if (pg && e == RAIDKM_CSUM_PCLEAR) {
+		/* a block being discarded: empty, on disk before the discard
+		 * attaches (raidkm_csum_disc) */
+		spin_lock(&pg->slock);
+		raidkm_csum_clear_slot_locked(pg, blk);
+		spin_unlock(&pg->slock);
+		if (test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags) &&
+		    !raidkm_csum_page_flush(s, pg))
+			pr_warn_ratelimited("md/raid:%s: native csum: a CRC of a block being discarded could not be cleared on disk\n",
+					    mdname(conf->mddev));
+	} else if (pg) {
+		spin_lock(&pg->slock);
+		raidkm_csum_set_slot(pg, blk, (u32)xa_to_value(e));
+		spin_unlock(&pg->slock);
+	} else if (e == RAIDKM_CSUM_PCLEAR) {
+		pr_warn_ratelimited("md/raid:%s: native csum: a CRC of a block being discarded could not be cleared\n",
+				    mdname(conf->mddev));
+	}
+	mutex_unlock(&s->lock);
+	/* slot-store BEFORE pending-erase (pairs with peek's pending-then-slot
+	 * order); erase only if a newer store hasn't replaced the entry.  OOM
+	 * (pg NULL) drops the store: the on-region slot stays STALE, which a
+	 * later read false-mismatches on and the confirmed heal-rewrite then
+	 * repairs.  Landed twice (the worker and a pass), an entry is set twice
+	 * to the same value and erased once. */
+	if (xa_cmpxchg(&s->pending, idx, e, NULL, GFP_NOWAIT) == e) {
+		atomic_dec(&s->pending_nr);
+		if (e == RAIDKM_CSUM_PCLEAR)
+			raidkm_csum_clear_done(s->cache);
+	}
+}
+
 /* One shard's worker: land parked stores into faulted-in region pages, verify
  * deferred stripes, re-handle each.  Landing stores first is HOUSEKEEPING, not
  * ordering -- every verify path consults `pending` directly -- it just keeps
@@ -3800,51 +3970,7 @@ static void raidkm_csum_work_fn(struct work_struct *w)
 		void *e;
 
 		xa_for_each(&s->pending, idx, e) {
-			int member = idx >> 40;
-			unsigned long blk = idx & ((1UL << 40) - 1);
-			struct raidkm_csum_page *pg;
-
-			mutex_lock(&s->lock);
-			/* still parked?  raidkm_csum_drop_rows() erases
-			 * entries under this lock: landing one it erased
-			 * would put a dropped CRC back */
-			if (xa_load(&s->pending, idx) != e) {
-				mutex_unlock(&s->lock);
-				did = true;
-				continue;
-			}
-			pg = raidkm_csum_get(s, raidkm_csum_key(member, blk));
-			if (pg && e == RAIDKM_CSUM_PCLEAR) {
-				/* a block being discarded: empty, on disk
-				 * before the discard attaches (raidkm_csum_disc) */
-				spin_lock(&pg->slock);
-				raidkm_csum_clear_slot_locked(pg, blk);
-				spin_unlock(&pg->slock);
-				if (test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags) &&
-				    !raidkm_csum_page_flush(s, pg))
-					pr_warn_ratelimited("md/raid:%s: native csum: a CRC of a block being discarded could not be cleared on disk\n",
-							    mdname(conf->mddev));
-			} else if (pg) {
-				spin_lock(&pg->slock);
-				raidkm_csum_set_slot(pg, blk, (u32)xa_to_value(e));
-				spin_unlock(&pg->slock);
-			} else if (e == RAIDKM_CSUM_PCLEAR) {
-				pr_warn_ratelimited("md/raid:%s: native csum: a CRC of a block being discarded could not be cleared\n",
-						    mdname(conf->mddev));
-			}
-			mutex_unlock(&s->lock);
-			/* slot-store BEFORE pending-erase (pairs with peek's
-			 * pending-then-slot order); erase only if a newer
-			 * store hasn't replaced the entry.  OOM (pg NULL)
-			 * drops the store: the on-region slot stays STALE,
-			 * which a later read false-mismatches on and the
-			 * confirmed heal-rewrite then repairs. */
-			if (xa_cmpxchg(&s->pending, idx, e, NULL,
-				       GFP_NOWAIT) == e) {
-				atomic_dec(&s->pending_nr);
-				if (e == RAIDKM_CSUM_PCLEAR)
-					raidkm_csum_clear_done(s->cache);
-			}
+			raidkm_csum_land(s, idx, e);
 			did = true;
 			if (!--budget)
 				/* bounded pass: a sustained store flood must
@@ -3923,9 +4049,30 @@ static void raidkm_csum_queue_verify(struct r5conf *conf, struct stripe_head *sh
 		queue_work(c->wq, &s->work);
 }
 
-/* Flush every dirty page to its region on a clean stop (drain the workqueue
- * first so queued stores land), before the conf's rdevs are freed. */
-static void raidkm_csum_writeback(struct r5conf *conf)
+/* An epoch's pass: land every store parked in @s so far.  Not by
+ * flush_workqueue(): the shard worker runs as long as stores keep parking,
+ * and a pass would wait out a whole store flood.  One sweep: a store parked
+ * before the epoch closed is in `pending` when the sweep starts (see
+ * raidkm_csum_epoch_note); one parked during it is in the next epoch, landed
+ * or not. */
+static void raidkm_csum_land_all(struct raidkm_csum_shard *s)
+{
+	unsigned long idx;
+	void *e;
+
+	if (!atomic_read(&s->pending_nr))
+		return;
+	xa_for_each(&s->pending, idx, e) {
+		raidkm_csum_land(s, idx, e);
+		cond_resched();
+	}
+	wake_up(&s->pending_waitq);		/* writers at the cap */
+}
+
+/* Write every dirty page back to its region, then flush every member's
+ * cache: at a stop (before the conf's rdevs are freed), at md's quiesce, and
+ * as an epoch's pass (@live: the array serves I/O meanwhile). */
+static void raidkm_csum_writeback(struct r5conf *conf, bool live)
 {
 	struct raidkm_csum_cache *c = conf->csum;
 	struct md_rdev *rdev;
@@ -3935,23 +4082,35 @@ static void raidkm_csum_writeback(struct r5conf *conf)
 
 	if (!c || !conf->csum_disk)
 		return;
-	flush_workqueue(c->wq);				/* land parked stores */
+	if (!live)
+		flush_workqueue(c->wq);			/* land parked stores */
 	for (i = 0; i < c->nr_shards; i++) {
 		struct raidkm_csum_shard *s = &c->shards[i];
 		struct raidkm_csum_page *batch[RAIDKM_CSUM_WB_BATCH];
 		unsigned int n = 0;
 
+		if (live)
+			raidkm_csum_land_all(s);
 		/* in batches (raidkm_csum_flush_batch): a full-coverage cache
 		 * holds ~1 page per 4 MiB of member capacity, and one FUA
-		 * write per page made a stop or quiesce take minutes */
+		 * write per page made a stop or quiesce take minutes.  The
+		 * lock is dropped between batches: a pass may write thousands
+		 * of pages of a shard, and its worker (faults, landings,
+		 * verifies) must not wait for all of them.  A page dirtied
+		 * after the walk passed it is in the next epoch. */
+		key = 0;
 		mutex_lock(&s->lock);
-		xa_for_each(&s->pages, key, pg) {
+		for (pg = xa_find(&s->pages, &key, ULONG_MAX, XA_PRESENT); pg;
+		     pg = xa_find_after(&s->pages, &key, ULONG_MAX, XA_PRESENT)) {
 			if (!test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
 				continue;
 			batch[n++] = pg;
 			if (n == RAIDKM_CSUM_WB_BATCH) {
 				raidkm_csum_flush_batch(s, batch, n);
 				n = 0;
+				mutex_unlock(&s->lock);
+				cond_resched();
+				mutex_lock(&s->lock);
 			}
 		}
 		raidkm_csum_flush_batch(s, batch, n);
@@ -3960,16 +4119,10 @@ static void raidkm_csum_writeback(struct r5conf *conf)
 	/* then every member's cache, once: the pages above, and what
 	 * eviction wrote back without a flush since the array started */
 	for (i = 0; i < max(conf->raid_disks, conf->previous_raid_disks); i++) {
-		/* the members region pages are written to (conf->disks[],
-		 * as raidkm_csum_page_flush), pinned before use: this may run
-		 * from mddev_suspend without reconfig_mutex */
-		rcu_read_lock();
-		rdev = READ_ONCE(conf->disks[i].rdev);
-		if (rdev && !test_bit(Faulty, &rdev->flags))
-			atomic_inc(&rdev->nr_pending);
-		else
-			rdev = NULL;
-		rcu_read_unlock();
+		/* the members region pages are written to (as
+		 * raidkm_csum_page_flush); this may run from mddev_suspend
+		 * without reconfig_mutex */
+		rdev = raidkm_csum_rdev_get(conf, i);
 		if (!rdev)
 			continue;
 		if (blkdev_issue_flush(rdev->bdev)) {
@@ -3981,82 +4134,532 @@ static void raidkm_csum_writeback(struct r5conf *conf)
 	}
 }
 
-/* Hotfix H for the CRC write-back lag (notes csum-crash-lag-2026-11-05.md).
- * The region is written back lazily (quiesce, stop, eviction, drops), and
- * a crash re-derives CRCs only over the resync's scope.  md shrinks that
- * scope by itself: safe mode marks the superblock clean ~200 ms after the
- * last write (no resync at all), and while the array is dirty the resync
- * offset it saves is a checkpoint past CRCs the cache alone holds.  Both
- * need md's set_in_sync(), which succeeds only with writes_pending at
- * zero: hold one reference while the array runs.  That also covers a
- * sysfs safe_mode_delay or array_state=clean write and the reboot
- * notifier's safe mode; md's forced clean at stop (__md_stop_writes) comes
- * after quiesce, which writes the CRCs back (raidkm_pers_quiesce).  Cost: once
- * written, the array stays "active" until it stops, and a crash resyncs
- * every row with data even after a long idle.
+/* Plan A for the CRC write-back lag (notes csum-crash-lag-plan-a-2026-11-06.md,
+ * after hotfix H, csum-crash-lag-2026-11-05.md).  The region is written back
+ * lazily, and a crash re-derives CRCs only over the resync's scope, which md
+ * shrinks by itself: safe mode marks the superblock clean ~200 ms after the
+ * last write (no resync at all), and an in_sync array's superblock records
+ * the resync's checkpoints.  Both need md's set_in_sync(), which succeeds
+ * only with writes_pending at zero.
  *
- * The write-intent bitmap shrinks it too: a chunk's bit clears seconds
- * after its last write, CRCs still in the cache.  An unclean start
- * therefore resyncs without the bitmap (csum_fullsync) until a resync
- * completes.  The row map still skips U rows (their CRCs were dropped on
- * disk before they became U). */
+ * So every CRC store opens a write-back epoch, or joins the open one: the
+ * first store of an epoch takes one writes_pending reference (and marks an
+ * in_sync array dirty, as md_write_start() would), and the epoch's pass
+ * closes it, writes every dirty page back with one cache flush per member
+ * (raidkm_csum_writeback) and only then drops the reference.  The pass runs
+ * after csum_epoch_quiet_ms without a store, or csum_epoch_max_ms after the
+ * epoch opened under steady stores.  An idle array goes clean about a pass
+ * later than a plain one, and a crash of an idle array needs no resync.
+ *
+ * Store vs pass (the store-buffer pattern): a store makes itself visible
+ * (slot + DIRTY under pg->slock, or the parked entry), then smp_mb(), then
+ * tests EPOCH_OPEN; the pass clears EPOCH_OPEN, then smp_mb(), then drains the
+ * parked stores and snapshots every DIRTY page.  Either the pass sees the
+ * store, or the store sees EPOCH_OPEN clear and opens the next epoch, whose
+ * reference keeps the array dirty until that epoch's pass.  A store racing a
+ * page's snapshot re-sets DIRTY after it (raidkm_csum_snapshot), so it is in
+ * the next epoch, which it opened or will open.
+ *
+ * A resync's re-derived CRCs (step 2) are not an epoch's: they must not hold
+ * the array dirty, or md would record no checkpoint while it resyncs.  md
+ * moves its checkpoint, and ends the resync, only with recovery_active at 0;
+ * the first re-derive after a sync pass counts one sector there, and the
+ * pass (raidkm_csum_sync_fn) writes the CRCs back before it gives it back
+ * (raidkm_csum_sync_note).  A crash resumes the resync at a checkpoint
+ * whose CRCs below are on disk.
+ *
+ * The write-intent bitmap (step 3): md clears a chunk's bit seconds after its
+ * last write, possibly before its CRCs are written back.  A store also holds
+ * the bitmap chunk of its block (raidkm_csum_bmh_mark) until a pass that
+ * began after the store has written the CRCs back, so an unclean start
+ * resyncs by the bitmap again (and re-derives over its dirty bits); reads
+ * still go unverified until that resync completes (csum_fullsync).  The row
+ * map still skips U rows (their CRCs were dropped on disk before they became
+ * U). */
 static bool csum_test_no_hold;	/* testing only: the old behaviour */
 module_param(csum_test_no_hold, bool, 0644);
 MODULE_PARM_DESC(csum_test_no_hold,
 		 "TESTING ONLY: let md mark a native-csum array clean and scope its resync by the bitmap (CRCs may lag on disk)");
 
-static void raidkm_csum_hold_run(struct r5conf *conf)
-{
-	struct mddev *mddev = conf->mddev;
+static unsigned int csum_epoch_quiet_ms = 100;
+module_param(csum_epoch_quiet_ms, uint, 0644);
+MODULE_PARM_DESC(csum_epoch_quiet_ms,
+		 "native csum: write the CRCs back this many ms after the last store (then md may mark the array clean)");
 
-	if (!conf->csum || !conf->csum_disk || conf->csum_hold ||
-	    csum_test_no_hold)
-		return;
+static unsigned int csum_epoch_max_ms = 5000;
+module_param(csum_epoch_max_ms, uint, 0644);
+MODULE_PARM_DESC(csum_epoch_max_ms,
+		 "native csum: under steady writes, write the CRCs back at least this often (ms)");
+
+/* the open epoch's reference: md_write_start() without the wait for the
+ * superblock (stores run in the stripe path; nothing has to wait for this
+ * superblock write, and MD_SB_CHANGE_PENDING would defer every stripe in
+ * handle_stripe() until md wrote it, which a store under reconfig_mutex in
+ * raid5_quiesce() would never let happen) */
+static void raidkm_csum_epoch_get(struct mddev *mddev)
+{
 	percpu_ref_get(&mddev->writes_pending);
-	conf->csum_hold = true;
-	if (mddev->recovery_cp != MaxSector) {
-		conf->csum_fullsync = true;
-		pr_info("md/raid:%s: native csum: unclean start, resync ignores the write-intent bitmap\n",
-			mdname(mddev));
-	}
+	smp_mb();	/* as md_write_start(): matches the one in set_in_sync() */
 }
 
-/* md_run() leaves the array in_sync whatever the superblock said, and an
- * in_sync array's superblock records the resync's progress (its
- * checkpoints, then "clean" at the end) although the CRCs it re-derived are
- * in the cache only: a second crash would resume past stale CRCs.  A
- * resync marks the array dirty, as a write would (md_write_start); the
- * hold keeps it so until a stop writes the CRCs back. */
-static void raidkm_csum_sync_dirty(struct r5conf *conf)
+/* an in_sync array with an open epoch: mark it dirty, as a write would */
+static void raidkm_csum_epoch_dirty(struct mddev *mddev)
 {
-	struct mddev *mddev = conf->mddev;
+	bool changed = false;
 
-	if (!conf->csum_hold || !READ_ONCE(mddev->in_sync) ||
-	    !raidkm_csum_rederive(conf))
+	if (!md_is_rdwr(mddev))
 		return;
 	spin_lock(&mddev->lock);
 	if (mddev->in_sync) {
 		mddev->in_sync = 0;
-		/* not MD_SB_CHANGE_PENDING, unlike md_write_start(): nothing
-		 * has to wait for this superblock write (any later one,
-		 * checkpoints included, carries the dirty state), and PENDING
-		 * defers every stripe in handle_stripe() until md writes it --
-		 * which a store holding reconfig_mutex in raid5_quiesce()
-		 * (group_thread_cnt, ...) would never let happen: deadlock */
 		set_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags);
 		md_wakeup_thread(mddev->thread);
+		changed = true;
 	}
 	spin_unlock(&mddev->lock);
-	sysfs_notify_dirent_safe(mddev->sysfs_state);
+	if (changed)
+		sysfs_notify_dirent_safe(mddev->sysfs_state);
 }
 
-static void raidkm_csum_hold_free(struct r5conf *conf)
+/* After a store (raidkm_csum_store and the re-derive): open the epoch or
+ * join the open one.  Stores run in sleepable context. */
+static void raidkm_csum_epoch_note(struct r5conf *conf)
 {
-	if (!conf->csum_hold)
+	struct raidkm_csum_cache *c = conf->csum;
+	struct mddev *mddev = conf->mddev;
+	unsigned long now = jiffies;
+
+	if (!conf->csum_epoch)
 		return;
-	conf->csum_hold = false;
-	percpu_ref_put(&conf->mddev->writes_pending);
+	smp_mb();	/* the store visible before the test (see above) */
+	if (READ_ONCE(c->epoch_last) != now)
+		WRITE_ONCE(c->epoch_last, now);
+	/* the reference and the start before the bit (test_and_set_bit is
+	 * fully ordered): a pass that sees the epoch open -- one already
+	 * queued for left-over bitmap entries may run at once -- puts a
+	 * reference that is there, and reads this epoch's start.  A store
+	 * that loses the race gives its reference back; its start (a jiffy
+	 * or so later) only moves the ceiling that much. */
+	if (!test_bit(RAIDKM_CSUM_EPOCH_OPEN, &c->epoch_flags)) {
+		raidkm_csum_epoch_get(mddev);
+		WRITE_ONCE(c->epoch_start, now);
+		if (test_and_set_bit(RAIDKM_CSUM_EPOCH_OPEN, &c->epoch_flags))
+			percpu_ref_put(&mddev->writes_pending);
+		else
+			queue_delayed_work(system_unbound_wq, &c->epoch_dw,
+				msecs_to_jiffies(min(csum_epoch_quiet_ms,
+						     csum_epoch_max_ms)));
+	}
+	/* also with the epoch open: md forces an array clean at a stop or
+	 * --readonly (__md_stop_writes) whatever writes_pending says, and
+	 * md_run() starts every array in_sync */
+	if (unlikely(READ_ONCE(mddev->in_sync) ||
+		     READ_ONCE(mddev->sync_checkers)))
+		raidkm_csum_epoch_dirty(mddev);
 }
+
+/* Step 3.  Bitmap chunks, in member sectors (raid5's bitmap offsets; a
+ * block's CRC slot is keyed by its stripe's member sector, declustered rows
+ * too).  md's chunk size is a power of two and changes only with the bitmap,
+ * which md swaps only suspended: not while an entry pins active_io. */
+static unsigned int raidkm_csum_bmh_shift(struct mddev *mddev)
+{
+	return ilog2(max_t(unsigned long,
+			   mddev->bitmap_info.chunksize >> SECTOR_SHIFT, 1));
+}
+
+static void raidkm_csum_bmh_range(struct r5conf *conf, unsigned long chunk,
+				  sector_t *sector, unsigned long *sectors)
+{
+	unsigned int shift = raidkm_csum_bmh_shift(conf->mddev);
+	sector_t s = (sector_t)chunk << shift;
+	sector_t n = (sector_t)1 << shift;
+
+	*sector = s;
+	*sectors = s < conf->mddev->dev_sectors ?
+		   min(n, conf->mddev->dev_sectors - s) : 0;
+}
+
+/* After a store of block @blk's CRC (after raidkm_csum_epoch_note, whose
+ * barrier orders the store before the generation read): the block's bitmap
+ * chunk is in the bitmap set of the current epoch generation.  The chunk,
+ * not the region page's whole range: a data write set that bit on disk
+ * before its member writes (the hold only keeps md from clearing it), and
+ * a page's range would also hold chunks no store touched -- U rows, which
+ * learn they are clean only from a sync (start_sync/close_sync).  A new entry pins
+ * mddev->active_io: md swaps or removes a bitmap only suspended, and its
+ * suspend waits for that reference, so the bitmap an entry's hold went to
+ * is the one its release goes to.  A data write's store runs under its
+ * bio's reference, so the pin is taken even while a suspend waits; a store
+ * with no bio of its own behind it may find the array suspended and take no
+ * hold (those -- reshape, rebuild, declustered copies -- do not rely on the
+ * bitmap). */
+static void raidkm_csum_bmh_mark(struct r5conf *conf, unsigned long blk)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	struct mddev *mddev = conf->mddev;
+	unsigned long idx, gen, v;
+	void *e;
+
+	if (!conf->csum_epoch || !READ_ONCE(mddev->bitmap))
+		return;
+	idx = ((sector_t)blk << RAID5_STRIPE_SHIFT(conf)) >>
+	      raidkm_csum_bmh_shift(mddev);
+	gen = READ_ONCE(c->epoch_gen);
+	e = xa_load(&c->bmh, idx);
+	if (e && xa_to_value(e) >> RAIDKM_CSUM_BMH_SHIFT == gen)
+		return;
+	mutex_lock(&c->bmh_lock);
+	e = xa_load(&c->bmh, idx);
+	if (e) {
+		/* stored again: the hold now waits for this epoch's pass */
+		v = xa_to_value(e);
+		if (v >> RAIDKM_CSUM_BMH_SHIFT >= gen)
+			goto out;
+		xa_store(&c->bmh, idx,
+			 xa_mk_value(gen << RAIDKM_CSUM_BMH_SHIFT |
+				     (v & RAIDKM_CSUM_BMH_FLAGS)),
+			 GFP_NOIO | __GFP_NOFAIL);
+	} else if (percpu_ref_tryget(&mddev->active_io)) {
+		if (!mddev->bitmap) {
+			percpu_ref_put(&mddev->active_io);
+			goto out;
+		}
+		xa_store(&c->bmh, idx, xa_mk_value(gen << RAIDKM_CSUM_BMH_SHIFT),
+			 GFP_NOIO | __GFP_NOFAIL);
+		queue_work(system_unbound_wq, &c->bmh_work);
+	} else {
+		goto out;
+	}
+	/* The epoch this store joined may have closed since (its pass ran
+	 * its release while we waited for the lock, and found nothing left
+	 * to pass again for): with none open, no pass is coming for this
+	 * entry, so queue one.  Open, its pass releases under this lock
+	 * after the test.  (A pass running now is queued to run again.) */
+	if (!test_bit(RAIDKM_CSUM_EPOCH_OPEN, &c->epoch_flags))
+		queue_delayed_work(system_unbound_wq, &c->epoch_dw,
+				   msecs_to_jiffies(csum_epoch_quiet_ms));
+out:
+	mutex_unlock(&c->bmh_lock);
+}
+
+/* Take the bitmap holds of new entries (raidkm_bitmap_startwrite may sleep
+ * on a full counter, so not in the store).  md clears a bit only after its
+ * counter has sat at zero for a daemon pass or two (seconds), and the data
+ * write that stored the CRC still counts there until it ends: the hold,
+ * milliseconds later, is normally in time and sets no bit.  When it does
+ * set one (a store with no write behind it, or a late hold), write the
+ * bitmap out: md writes a page with a newly set bit only from an unplug
+ * (raid5d does it for its own writes), and its daemon writes no page while
+ * one is waiting for an unplug -- no bit of the array would reach the disk,
+ * cleared ones neither, until the next data write. */
+static void raidkm_csum_bmh_fn(struct work_struct *w)
+{
+	struct raidkm_csum_cache *c = container_of(w, struct raidkm_csum_cache,
+						   bmh_work);
+	struct r5conf *conf = c->conf;
+	struct mddev *mddev = conf->mddev;
+	unsigned long batch[16], idx, v, n;
+	unsigned int nb, i;
+	bool held = false;
+	sector_t sector;
+	void *e;
+
+	/* Not under bmh_lock: start_write sleeps while a chunk's counter is
+	 * full, until writes end -- whose stores may need the lock.  TAKING
+	 * keeps a release off the entry (and its active_io pin, the bitmap's
+	 * guard) until the hold is taken. */
+	for (;;) {
+		nb = 0;
+		mutex_lock(&c->bmh_lock);
+		xa_for_each(&c->bmh, idx, e) {
+			v = xa_to_value(e);
+			if (v & RAIDKM_CSUM_BMH_FLAGS)
+				continue;
+			xa_store(&c->bmh, idx,
+				 xa_mk_value(v | RAIDKM_CSUM_BMH_TAKING),
+				 GFP_NOIO | __GFP_NOFAIL);
+			batch[nb++] = idx;
+			if (nb == ARRAY_SIZE(batch))
+				break;
+		}
+		mutex_unlock(&c->bmh_lock);
+		if (!nb)
+			break;
+		for (i = 0; i < nb; i++) {
+			raidkm_csum_bmh_range(conf, batch[i], &sector, &n);
+			if (n)
+				raidkm_bitmap_startwrite(mddev, sector, n);
+		}
+		mutex_lock(&c->bmh_lock);
+		for (i = 0; i < nb; i++) {
+			v = xa_to_value(xa_load(&c->bmh, batch[i]));
+			xa_store(&c->bmh, batch[i],
+				 xa_mk_value((v & ~RAIDKM_CSUM_BMH_TAKING) |
+					     RAIDKM_CSUM_BMH_HELD),
+				 GFP_NOIO | __GFP_NOFAIL);
+		}
+		/* the bitmap stays while this reference is held, as while an
+		 * entry pins active_io (one does now: the count is not 0) */
+		if (!held)
+			percpu_ref_get(&mddev->active_io);
+		held = true;
+		mutex_unlock(&c->bmh_lock);
+	}
+	if (!held)
+		return;
+	if (mddev->bitmap)
+		mddev->bitmap_ops->unplug(mddev, true);
+	percpu_ref_put(&mddev->active_io);
+}
+
+/* Release the entries of generations up to @gen: their pages were written
+ * back by a pass that began after their stores (or by a quiesce's
+ * write-back).  An entry whose hold was not taken yet needs none any more. */
+static void raidkm_csum_bmh_release(struct r5conf *conf, unsigned long gen)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	unsigned long idx, v, n;
+	sector_t sector;
+	void *e;
+
+	mutex_lock(&c->bmh_lock);
+	xa_for_each(&c->bmh, idx, e) {
+		v = xa_to_value(e);
+		/* a hold being taken: the next pass (the entry is left) */
+		if (v >> RAIDKM_CSUM_BMH_SHIFT > gen ||
+		    (v & RAIDKM_CSUM_BMH_TAKING))
+			continue;
+		if (v & RAIDKM_CSUM_BMH_HELD) {
+			raidkm_csum_bmh_range(conf, idx, &sector, &n);
+			if (n)
+				raidkm_bitmap_endwrite(conf->mddev, sector, n,
+						       true);
+		}
+		xa_erase(&c->bmh, idx);
+		percpu_ref_put(&conf->mddev->active_io);
+	}
+	mutex_unlock(&c->bmh_lock);
+}
+
+/* What md's safemode timer does when it fires (md_safemode_timeout): the
+ * md thread tries set_in_sync() once.  The timer may have fired, and the try
+ * failed, while the epoch held the array dirty, and nothing would try again
+ * until the next write.  Not md_write_end(): that re-arms the timer, which
+ * __md_stop_writes() deletes before it quiesces -- a pass running into a stop
+ * would leave it armed past the mddev's life.  Nothing at safe_mode_delay 0
+ * (md then never marks a running array clean). */
+static void raidkm_csum_epoch_kick(struct mddev *mddev)
+{
+	if (mddev->external || !md_is_rdwr(mddev) || !mddev->safemode_delay)
+		return;
+	/* not fired yet: it tries when it does, after safe_mode_delay as
+	 * the admin set it (md_write_end() re-arms it after every write) */
+	if (timer_pending(&mddev->safemode_timer))
+		return;
+	if (!READ_ONCE(mddev->safemode))
+		WRITE_ONCE(mddev->safemode, 1);
+	md_wakeup_thread(mddev->thread);
+}
+
+/* The pass (system_unbound_wq; cancelled by raidkm_csum_epoch_close() before
+ * md's thread or the conf go away). */
+static void raidkm_csum_epoch_fn(struct work_struct *w)
+{
+	struct raidkm_csum_cache *c = container_of(to_delayed_work(w),
+					struct raidkm_csum_cache, epoch_dw);
+	struct r5conf *conf = c->conf;
+	struct mddev *mddev = conf->mddev;
+	bool open = test_bit(RAIDKM_CSUM_EPOCH_OPEN, &c->epoch_flags);
+	unsigned long now, quiet, ceil, gen;
+	bool fenced, closing;
+
+	smp_rmb();	/* the bit, then its epoch's start (epoch_note) */
+	now = jiffies;
+	quiet = READ_ONCE(c->epoch_last) + msecs_to_jiffies(csum_epoch_quiet_ms);
+	ceil = READ_ONCE(c->epoch_start) + msecs_to_jiffies(csum_epoch_max_ms);
+	if (open && time_before(now, quiet) && time_before(now, ceil)) {
+		queue_delayed_work(system_unbound_wq, &c->epoch_dw,
+				   (time_before(quiet, ceil) ? quiet : ceil) - now);
+		return;
+	}
+	/* an I/O of the array, as far as md's suspend is concerned: a grow
+	 * replaces conf->disks (resize_stripes) and a member goes away only
+	 * while the array is suspended, and mddev_suspend() waits for this
+	 * reference.  Suspended now: bitmap entries pin active_io themselves
+	 * (the suspend waits for this pass to release them, so go on with
+	 * those as the fence); with none, look again shortly. */
+	fenced = percpu_ref_tryget_live(&mddev->active_io);
+	if (!fenced && xa_empty(&c->bmh)) {
+		queue_delayed_work(system_unbound_wq, &c->epoch_dw,
+				   msecs_to_jiffies(10));
+		return;
+	}
+	/* a pass with no epoch open still runs for bitmap entries left
+	 * behind (a store that raced the last flip of the generation) */
+	closing = test_and_clear_bit(RAIDKM_CSUM_EPOCH_OPEN, &c->epoch_flags);
+	if (!closing && xa_empty(&c->bmh)) {
+		if (fenced)
+			percpu_ref_put(&mddev->active_io);
+		return;
+	}
+	gen = READ_ONCE(c->epoch_gen);
+	WRITE_ONCE(c->epoch_gen, gen + 1);
+	smp_mb();	/* the close and the new generation before the snapshots */
+	raidkm_csum_writeback(conf, true);
+	raidkm_csum_bmh_release(conf, gen);
+	if (fenced)
+		percpu_ref_put(&mddev->active_io);
+	/* entries of a newer generation left (a store that raced the flip)
+	 * and no epoch to pass them: pass again, or their holds -- and the
+	 * active_io they pin, which a suspend waits for -- would stay until
+	 * the next write */
+	if (!xa_empty(&c->bmh) &&
+	    !test_bit(RAIDKM_CSUM_EPOCH_OPEN, &c->epoch_flags))
+		queue_delayed_work(system_unbound_wq, &c->epoch_dw,
+				   msecs_to_jiffies(csum_epoch_quiet_ms));
+	if (!closing)
+		return;
+	atomic64_inc(&c->nr_pass);
+	percpu_ref_put(&mddev->writes_pending);
+	/* no store since the close: md may have tried the clean mark during
+	 * the pass and failed, and no write may come to make it try again
+	 * (also after a pass at the ceiling, when the stores stopped right
+	 * before it).  Under steady stores the next epoch is open already. */
+	if (!test_bit(RAIDKM_CSUM_EPOCH_OPEN, &c->epoch_flags))
+		raidkm_csum_epoch_kick(mddev);
+}
+
+/* md's quiesce and the stop, after raidkm_csum_writeback() wrote every page
+ * back with no store possible since: close the open epoch without a pass.
+ * True if one was open. */
+static bool raidkm_csum_epoch_close(struct r5conf *conf)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+
+	if (!c || !conf->csum_epoch)
+		return false;
+	cancel_delayed_work_sync(&c->epoch_dw);
+	/* no hold half taken (no store queues the work now) */
+	cancel_work_sync(&c->bmh_work);
+	WRITE_ONCE(c->epoch_gen, c->epoch_gen + 1);
+	raidkm_csum_bmh_release(conf, ULONG_MAX);
+	WARN_ON_ONCE(!xa_empty(&c->bmh));
+	if (!test_and_clear_bit(RAIDKM_CSUM_EPOCH_OPEN, &c->epoch_flags))
+		return false;
+	percpu_ref_put(&conf->mddev->writes_pending);
+	return true;
+}
+
+/* After a resync's re-derived CRC is in the cache (sleepable context): hold
+ * md's checkpoint until a sync pass has written it.  Store-buffer order as
+ * raidkm_csum_epoch_note: the slot is set before the test, the pass clears
+ * SYNC_OPEN before its snapshots. */
+static void raidkm_csum_sync_note(struct r5conf *conf)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+
+	if (!conf->csum_epoch)
+		return;
+	smp_mb();
+	if (test_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags) ||
+	    test_and_set_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags))
+		return;
+	/* md_do_sync() waits for recovery_active to reach 0 before it moves
+	 * a checkpoint or ends the resync; the re-deriving stripe's own
+	 * sectors are still counted (its md_done_sync comes after this
+	 * verify), so the count never touches 0 in between */
+	raidkm_recovery_active_add(conf->mddev, 1);
+	queue_delayed_work(system_unbound_wq, &c->sync_dw,
+			   msecs_to_jiffies(csum_epoch_quiet_ms));
+}
+
+/* The sync pass.  No active_io fence, unlike the epoch's: while it holds
+ * recovery_active md's resync thread runs, and md swaps no bitmap and starts
+ * no reshape (resize_stripes) while a resync thread runs; a member's rdev is
+ * pinned under RCU (raidkm_csum_flush_batch). */
+static void raidkm_csum_sync_fn(struct work_struct *w)
+{
+	struct raidkm_csum_cache *c = container_of(to_delayed_work(w),
+					struct raidkm_csum_cache, sync_dw);
+	struct r5conf *conf = c->conf;
+
+	if (!test_and_clear_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags))
+		return;
+	smp_mb__after_atomic();	/* the close before the snapshots */
+	raidkm_csum_writeback(conf, true);
+	md_done_sync(conf->mddev, 1, 1);
+}
+
+/* md's quiesce and the stop, after raidkm_csum_writeback(): give back a
+ * held sector (no resync runs then: md quiesces before it starts one and
+ * after it stopped it). */
+static void raidkm_csum_sync_close(struct r5conf *conf)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+
+	if (!c || !conf->csum_epoch)
+		return;
+	cancel_delayed_work_sync(&c->sync_dw);
+	if (test_and_clear_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags))
+		md_done_sync(conf->mddev, 1, 1);
+}
+
+static bool csum_bitmap_resync = true;
+module_param(csum_bitmap_resync, bool, 0644);
+MODULE_PARM_DESC(csum_bitmap_resync,
+		 "native csum: after a crash, resync only what the write-intent bitmap marks (N: the whole array, as modules of 2026-11-06/07 did; set N for the first start of an array that crashed under one of them)");
+
+static bool raidkm_dcl_reb_transient(struct r5conf *conf);
+
+/* An unclean start: the resync re-derives the CRCs over its scope, and the
+ * bitmap holds (step 3) keep that scope covering every CRC the cache alone
+ * held -- for the stores of writes on a healthy array.  A rebuild, reshape
+ * or declustered move moves its own checkpoint (recovery_offset,
+ * reshape_position) past stores no bitmap bit may cover yet, so a crash
+ * during one resyncs the whole array, as before plan A; so does an array
+ * last run by a module that took no holds (csum_bitmap_resync=N). */
+static const char *raidkm_csum_nobitmap_why(struct r5conf *conf)
+{
+	struct mddev *mddev = conf->mddev;
+	struct md_rdev *rdev;
+
+	if (!csum_bitmap_resync)
+		return "csum_bitmap_resync=N";
+	if (mddev->reshape_position != MaxSector)
+		return "reshape in progress";
+	rdev_for_each(rdev, mddev)
+		if (rdev->raid_disk >= 0 && !test_bit(Faulty, &rdev->flags) &&
+		    !test_bit(In_sync, &rdev->flags))
+			return "rebuild in progress";
+	if (conf->dcl && raidkm_dcl_reb_transient(conf))
+		return "declustered move in progress";
+	return NULL;
+}
+
+static void raidkm_csum_epoch_run(struct r5conf *conf)
+{
+	struct mddev *mddev = conf->mddev;
+	const char *why;
+
+	if (!conf->csum || !conf->csum_disk || csum_test_no_hold)
+		return;
+	conf->csum_epoch = true;
+	if (mddev->recovery_cp != MaxSector) {
+		conf->csum_fullsync = true;
+		/* md creates the bitmap after pers->run(): mddev->bitmap is
+		 * NULL here, the superblock's bitmap location is known */
+		why = raidkm_csum_nobitmap_why(conf);
+		conf->csum_nobitmap = !!why;
+		if (why && (mddev->bitmap_info.offset || mddev->bitmap_info.file))
+			pr_info("md/raid:%s: native csum: unclean start, reads unverified until the resync completes; it ignores the bitmap (%s)\n",
+				mdname(mddev), why);
+		else
+			pr_info("md/raid:%s: native csum: unclean start, reads unverified until the resync completes\n",
+				mdname(mddev));
+	}
+}
+
 
 /* Auto-size the region-page cache from the array geometry: enough pages to
  * cover EVERY member's whole CRC region (member_blocks/1022 per member --
@@ -4123,6 +4726,11 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 	atomic_set(&c->nr_disc, 0);
 	atomic_set(&c->nr_clear, 0);
 	init_waitqueue_head(&c->clear_wq);
+	INIT_DELAYED_WORK(&c->epoch_dw, raidkm_csum_epoch_fn);
+	INIT_DELAYED_WORK(&c->sync_dw, raidkm_csum_sync_fn);
+	mutex_init(&c->bmh_lock);
+	xa_init(&c->bmh);
+	INIT_WORK(&c->bmh_work, raidkm_csum_bmh_fn);
 	/* split the total soft ceiling across shards (>=16 each so tiny caches work) */
 	per = max(max(total, 64u) / nsh, 16u);
 	for (i = 0; i < nsh; i++) {
@@ -4181,6 +4789,14 @@ static void raidkm_csum_cache_free(struct r5conf *conf)
 
 	if (!c)
 		return;
+	/* raid5_free closed the epoch (raidkm_csum_epoch_close); a run that
+	 * failed never opened one */
+	cancel_delayed_work_sync(&c->epoch_dw);
+	cancel_delayed_work_sync(&c->sync_dw);
+	cancel_work_sync(&c->bmh_work);
+	/* raid5_free released every entry (raidkm_csum_epoch_close) */
+	WARN_ON_ONCE(!xa_empty(&c->bmh));
+	xa_destroy(&c->bmh);
 	if (atomic64_read(&c->nr_evict))
 		pr_info("md/raid:%s: native csum cache: %lld region page reads, %lld written back, %lld evicted\n",
 			mdname(conf->mddev),
@@ -10966,14 +11582,49 @@ static void raidkm_row_csum_store(struct r5conf *conf, int member,
 				  sector_t asect, const void *buf,
 				  unsigned int len)
 {
+	unsigned long blk = raidkm_csum_blkidx(conf, asect), b0 = blk;
+	unsigned int bsize = RAID5_STRIPE_SIZE(conf), off, shift;
+	unsigned long chunk, last = ULONG_MAX;
+	bool pin;
+
+	if (!conf->csum)
+		return;
+	/* raidkm_csum_store()'s steps once for the span, not per block: the
+	 * pin, the stores, one note, a bitmap mark per chunk it touches */
+	pin = raidkm_csum_epoch_pin(conf);
+	for (off = 0; off < len; off += bsize, blk++)
+		raidkm_csum_store_one(conf, member, blk,
+				      raidkm_row_block_crc(conf, buf + off));
+	raidkm_csum_epoch_note(conf);
+	shift = raidkm_csum_bmh_shift(conf->mddev);
+	for (blk = b0, off = 0; off < len; off += bsize, blk++) {
+		chunk = ((sector_t)blk << RAID5_STRIPE_SHIFT(conf)) >> shift;
+		if (chunk != last)
+			raidkm_csum_bmh_mark(conf, blk);
+		last = chunk;
+	}
+	raidkm_csum_epoch_unpin(conf, pin);
+}
+
+/* The same for a resync's re-derived CRCs (@rederive): held against md's
+ * checkpoint, not an epoch's (raidkm_csum_sync_note), once for the span. */
+static void raidkm_row_csum_store_sync(struct r5conf *conf, int member,
+				       sector_t asect, const void *buf,
+				       unsigned int len, bool rederive)
+{
 	unsigned long blk = raidkm_csum_blkidx(conf, asect);
 	unsigned int bsize = RAID5_STRIPE_SIZE(conf), off;
 
 	if (!conf->csum)
 		return;
+	if (!rederive) {
+		raidkm_row_csum_store(conf, member, asect, buf, len);
+		return;
+	}
 	for (off = 0; off < len; off += bsize, blk++)
-		raidkm_csum_store(conf, member, blk,
-				  raidkm_row_block_crc(conf, buf + off));
+		raidkm_csum_store_one(conf, member, blk,
+				      raidkm_row_block_crc(conf, buf + off));
+	raidkm_csum_sync_note(conf);
 }
 
 /*
@@ -12275,13 +12926,13 @@ static int raidkm_row_sync_chunk(struct mddev *mddev, sector_t sector_nr,
 	 * (A parity chunk about to be rewritten gets its own below.) */
 	if (rederive) {
 		for (i = 0; i < k; i++)
-			raidkm_row_csum_store(conf, sm[i].slot, sector_nr,
-					      src[i], len);
+			raidkm_row_csum_store_sync(conf, sm[i].slot, sector_nr,
+						   src[i], len, true);
 		for (p = 0; p < m; p++)
 			if (!test_bit(p, &bad))
-				raidkm_row_csum_store(conf, sm[k + p].slot,
-						      sector_nr, src[k + p],
-						      len);
+				raidkm_row_csum_store_sync(conf, sm[k + p].slot,
+							   sector_nr, src[k + p],
+							   len, true);
 	}
 
 	if (nmis && check) {
@@ -12304,8 +12955,9 @@ static int raidkm_row_sync_chunk(struct mddev *mddev, sector_t sector_nr,
 		raidkm_row_sync_begin(&rs, hweight_long(bad));
 		blk_start_plug(&plug);
 		for_each_set_bit(p, &bad, m) {
-			raidkm_row_csum_store(conf, sm[k + p].slot, sector_nr,
-					      src[k + p], len);
+			raidkm_row_csum_store_sync(conf, sm[k + p].slot,
+						   sector_nr, src[k + p], len,
+						   rederive);
 			raidkm_row_sync_submit(mddev, sm[k + p].rdev,
 					       &ctx->buf[k + m + p], sector_nr,
 					       len, REQ_OP_WRITE | REQ_SYNC,
@@ -18566,7 +19218,7 @@ static sector_t raidkm_row_bitmap_run_end(struct mddev *mddev,
 	struct r5conf *conf = mddev->private;
 	sector_t s = sector_nr, blocks, end;
 
-	if (!mddev->bitmap || conf->fullsync || conf->csum_fullsync ||
+	if (!mddev->bitmap || conf->fullsync || conf->csum_nobitmap ||
 	    test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
 		return max_sector;
 	end = min(max_sector, sector_nr + (sector_t)win * conf->chunk_sectors);
@@ -18650,9 +19302,6 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	 */
 	smp_mb();
 	wait_event(conf->row_write_wait, !atomic_read(&conf->row_writes));
-
-	if (sector_nr < max_sector)
-		raidkm_csum_sync_dirty(conf);
 
 	/*
 	 * raid_km redesign: m > 2 resync/scrub goes through the synchronous
@@ -18770,7 +19419,8 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 			if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
 			    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
 			    !conf->csum_sync_skipped)
-				conf->csum_fullsync = false;
+				conf->csum_fullsync = conf->csum_nobitmap =
+					false;
 		}
 		conf->csum_sync_skipped = false;
 		if (mddev->bitmap)
@@ -18870,7 +19520,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	 * apply (matches the NULL-bitmap behaviour of the upstream helper). */
 	if (mddev->bitmap &&
 	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
-	    !conf->fullsync && !conf->csum_fullsync &&
+	    !conf->fullsync && !conf->csum_nobitmap &&
 	    !mddev->bitmap_ops->start_sync(mddev, sector_nr, &sync_blocks,
 					   true) &&
 	    sync_blocks >= RAID5_STRIPE_SECTORS(conf)) {
@@ -23255,7 +23905,7 @@ static int raid5_run(struct mddev *mddev)
 		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	}
 
-	raidkm_csum_hold_run(conf);
+	raidkm_csum_epoch_run(conf);
 	return 0;
 abort:
 	md_unregister_thread(mddev, &mddev->thread);
@@ -23277,8 +23927,9 @@ static void raid5_free(struct mddev *mddev, void *priv)
 
 	/* Native checksum: drain the workqueue + flush dirty region pages on a
 	 * clean stop, before the conf and its rdevs go away. */
-	raidkm_csum_writeback(conf);
-	raidkm_csum_hold_free(conf);
+	raidkm_csum_writeback(conf, false);
+	raidkm_csum_epoch_close(conf);
+	raidkm_csum_sync_close(conf);
 	raidkm_snap_stop(conf);
 	raidkm_snap_free(conf);
 	raidkm_rowmap_stop(conf);
@@ -24578,15 +25229,26 @@ static void raid5_quiesce(struct mddev *mddev, int quiesce)
 /* md core's ->quiesce (stop, readonly, suspend, the reboot notifier):
  * with native CRCs, write them back while quiesced, so they are on disk
  * before md may write the superblock clean (__md_stop_writes quiesces
- * first; hotfix H, raidkm_csum_hold_run).  raidkm's own quiesces (row and
+ * first and then forces the array clean), and close the open epoch: no
+ * store can come before the quiesce ends.  At its end md may try the clean
+ * mark again (raidkm_csum_epoch_kick).  raidkm's own quiesces (row and
  * declustered state changes) call raid5_quiesce() and skip this. */
 static void raidkm_pers_quiesce(struct mddev *mddev, int quiesce)
 {
 	struct r5conf *conf = mddev->private;
 
 	raid5_quiesce(mddev, quiesce);
-	if (quiesce && conf && !csum_test_no_hold)
-		raidkm_csum_writeback(conf);
+	if (!conf || csum_test_no_hold || !conf->csum)
+		return;
+	if (quiesce) {
+		raidkm_csum_writeback(conf, false);
+		raidkm_csum_sync_close(conf);
+		if (raidkm_csum_epoch_close(conf))
+			set_bit(RAIDKM_CSUM_EPOCH_KICK, &conf->csum->epoch_flags);
+	} else if (test_and_clear_bit(RAIDKM_CSUM_EPOCH_KICK,
+				      &conf->csum->epoch_flags)) {
+		raidkm_csum_epoch_kick(mddev);
+	}
 }
 
 static void *raid45_takeover_raid0(struct mddev *mddev, int level)

@@ -1155,15 +1155,18 @@ struct r5conf {
 	struct raidkm_csum_cache *csum;	/* demand-paged region-page cache;
 					 * non-NULL == native checksum on */
 	bool			csum_disk;
-	/* CRC write-back lag (csum-crash-lag-2026-11-05.md, hotfix H): with
-	 * csum_disk the region is written back only at quiesce, stop,
-	 * eviction and drops, so md must not shrink the next resync's scope
-	 * on its own: csum_hold = one mddev->writes_pending reference held
-	 * from run to free (md never marks the array clean while it runs);
-	 * csum_fullsync = the array started unclean, so the resync ignores
-	 * the bitmap until a resync completes. */
-	bool			csum_hold;
+	/* CRC write-back lag (csum-crash-lag-2026-11-05.md; plan A,
+	 * csum-crash-lag-plan-a-2026-11-06.md): with csum_disk the region is
+	 * written back lazily, so md must not shrink the next resync's scope
+	 * past CRCs the cache alone holds.  csum_epoch = the write-back epochs
+	 * run (raidkm_csum_epoch_note: a store opens an epoch, which holds one
+	 * mddev->writes_pending reference until a pass has written its pages
+	 * back); csum_fullsync = the array started unclean, so reads go
+	 * unverified until a resync completes; csum_nobitmap = that resync
+	 * also ignores the bitmap (raidkm_csum_epoch_run says when). */
+	bool			csum_epoch;
 	bool			csum_fullsync;
+	bool			csum_nobitmap;
 	bool			csum_sync_skipped;	/* this resync pass skipped
 							 * rows: too degraded */
 	u32			csum_gen;	/* region self-integrity: per-array

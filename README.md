@@ -1613,15 +1613,23 @@ A write that races a discard of the same rows waits for it, so no CRC is
 stored over a block the discard then trims.
 
 **After a crash** (with `--checksum`, with or without the row map): the CRCs
-reach the disk lazily (at a stop, `--readonly`, eviction), so md never marks
-a running checksum array clean: once written it shows `active` until it
-stops (writing `clean` to `array_state` returns EBUSY).  A crash therefore
-always resyncs every row with data, and that resync ignores the write-intent
-bitmap and re-derives the CRCs; reads go unverified until it completes.  A
-stop, `--readonly` or a reboot writes the CRCs back before md writes the
-superblock clean.  (Modules before 2026-11-06 could return EIO after a crash
-of an idle array, of an array with a bitmap, or during the post-crash
-resync.)
+reach the disk lazily, in write-back passes ~100 ms after the last write and
+at least every 5 s under steady writes (`csum_epoch_quiet_ms`,
+`csum_epoch_max_ms`), each ending with a cache flush of every member; md may
+mark the array clean only after a pass, and clears a write-intent bit only
+after the pass that wrote that chunk's CRCs.  An idle array goes `clean` a
+little later than a plain one, and its crash needs no resync.  A crash while
+it is `active` resyncs what the bitmap marks (without one, every row with
+data) and re-derives the CRCs; reads go unverified until that resync
+completes, and a second crash resumes it from its last checkpoint.  A stop,
+`--readonly` or a reboot writes the CRCs back before md writes the superblock
+clean.  An array that crashed under a module of 2026-11-06 or 2026-11-07 must
+finish that crash's resync under it (or stop cleanly) before this module
+assembles it: those let bitmap bits clear early (if in doubt, start it once
+with the module parameter `raidkm.csum_bitmap_resync=N`, which resyncs the
+whole array; `--update=resync` does not, with a bitmap).  (Modules before 2026-11-06 could
+return EIO after a crash of an idle array, of an array with a bitmap, or
+during the post-crash resync.)
 mdadm refuses the combination when the raidkm module loaded lacks the
 read-only parameter `rowmap_csum`.
 

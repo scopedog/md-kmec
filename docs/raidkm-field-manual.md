@@ -714,16 +714,35 @@ page reads, ... evicted` shows whether the cache was evicting.
 > buys. If torn-write atomicity across power loss is a requirement, native
 > checksums are not the mechanism to reach for.
 
-**After a crash.** CRCs reach the disk lazily (at a stop, `--readonly`,
-eviction), so md never marks a running checksum array clean: once written,
-`array_state` stays `active` until the array stops (writing `clean` returns
-EBUSY). Every crash therefore resyncs every row with data (with the row map,
-only those), ignoring the write-intent bitmap, and re-derives the CRCs on the
-way; reads are not verified against stored CRCs until that resync completes.
-A stop, `--readonly` or reboot writes the CRCs back before md writes the
-superblock clean. Modules before 2026-11-06 could return EIO after a crash of
-an idle array, of an array with a bitmap, or during the post-crash resync.
-Gate: `tools/raidkm-test-csum-crashlag.sh`.
+**After a crash.** CRCs reach the disk lazily, in write-back passes: about
+100 ms after the last write (`raidkm.csum_epoch_quiet_ms`), and at least every
+5 s under steady writes (`raidkm.csum_epoch_max_ms`), the module writes back
+every CRC page changed since the last pass and flushes the members' caches.
+md may mark the array clean only after such a pass: an idle array shows
+`clean` a little later than a plain one (writing `clean` to `array_state`
+returns EBUSY until then), and a crash of an idle array needs no resync. A
+write-intent bitmap keeps a chunk's bit set until the pass that wrote its CRCs
+back, so a crash while the array is `active` resyncs the chunks the bitmap
+marks (without a bitmap every row with data; with the row map only those),
+re-deriving their CRCs; reads are not verified against stored CRCs until that
+resync completes. A second crash during that resync resumes it from its last
+checkpoint: md records a checkpoint only once the CRCs re-derived below it are
+on disk. A stop, `--readonly` or reboot writes the CRCs back before md writes
+the superblock clean. Gate: `tools/raidkm-test-csum-crashlag.sh`.
+
+*Upgrading from the modules of 2026-11-06 and 2026-11-07:* they let bitmap
+bits clear while CRCs were still in the cache, and made up for it with a full
+resync after every crash. An array that crashed while running one of them
+must finish its post-crash resync under that module (or be stopped cleanly)
+before it is assembled with this one; a bitmap-scoped resync would miss those
+chunks. If in doubt, load this module with `raidkm.csum_bitmap_resync=N` for
+that first start: its post-crash resync then covers the whole array, as those
+modules' did (`--update=resync` does not: md still resyncs only the chunks the
+bitmap marks). Set it back to `Y` once that resync has completed. A crash
+during a rebuild, reshape or declustered move resyncs the whole array in any
+case.
+Modules before 2026-11-06 could return EIO after a crash of an idle array, of
+an array with a bitmap, or during the post-crash resync.
 
 **Read-only arrays.** A CRC mismatch on more members of a stripe than the
 parity count fails the read with EIO and records a bad block on each, as on a
