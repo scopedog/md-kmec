@@ -45,6 +45,9 @@
 #   RX_FULL_ORACLE    1 = exhaustive C(N,new_m) erasure sweep (default 0: strong single pattern)
 #   RX_AP_OLD_M       add-parity starting m (k fixed = 4)    (default 3  -> m=3->4)
 #   RX_AD_OLD_K       add-data starting k (m fixed = 2)      (default 3  -> k=3->4)
+#   RX_CUT            atomic | serial power cut (rx_crash_now) (default atomic)
+#   RX_BE_REPS        best-effort crash runs per type        (default 1)
+#   RX_BE_ONLY        1 = run only the best-effort crashes    (default 0)
 #
 # Usage:   sudo bash tools/raidkm-test-reshape-crash.sh
 #          sudo RX_FULL_ORACLE=1 RX_AP_OLD_M=2 bash tools/raidkm-test-reshape-crash.sh
@@ -58,6 +61,9 @@ RX_SZ="${RX_SZ:-32}"
 RX_FULL_ORACLE="${RX_FULL_ORACLE:-0}"
 RX_AP_OLD_M="${RX_AP_OLD_M:-3}"
 RX_AD_OLD_K="${RX_AD_OLD_K:-3}"
+RX_CUT="${RX_CUT:-atomic}"      # atomic | serial (see rx_crash_now)
+RX_BE_REPS="${RX_BE_REPS:-1}"   # best-effort crash runs per reshape type
+RX_BE_ONLY="${RX_BE_ONLY:-0}"   # 1 = skip the other tiers, run best-effort only
 
 RX_LOOPS=(); RX_FLK=(); RX_DEVS=()
 RX_HAVE_INJECT=0
@@ -121,15 +127,42 @@ rx_setup() {                    # rx_setup <ndevs>
 	done
 }
 
-rx_crash_now() {                # drop every write (power loss)
+rx_crash_now() {                # power loss: every member at one instant
 	local i f loop sectors
+	# RX_CUT=serial: the old flip, one member at a time (suspend, load
+	# drop_writes, resume, next member).  That is not a power cut: md keeps
+	# writing to the members not yet flipped while the flipped ones ack
+	# writes and flushes they drop, so a FUA superblock or journal record
+	# can be dropped on one member and stored on another.  Kept only to
+	# compare against.
+	if [ "$RX_CUT" = serial ]; then
+		for i in "${!RX_FLK[@]}"; do
+			f="${RX_FLK[$i]:-}"; loop="${RX_LOOPS[$i]:-}"
+			[ -n "$f" ] && [ -n "$loop" ] || continue
+			sectors=$(sudo blockdev --getsz "$loop")
+			sudo dmsetup suspend "$f"
+			echo "0 $sectors flakey $loop 0 0 86400 1 drop_writes" | sudo dmsetup load "$f"
+			sudo dmsetup resume "$f"
+		done
+		return
+	fi
+	# Atomic: suspend every member first (writes already mapped complete,
+	# new ones park), then load drop_writes and resume, so the parked writes
+	# and everything after vanish on every member alike.  --noflush and
+	# --noudevsync as in raidkm-test-declustered-crash.sh: a flushing
+	# suspend can wait behind the reshape's I/O, and a synced resume can
+	# hang on a stranded udev cookie.
+	for f in "${RX_FLK[@]}"; do
+		[ -n "$f" ] && sudo dmsetup suspend --noflush --nolockfs --noudevsync "$f"
+	done
 	for i in "${!RX_FLK[@]}"; do
 		f="${RX_FLK[$i]:-}"; loop="${RX_LOOPS[$i]:-}"
 		[ -n "$f" ] && [ -n "$loop" ] || continue
 		sectors=$(sudo blockdev --getsz "$loop")
-		sudo dmsetup suspend "$f"
 		echo "0 $sectors flakey $loop 0 0 86400 1 drop_writes" | sudo dmsetup load "$f"
-		sudo dmsetup resume "$f"
+	done
+	for f in "${RX_FLK[@]}"; do
+		[ -n "$f" ] && sudo dmsetup resume --noudevsync "$f"
 	done
 }
 
@@ -579,6 +612,22 @@ rk_load_modules || exit 1
 rx_global_cleanup
 rx_probe_inject
 
+rx_besteffort_all() {
+	local rep type
+	for rep in $(seq 1 "$RX_BE_REPS"); do
+		for type in add-parity add-data; do
+			rx_besteffort_crash "$type"
+		done
+	done
+}
+
+if [ "$RX_BE_ONLY" = 1 ]; then
+	echo "==== best-effort crashes only (RX_BE_ONLY=1, cut $RX_CUT, $RX_BE_REPS runs per type) ===="
+	rx_besteffort_all
+	rk_summary "raidkm-test-reshape-crash.sh"
+	exit $?
+fi
+
 echo "==== Tier 0: harness sanity (clean reshapes) ===="
 rx_tier0_clean add-parity
 rx_tier0_clean add-data
@@ -586,9 +635,8 @@ rx_tier0_clean add-data
 if [ "$RX_HAVE_INJECT" != 1 ]; then
 	echo
 	echo "==== inject knob ABSENT (no CONFIG_RAIDKM_FAULT_INJECT) ===="
-	echo "     Tiers 1-4 SKIPPED — running best-effort reshape_position-timed crash."
-	rx_besteffort_crash add-parity
-	rx_besteffort_crash add-data
+	echo "     Tiers 1-4 SKIPPED — running best-effort reshape_position-timed crash (cut $RX_CUT)."
+	rx_besteffort_all
 	rk_summary "raidkm-test-reshape-crash.sh"
 	exit $?
 fi
