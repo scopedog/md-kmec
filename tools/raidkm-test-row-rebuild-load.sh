@@ -336,7 +336,7 @@ run_pace_cost() {
 	rk_create 2r "${MEMBERS[@]:0:$N}" || { rk_fail "$tag: create"; return; }
 	local pknob="/sys/block/$MDNAME/md/rk_row_rebuild_pace"
 	echo 16 > "/sys/block/$MDNAME/md/rk_row_rebuild_workers"
-	rk_write "$DATAMB"
+	rk_write "$DATAMB" || { rk_fail "$tag: write"; return; }
 	echo 2000000 > "/sys/block/$MDNAME/md/sync_speed_min"
 	echo 2000000 > "/sys/block/$MDNAME/md/sync_speed_max"
 	fio --name=fg --filename="$MD" --rw=read --bs=1M --direct=1 --ioengine=libaio \
@@ -474,7 +474,7 @@ run_bitmap_pass() {
 
 	RK_CREATE_EXTRA="--bitmap=internal --bitmap-chunk=4M" \
 		rk_create 2r "${MEMBERS[@]:0:$N}" || { rk_fail "$tag: create"; return; }
-	rk_write "$DATAMB"
+	rk_write "$DATAMB" || { rk_fail "$tag: write"; return; }
 	rk_fail_disks "$victim"; rk_remove_disks "$victim"
 	# three scattered regions change while the member is out
 	for off in 16 80 150; do
@@ -556,7 +556,7 @@ run_write_pass() {
 	spare=${MEMBERS[$N]}
 
 	rk_create 2r "${MEMBERS[@]:0:$N}" || { rk_fail "$tag: create"; return; }
-	rk_write "$DATAMB"
+	rk_write "$DATAMB" || { rk_fail "$tag: write"; return; }
 	rk_fail_disks "$victim"; rk_remove_disks "$victim"
 	# throttled, so the window sits full ahead of md's cursor
 	echo 1000 > "/sys/block/$MDNAME/md/sync_speed_min"

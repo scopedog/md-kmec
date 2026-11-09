@@ -118,13 +118,20 @@ done
 # Data + parity occupy ngroups*g = 12 of the 14 columns of each row; the two
 # spare columns must still be all-zero after every write above.  Count row-0
 # members whose first data chunk carries any nonzero byte.
-nz=0
+nz=0; rdfail=0
 for d in $(seq 0 $((N - 1))); do
-	sudo dd if="${MEMBERS[$d]}" of="$RK_TMP/r0c" bs="${CHUNK_KB}k" count=1 \
-		iflag=skip_bytes,direct skip=$(( do_s * 512 )) status=none
+	rm -f "$RK_TMP/r0c"
+	# an empty (failed) read would count as an all-zero spare column
+	if ! sudo dd if="${MEMBERS[$d]}" of="$RK_TMP/r0c" bs="${CHUNK_KB}k" count=1 \
+		iflag=skip_bytes,direct skip=$(( do_s * 512 )) status=none ||
+	   [ "$(stat -c %s "$RK_TMP/r0c" 2>/dev/null)" != $(( CHUNK_KB * 1024 )) ]; then
+		rdfail=$((rdfail + 1)); continue
+	fi
 	[ "$(tr -d '\0' < "$RK_TMP/r0c" | wc -c)" -gt 0 ] && nz=$((nz + 1))
 done
-if [ "$nz" -le $(( N - SC )) ]; then
+if [ "$rdfail" -gt 0 ]; then
+	rk_fail "spare-column check: $rdfail member read(s) failed"
+elif [ "$nz" -le $(( N - SC )) ]; then
 	rk_pass "row-0 spare columns untouched ($nz/$N members carry row-0 bytes)"
 else
 	rk_fail "row 0 has $nz non-zero members — a spare column was written"

@@ -162,8 +162,10 @@ else
 	lbs=$(sudo blockdev --getss "$member0" 2>/dev/null || echo 512)
 	blk_lbs=$(( BLK / lbs ))			# 4 KiB block in logical-block units
 	off_lbs=$(( do_s * 512 / lbs ))		# data_offset (bytes) in logical-block units
+	rm -f "$RK_TMP/blk0.good" "$RK_TMP/blk0.rd"
 	sudo dd if="$member0" of="$RK_TMP/blk0.good" bs="$lbs" skip="$off_lbs" \
-		count="$blk_lbs" iflag=direct status=none 2>/dev/null
+		count="$blk_lbs" iflag=direct status=none ||
+		echo "T3: read of $member0 failed" >&2
 	sudo dd if=/dev/urandom of="$member0" bs="$lbs" seek="$off_lbs" \
 		count="$blk_lbs" conv=notrunc status=none 2>/dev/null
 	sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
@@ -174,9 +176,14 @@ else
 		th0=$(healed)
 		# cold read: md re-fetches block 0 from the corrupt member, reloads the
 		# CRC from the region, detects the mismatch, and heals from parity.
-		sudo dd if="$MD" of="$RK_TMP/blk0.rd" bs="$BLK" count=1 iflag=direct status=none 2>/dev/null
+		sudo dd if="$MD" of="$RK_TMP/blk0.rd" bs="$BLK" count=1 iflag=direct status=none ||
+			echo "T3: read of $MD failed" >&2
 		th1=$(healed)
-		data_ok=no; cmp -s "$RK_TMP/blk0.good" "$RK_TMP/blk0.rd" && data_ok=yes
+		# two readbacks compared: both must hold the whole block, or two
+		# failed reads (empty files) would compare equal
+		data_ok=no
+		[ "$(stat -c %s "$RK_TMP/blk0.good" 2>/dev/null)" = "$BLK" ] &&
+			cmp -s "$RK_TMP/blk0.good" "$RK_TMP/blk0.rd" && data_ok=yes
 		detected=no; ! no_mismatch && detected=yes
 		if [ "$data_ok" = yes ] && [ "$detected" = yes ]; then
 			rk_pass "T3: real corruption detected + healed after CRC re-faulted from region post-thrash"

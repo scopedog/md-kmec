@@ -105,7 +105,7 @@ create-time or sysfs switch; **scoped** ships with a documented boundary.
 | Remove parity<br>`--grow --remove-parity` | m → m−1 (≥2 remain), k and capacity fixed, so every row simply re-encodes in place — no array-size dance. The m=4→3 Cauchy→Vandermonde boundary is handled by the re-encode. Classic layouts only. | shipped |
 | Pool expand / shrink<br>`--grow --raid-devices=N′` | Declustered: re-tile each row into more (or fewer) k+m groups at fixed g, m, s. Shrink removes one group's disks per reshape and runs the engine backwards. | shipped |
 | Spare-count change<br>`--grow --spare-columns=s′` | Trade capacity against distributed-spare columns in either direction, on the fixed pool. | shipped |
-| Crash safety | Every COW reshape journals STAGE→COMMIT→DONE. A power loss mid-reshape is recovered by a plain `mdadm --assemble` replaying the in-kernel journal — raidkm sets `RESHAPE_NO_BACKUP`, so mdadm neither demands a backup file nor runs its critical-section restore. Fault suite: **114 passed / 0 failed** on base and GFNI. | shipped |
+| Crash safety | Every COW reshape journals STAGE→COMMIT→DONE. A power loss mid-reshape is recovered by a plain `mdadm --assemble` replaying the in-kernel journal — raidkm sets `RESHAPE_NO_BACKUP`, so mdadm neither demands a backup file nor runs its critical-section restore. Fault suite: **114 passed / 0 failed** on base and GFNI. Power cut mid-reshape on every member at once: **43 of 43** crashes recovered byte-identical on kernels 6.12 and 7.0. | shipped |
 
 ### Consistency & logging
 
@@ -589,6 +589,17 @@ verify-src plus CRC re-key).
 > copy, and a member failure before you remove them will legitimately pull them
 > back in as hot-spare rebuild targets. `--remove` and `--zero-superblock` them
 > as part of the procedure, not later.
+
+### A band that will not read
+
+A reshape reads each band through the old geometry. If a block there fails its
+CRC and parity cannot repair it, that band fails and the reshape stops
+advancing. It waits before each retry, 10 ms doubling to 1 s, and logs the
+first failure of a run of retries, then at most 3 lines a minute. To heal the
+block, read that region through the array: `check` and `repair` cannot run
+while the reshape is pending. Once the block reads, the reshape continues by
+itself; until then it costs one retry a second. Modules before md-kmec 845a2b4
+retried every ~12 ms with a quiesce of the whole array each time.
 
 ---
 
@@ -1180,7 +1191,7 @@ tools/raidkm-test-degraded.sh          # max-degraded reconstruction, read + wri
 tools/raidkm-test-grow.sh              # --add-data incl. degraded-read-after-grow, --add-parity
 tools/raidkm-test-shrink.sh            # backward COW walk (+ -crash variant)
 tools/raidkm-test-reshape-concurrent.sh  # I/O across a throttled reshape (dual EC tables)
-tools/raidkm-test-reshape-crash.sh     # power-loss / torn-write recovery (fault-inject build)
+tools/raidkm-test-reshape-crash.sh     # power-loss / torn-write recovery (fault-inject build; else timed power cuts)
 NATIVE=1 tools/raidkm-test-selfheal.sh # checksum-driven heal (or dm-integrity by default)
 NATIVE=1 tools/raidkm-test-csum-thrash.sh  # CRC-region cache eviction round-trip
 tools/raidkm-test-row-dread-wide.sh    # degraded span read once per row: unaligned, two failures, races, dcl
@@ -1188,6 +1199,7 @@ NATIVE=1 tools/raidkm-test-row-csum.sh # checksum verified/published through the
 tools/raidkm-test-gtc-swap.sh          # group_thread_cnt / worker_thread_cnt under resync + I/O (a field-reported crash)
 tools/raidkm-test-nowait.sh            # io_uring 1 MiB reads vs 2 MiB / libaio (fio; no REQ_NOWAIT)
 tools/raidkm-test-csum-crashlag.sh     # --checksum crash images read back with no stale CRC
+tools/raidkm-test-powercut.sh          # power cut during writes, replayed from per-member write logs kept in completion order (dm-log-writes-ord)
 tools/raidkm-test-csum-readonly.sh     # --checksum mismatch past the parity on a read-only array: EIO, no hang
 tools/raidkm-test-snap-convert.sh      # mdadm --grow --snapshots on an existing row-map array
 tools/raidkm-test-declustered-discard.sh # discards on declustered pools
@@ -1223,8 +1235,13 @@ and runs five tiers — clean reshape, crash-and-resume at each phase × band, t
 STAGE/COMMIT, hybrid fault tolerance (frozen mid-reshape: the migrated region
 survives `m_new` failures and the pending region `m_old`, each probed on its own
 array), and torn COMMIT concurrent with a member failure. **114 passed / 0
-failed on both base and GFNI.** Without the fault-inject build it auto-runs Tier
-0 plus a best-effort timed crash.
+failed on both base and GFNI.** Without the fault-inject build it runs Tier 0
+plus a power cut timed by `reshape_position`, `RX_BE_REPS` times per reshape
+type (`RX_BE_ONLY=1` runs only those). The cut drops writes on every member at
+one instant. On RHEL 10.2 and Rocky 10 (kernel 6.12) and Ubuntu 26.04 (kernel
+7.0), **43 of 43** such crashes recovered byte-identical, with scrub clean and
+degraded reads right, from journal records in every phase (STAGE, COMMIT,
+DONE).
 
 The **self-heal suite** writes data, injects *silent* corruption directly on the
 raw backing store, and verifies reconstruction on both the read path and the
@@ -1239,10 +1256,23 @@ members and needs `integritysetup` from the `cryptsetup` package.
 > two harness bugs surfaced only on 4K-logical devices. And `scrub=0` is not
 > proof of EC correctness: it can mask a stale-table bug that only a *degraded
 > read* exposes. Test the decode.
+>
+> A power cut must hit every member at the same instant. Flipping members to
+> `drop_writes` one at a time (the old reshape-crash harness, still there as
+> `RX_CUT=serial`) lets md keep writing to the members not yet flipped. Their
+> journals then end on different records, a state no real power loss can make,
+> and the test reported DATA CORRUPT on a sound module.
+>
+> Ubuntu 26.04 ships uutils `dd` by default, and it fails every `iflag=direct`
+> read. The harness used to hide dd's errors, so readbacks came back empty:
+> tests that compare against the written data failed, and tests that compare
+> two readbacks passed when they should not. The library now runs GNU dd
+> (`gnudd`) in its place, refuses to start when only uutils is there
+> (`RK_ALLOW_UUTILS_DD=1` overrides), and fails a test on any failed read.
 
 ---
 
 Sources: [`README.md`](../README.md), `km/raid_km.c`, `km/raid_km.h`,
 `km/raid_km_dcl.h`, `km/raid_km-reshape.c`, `tools/`, and the `raidkm-level71`
-mdadm fork (`24e99c1b`). Benchmark figures are as recorded in the tree, each
+mdadm fork (`8e1199ab`). Benchmark figures are as recorded in the tree, each
 with its harness and hardware named alongside. GPL-2.0-only.

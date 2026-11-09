@@ -64,6 +64,16 @@ RX_AD_OLD_K="${RX_AD_OLD_K:-3}"
 RX_CUT="${RX_CUT:-atomic}"      # atomic | serial (see rx_crash_now)
 RX_BE_REPS="${RX_BE_REPS:-1}"   # best-effort crash runs per reshape type
 RX_BE_ONLY="${RX_BE_ONLY:-0}"   # 1 = skip the other tiers, run best-effort only
+# A bad value must not run a different test, or none, and report green:
+# RX_BE_REPS=0 ran zero crashes and passed, a misspelled serial ran atomic.
+case "$RX_CUT" in atomic|serial) ;;
+	*) echo "ERROR: RX_CUT=$RX_CUT: atomic or serial" >&2; exit 2 ;; esac
+case "$RX_BE_REPS" in ''|*[!0-9]*|0*)
+	echo "ERROR: RX_BE_REPS=$RX_BE_REPS: a positive integer" >&2; exit 2 ;; esac
+case "$RX_BE_ONLY" in 0|1) ;;
+	*) echo "ERROR: RX_BE_ONLY=$RX_BE_ONLY: 0 or 1" >&2; exit 2 ;; esac
+case "$RX_FULL_ORACLE" in 0|1) ;;
+	*) echo "ERROR: RX_FULL_ORACLE=$RX_FULL_ORACLE: 0 or 1" >&2; exit 2 ;; esac
 
 RX_LOOPS=(); RX_FLK=(); RX_DEVS=()
 RX_HAVE_INJECT=0
@@ -152,18 +162,28 @@ rx_crash_now() {                # power loss: every member at one instant
 	# --noudevsync as in raidkm-test-declustered-crash.sh: a flushing
 	# suspend can wait behind the reshape's I/O, and a synced resume can
 	# hang on a stranded udev cookie.
+	# Every step is checked: one member that fails to suspend, load or
+	# resume is the partial cut this replaced, so it returns 1 and the
+	# caller reports the crash as invalid instead of judging the array.
+	local bad=0
 	for f in "${RX_FLK[@]}"; do
-		[ -n "$f" ] && sudo dmsetup suspend --noflush --nolockfs --noudevsync "$f"
+		[ -n "$f" ] || continue
+		sudo dmsetup suspend --noflush --nolockfs --noudevsync "$f" ||
+			{ echo "rx_crash_now: suspend $f failed" >&2; bad=1; }
 	done
 	for i in "${!RX_FLK[@]}"; do
 		f="${RX_FLK[$i]:-}"; loop="${RX_LOOPS[$i]:-}"
 		[ -n "$f" ] && [ -n "$loop" ] || continue
 		sectors=$(sudo blockdev --getsz "$loop")
-		echo "0 $sectors flakey $loop 0 0 86400 1 drop_writes" | sudo dmsetup load "$f"
+		echo "0 $sectors flakey $loop 0 0 86400 1 drop_writes" | sudo dmsetup load "$f" ||
+			{ echo "rx_crash_now: load drop_writes on $f failed" >&2; bad=1; }
 	done
 	for f in "${RX_FLK[@]}"; do
-		[ -n "$f" ] && sudo dmsetup resume --noudevsync "$f"
+		[ -n "$f" ] || continue
+		sudo dmsetup resume --noudevsync "$f" ||
+			{ echo "rx_crash_now: resume $f failed" >&2; bad=1; }
 	done
+	return "$bad"
 }
 
 rx_thaw() {                     # back to passthrough; dropped writes stay dropped
@@ -348,7 +368,8 @@ rx_start_grow() {
 
 # Simulate power loss with the reshape thread parked, then assemble + resume.
 rx_crash_and_resume() {
-	rx_crash_now
+	rx_crash_now ||
+		rk_fail "power cut incomplete (a dmsetup step failed): not a valid crash, the verdicts below mean nothing"
 	sudo "$MDADM" --stop "$MD" >/dev/null 2>&1
 	rx_thaw
 	sudo "$MDADM" --stop "$MD" >/dev/null 2>&1

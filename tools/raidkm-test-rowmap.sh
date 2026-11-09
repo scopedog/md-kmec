@@ -311,8 +311,11 @@ else
 fi
 echo system > /sys/block/$MDN/md/sync_speed_max; echo system > /sys/block/$MDN/md/sync_speed_min
 idle
+# two readbacks compared: a failed read feeds a random token into that row's
+# hash, so two failed reads never compare equal
 stripes() { local r c; for r in $(seq 2 21); do for c in 0 1 2 3 4 5 6 7; do
-	dd if=$MD bs=4096 skip=$(( (r * ROW + c * CHUNK * 1024 + (r % 3) * 4096) / 4096 )) count=1 iflag=direct status=none
+	dd if=$MD bs=4096 skip=$(( (r * ROW + c * CHUNK * 1024 + (r % 3) * 4096) / 4096 )) count=1 iflag=direct status=none ||
+		{ echo "T10: read failed (row $r chunk $c)" >&2; echo "readfail:$RANDOM$RANDOM"; }
 	done | md5sum | cut -c1-8; done; }
 s_in=$(stripes); $MDADM $MD --fail $SPARE >/dev/null 2>&1; sleep 0.3; s_out=$(stripes)
 nd=$(diff <(echo "$s_in") <(echo "$s_out") | grep -c "^<")

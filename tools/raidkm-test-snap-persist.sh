@@ -100,7 +100,10 @@ sdev() {
 		sleep 0.2; t=$((t + 1))
 	done
 }
-md5() { [ -b "$1" ] || { echo "nodev:$1"; return; }; dd if="$1" bs=1M iflag=direct status=none | md5sum | cut -c1-32; }
+# a failed read prints a unique token, so two failed reads never compare equal
+md5() { [ -b "$1" ] || { echo "nodev:$1:$RANDOM$RANDOM"; return; }; local s
+	s=$(set -o pipefail; dd if="$1" bs=1M iflag=direct status=none | md5sum) &&
+		echo "${s:0:32}" || { echo "md5: read of $1 failed" >&2; echo "readfail:$1:$RANDOM$RANDOM"; }; }
 # same <label> <expected> <device>: md5 of device is expected (prints both if not)
 same() { local got; got=$(md5 "$3"); [ "$got" = "$2" ] && return 0
 	echo "    $1: $3 md5 $got, expected $2"; return 1; }
@@ -347,7 +350,21 @@ NRM=$(( (ROWS + 509) / 510 )); NPM=$(( (NRM + 4079) / 4080 ))
 # both copies of each to every member.  (Not the rmap slots: the slot a page
 # is not in may hold anything, e.g. what a re-added member had before.)
 META=$(( 46 + 2 * NPM ))
-regmd5() { dd if="$1" bs=4096 skip=$SNOFF count=$META status=none | md5sum | cut -c1-32; }
+# md5 of <count> 4 KiB blocks at <skip>; a failed or short read (a skip past
+# the end reads nothing and succeeds) gives a unique token, never a checksum
+regsum() {	# regsum <dev> <skip> <count>
+	local f s; f=$(mktemp)
+	if [ "${3:-0}" -gt 0 ] 2>/dev/null &&
+	   dd if="$1" of="$f" bs=4096 skip="$2" count="$3" status=none &&
+	   [ "$(stat -c %s "$f")" = $(( $3 * 4096 )) ]; then
+		s=$(md5sum < "$f"); echo "${s:0:32}"
+	else
+		echo "regsum: short or failed read of $1 (skip $2 count $3)" >&2
+		echo "readfail:$1:$RANDOM$RANDOM"
+	fi
+	rm -f "$f"
+}
+regmd5() { regsum "$1" "$SNOFF" "$META"; }
 r5=$(regmd5 "${M[5]}")
 [ "$(regmd5 "${M[0]}")" = "$r5" ] && [ "$(regmd5 "${M[1]}")" = "$r5" ] && \
 	pass "T8 rebuilt members hold the same metadata as the others" || \
@@ -449,7 +466,7 @@ if [ -n "${SNAP_DCL:-}" ]; then
 	[ "$(regmd5 "$SPARE")" = "$r5" ] && pass "T13 the new disk holds the same snapshot metadata" || \
 		fail "T13 metadata on $SPARE $(regmd5 "$SPARE"), others $r5"
 	RMOFF=$(( (DO + MREG) / 8 ))	# the row map (rk_rowmap map_region, read at T8)
-	rmmd5() { dd if="$1" bs=4096 skip=$RMOFF count=$RMP status=none | md5sum | cut -c1-32; }
+	rmmd5() { regsum "$1" "$RMOFF" "$RMP"; }
 	[ "$(rmmd5 "$SPARE")" = "$(rmmd5 "${M[5]}")" ] && pass "T13 and the same row map" || \
 		fail "T13 row map on $SPARE differs"
 	NEW=("${M[@]:0:3}" "$SPARE" "${M[@]:6}")	# 4 and 5 left out

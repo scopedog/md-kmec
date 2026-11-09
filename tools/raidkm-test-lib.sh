@@ -15,6 +15,7 @@
 #   BRD_SIZE_KB ramdisk size in KiB                (default 262144 = 256 MiB)
 #   CHUNK_KB    array chunk size in KiB            (default 64)
 #   RK_TMP      scratch dir for data checksums     (default /tmp/raidkm-test)
+#   RK_DD       the dd to run                      (default gnudd if dd is uutils, else dd)
 #
 # Tests need root (sudo) for modprobe/insmod, mdadm, sysfs and drop_caches.
 
@@ -34,6 +35,46 @@ BRD_NR="${BRD_NR:-12}"
 BRD_SIZE_KB="${BRD_SIZE_KB:-262144}"
 CHUNK_KB="${CHUNK_KB:-64}"
 RK_TMP="${RK_TMP:-/tmp/raidkm-test}"
+
+# dd.  Ubuntu 26.04's default dd is uutils coreutils, and its O_DIRECT reads
+# fail on md with "IO error: Invalid input" (unaligned buffer, uutils #12085),
+# so every iflag=direct readback comes back empty: a compare against the
+# written data fails, and a compare of two readbacks passes (empty == empty).
+# GNU dd is installed beside it as gnudd.  RK_DD is the dd the tests run:
+# gnudd when dd is uutils, else dd.  The dd() and sudo() wrappers send every
+# `dd` and `sudo dd` in the sourcing script to it (sudo itself would look dd
+# up in its secure_path, so RK_DD is resolved to a full path); rk_check_dd
+# refuses a uutils or broken RK_DD, from rk_load_modules and from the first
+# rk_write / rk_readback / rk_md5.  The detection runs the dd binary, never a
+# dd() function a script defined before sourcing this.
+rk_dd_is_uutils() { command "$1" --version 2>/dev/null | head -1 | grep -qi uutils; }
+if [ -z "${RK_DD:-}" ]; then
+	RK_DD=dd
+	rk_dd_is_uutils dd && type -P gnudd >/dev/null 2>&1 && RK_DD=gnudd
+fi
+RK_DD=$(type -P "$RK_DD" 2>/dev/null || echo "$RK_DD")
+if [ "$RK_DD" != "$(type -P dd 2>/dev/null)" ]; then
+	dd() { command "$RK_DD" "$@"; }
+	sudo() {
+		if [ "${1:-}" = dd ]; then shift; command sudo "$RK_DD" "$@"
+		else command sudo "$@"; fi
+	}
+fi
+RK_DD_OK=
+rk_check_dd() {
+	[ -n "$RK_DD_OK" ] && return "$RK_DD_OK"
+	if ! command "$RK_DD" --version >/dev/null 2>&1; then
+		echo "ERROR: dd '$RK_DD' does not run: set RK_DD=<GNU dd>." >&2
+		RK_DD_OK=1; return 1
+	fi
+	if rk_dd_is_uutils "$RK_DD" && [ "${RK_ALLOW_UUTILS_DD:-0}" != 1 ]; then
+		echo "ERROR: $RK_DD is uutils ($("$RK_DD" --version 2>/dev/null | head -1)): its O_DIRECT" \
+		     "reads fail on md, so readbacks would be empty. Install GNU dd (gnudd)," \
+		     "or set RK_DD=<GNU dd> (RK_ALLOW_UUTILS_DD=1 to run anyway)." >&2
+		RK_DD_OK=1; return 1
+	fi
+	RK_DD_OK=0
+}
 
 RK_PASS=0
 RK_FAIL=0
@@ -128,6 +169,7 @@ rk_verify_srcversion() {
 }
 
 rk_load_modules() {
+	rk_check_dd || return 1
 	rk_resolve_mdadm || { echo "ERROR: no mdadm found (set MDADM=)" >&2; return 1; }
 	if [ "$RK_RELOAD" = 1 ]; then
 		sudo rmmod raidkm 2>/dev/null || true
@@ -361,18 +403,40 @@ rk_wait_populated() {
 }
 
 # rk_write <MiB> : fill the array with random data, remember its checksum.
+# A failed dd says so and returns 1, and leaves RK_SRC_MD5 a token no
+# readback can match.
 rk_write() {
-	sudo dd if=/dev/urandom of="$RK_TMP/src" bs=1M count="$1" status=none 2>/dev/null
-	sudo dd if="$RK_TMP/src" of="$MD" bs=1M count="$1" oflag=direct status=none 2>/dev/null
+	RK_SRC_MD5="write-failed:$$:$RANDOM$RANDOM"
+	rk_check_dd || return 1
+	sudo dd if=/dev/urandom of="$RK_TMP/src" bs=1M count="$1" iflag=fullblock status=none ||
+		{ echo "rk_write: dd from /dev/urandom failed" >&2; return 1; }
+	sudo dd if="$RK_TMP/src" of="$MD" bs=1M count="$1" oflag=direct status=none ||
+		{ echo "rk_write: dd to $MD failed" >&2; return 1; }
 	sync
 	RK_SRC_MD5=$(md5sum "$RK_TMP/src" | cut -d' ' -f1)
 }
 
 # rk_readback <MiB> : drop caches, read back, return 0 iff it matches rk_write.
+# A failed dd says so and returns 1 without comparing.
 rk_readback() {
+	rk_check_dd || return 1
 	sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
-	sudo dd if="$MD" of="$RK_TMP/rd" bs=1M count="$1" iflag=direct status=none 2>/dev/null
+	sudo dd if="$MD" of="$RK_TMP/rd" bs=1M count="$1" iflag=direct status=none ||
+		{ echo "rk_readback: dd from $MD failed" >&2; return 1; }
 	[ "$(md5sum "$RK_TMP/rd" | cut -d' ' -f1)" = "$RK_SRC_MD5" ]
+}
+
+# rk_md5 <dev> [dd operands...] : md5 of an O_DIRECT read of <dev>.  A failed
+# read says so and prints a unique "readfail:" token instead of a checksum, so
+# two failed reads never compare equal (two empty reads would).
+rk_md5() {
+	local dev=$1 s; shift
+	if rk_check_dd && s=$(set -o pipefail; sudo dd if="$dev" iflag=direct status=none "$@" | md5sum); then
+		echo "${s%% *}"
+	else
+		echo "rk_md5: read of $dev failed" >&2
+		echo "readfail:$dev:$$:$RANDOM$RANDOM"
+	fi
 }
 
 # Wait for the pass just started through sync_action to end.  sync_action

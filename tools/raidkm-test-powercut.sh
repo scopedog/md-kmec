@@ -347,7 +347,7 @@ pc_snap_md5() {	# pc_snap_md5 <name>: waits for udev's node
 		[ $t -ge 50 ] && { echo nodev; return; }
 		sleep 0.2; t=$((t + 1))
 	done
-	sudo dd if="$d" bs=1M iflag=direct status=none | md5sum | cut -c1-32
+	rk_md5 "$d" bs=1M
 }
 # the loop: "create <n> <md5>" once create returned and the md5 is read,
 # "destroy <n>" before a destroy is tried
