@@ -71,9 +71,7 @@ else
 fi
 
 echo "=== post: scrub + degraded-decode ==="
-echo check | sudo tee /sys/block/md70/md/sync_action >/dev/null
-for i in $(seq 1 90); do grep -qE "check" /proc/mdstat || break; sleep 2; done
-mm=$(cat /sys/block/md70/md/mismatch_cnt)
+mm=$(rk_scrub)		# a scrub seen to complete (raidkm-test-lib.sh)
 [ "$mm" = 0 ] && rk_pass "scrub clean after concurrent reshape" || rk_fail "scrub mismatch_cnt=$mm"
 
 # degraded decode: parity must be EC-correct even after the concurrent churn

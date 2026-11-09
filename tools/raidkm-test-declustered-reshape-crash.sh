@@ -87,9 +87,7 @@ echo "=== verify integrity + scrub + degraded-decode ==="
 sudo dd if="$MD" of="$RK_TMP/rd" bs=1M count="$PATMB" iflag=direct status=none
 POST=$(md5sum "$RK_TMP/rd" | cut -d' ' -f1)
 [ "$PRE" = "$POST" ] && rk_pass "data intact across crash+resume" || rk_fail "DATA MISMATCH ($PRE vs $POST)"
-echo check | sudo tee /sys/block/md70/md/sync_action >/dev/null
-for i in $(seq 1 90); do grep -qE "check" /proc/mdstat || break; sleep 2; done
-mm=$(cat /sys/block/md70/md/mismatch_cnt)
+mm=$(rk_scrub)		# a scrub seen to complete (raidkm-test-lib.sh)
 [ "$mm" = 0 ] && rk_pass "scrub clean after crash+resume" || rk_fail "scrub mismatch_cnt=$mm"
 for d in "${MEMBERS[@]:0:$M}"; do sudo "$MDADM" --fail "$MD" "$d" >/dev/null 2>&1; sleep 1; done
 deg=$(cat /sys/block/md70/md/degraded)

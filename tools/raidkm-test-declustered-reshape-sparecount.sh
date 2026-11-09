@@ -89,18 +89,8 @@ echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 
 # scrub that waits for a NEW "check done." — mismatch_cnt after an INTR'd
 # check is garbage (kmec scrub-after-reshape race)
-scrub_settled() {
-	local d0 i
-	d0=$(sudo dmesg | grep -c "check done")
-	echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
-	for i in $(seq 1 600); do
-		[ "$(sudo dmesg | grep -c 'check done')" -gt "$d0" ] && {
-			cat "/sys/block/$MDNAME/md/mismatch_cnt"
-			return 0
-		}
-		sleep 0.5
-	done
-	echo "check-never-completed"
+scrub_settled() {	# a scrub seen to complete (raidkm-test-lib.sh)
+	rk_scrub
 }
 
 echo "=== spare-count INCREASE s=$END_S->$START_S (ngroups $NEW_NG->$OLD_NG, capacity shrinks — BACKWARD walk) ==="

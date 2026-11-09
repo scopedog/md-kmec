@@ -402,11 +402,51 @@ rk_wait_pass() {	# rk_wait_pass [<the action written>]
 	rk_wait_idle
 }
 
-# Run a parity scrub and echo the resulting mismatch_cnt.
+# Run a parity scrub and echo the resulting mismatch_cnt, or
+# "check-never-completed" (never 0, so a caller's "= 0" test fails) when no
+# check ran to its end.
+#
+# A check must be seen to COMPLETE: md's own "md: <dev>: check done." (older
+# kernels: "data-check done.") after our trigger.  Right after a reshape,
+# md's reap of the reshape thread is still pending: the write of "check"
+# gets EBUSY, or the check starts and is INTR'd ~0.1 s in, and an
+# interrupted check leaves a garbage mismatch_cnt -- a whole-device count on
+# a correct array or a 0 on a bad one.  So: drop a marker into the kernel
+# log, trigger, wait for the pass, and accept the count only if a "check
+# done." line follows the marker; otherwise let md settle and try again.
+# Where the marker does not show up in the log (no writable /dev/kmsg, e.g.
+# printk.devkmsg=off, or a write that is dropped), the test is a count: more
+# "check done." lines than before the trigger.
 rk_scrub() {
-	echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
-	rk_wait_pass
-	cat "/sys/block/$MDNAME/md/mismatch_cnt"
+	local try tag d0 done_re="md: $MDNAME: (data-)?check done"
+	local sa="/sys/block/$MDNAME/md/sync_action"
+	for try in 1 2 3 4 5; do
+		tag="raidkm-test: scrub mark $$.$RANDOM.$try $MDNAME"
+		echo "$tag" | sudo tee /dev/kmsg >/dev/null 2>&1
+		d0=
+		sudo dmesg 2>/dev/null | grep -qF "$tag" ||
+			d0=$(sudo dmesg 2>/dev/null | grep -cE "$done_re")
+		if echo check | sudo tee "$sa" >/dev/null 2>&1; then
+			rk_wait_pass
+			# Marker logged: a "check done" line after it; any one when
+			# a check that logged a flood has pushed it out of the ring
+			# buffer (it was there, so every line left is newer).  The
+			# marker resets what was seen before it.
+			if [ -z "$d0" ] && sudo dmesg 2>/dev/null |
+			   awk -v t="$tag" -v re="$done_re" '
+				index($0, t) { hit = 0; next }
+				$0 ~ re      { hit = 1 }
+				END          { exit !hit }' ||
+			   { [ -n "$d0" ] &&
+			     [ "$(sudo dmesg 2>/dev/null | grep -cE "$done_re")" -gt "$d0" ]; }; then
+				cat "/sys/block/$MDNAME/md/mismatch_cnt"
+				return 0
+			fi
+		fi
+		rk_wait_pass		# a sync we collided with, or the reap
+		sleep 2
+	done
+	echo "check-never-completed"
 }
 
 rk_fail_disks() { local d; for d in "$@"; do sudo "$MDADM" --fail "$MD" "$d" >/dev/null 2>&1; done; sleep 1; }

@@ -69,9 +69,7 @@ echo "PRE=$PRE POST=$POST"
 [ "$PRE" = "$POST" ] && rk_pass "data integrity across reshape" || rk_fail "DATA MISMATCH across reshape"
 
 echo "=== scrub ==="
-echo check | sudo tee /sys/block/md70/md/sync_action >/dev/null
-for i in $(seq 1 90); do grep -qE "check" /proc/mdstat || break; sleep 2; done
-mm=$(cat /sys/block/md70/md/mismatch_cnt)
+mm=$(rk_scrub)		# a scrub seen to complete (raidkm-test-lib.sh)
 [ "$mm" = 0 ] && rk_pass "scrub clean (mismatch_cnt=0)" || rk_fail "scrub mismatch_cnt=$mm"
 
 echo "=== degraded-decode oracle: fail m disks (one at a time), read via reconstruct ==="

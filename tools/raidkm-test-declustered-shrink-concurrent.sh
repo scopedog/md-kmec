@@ -117,12 +117,7 @@ NEW_SIZE=$(cat /sys/block/$MDNAME/size)
 [ "$NEW_SIZE" = "$CLAMP_SECT" ] && rk_pass "capacity at the new geometry ($OLD_SIZE -> $NEW_SIZE)" \
 				|| rk_fail "capacity $NEW_SIZE (want $CLAMP_SECT)"
 
-d0=$(sudo dmesg | grep -c "check done")
-echo check | sudo tee /sys/block/$MDNAME/md/sync_action >/dev/null
-for i in $(seq 1 600); do
-	[ "$(sudo dmesg | grep -c 'check done')" -gt "$d0" ] && break; sleep 0.5
-done
-mm=$(cat /sys/block/$MDNAME/md/mismatch_cnt)
+mm=$(rk_scrub)		# a scrub seen to complete (raidkm-test-lib.sh)
 [ "$mm" = 0 ] && rk_pass "settled scrub clean after concurrent shrink" \
 	      || rk_fail "scrub mismatch_cnt=$mm"
 

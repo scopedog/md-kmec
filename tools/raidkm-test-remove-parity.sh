@@ -56,18 +56,9 @@ wait_reshape_done() {
 	done
 	return 1
 }
-scrub_settled() {
-	local d0 i
+scrub_settled() {	# let the reshape reap settle, then a checked scrub
 	sleep 3
-	d0=$(sudo dmesg | grep -c "check done")
-	echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
-	for i in $(seq 1 600); do
-		[ "$(sudo dmesg | grep -c 'check done')" -gt "$d0" ] && {
-			cat "/sys/block/$MDNAME/md/mismatch_cnt"; return 0
-		}
-		sleep 0.5
-	done
-	echo "check-never-completed"
+	rk_scrub
 }
 remove_parity() {	# remove_parity -> 0 if started
 	sudo "$MDADM" --grow "$MD" --remove-parity >/dev/null 2>&1

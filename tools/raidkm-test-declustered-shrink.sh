@@ -84,18 +84,8 @@ wait_trigger_idle() {
 
 # scrub that waits for a NEW "check done." — a check INTR'd by md's reap
 # leaves garbage in mismatch_cnt (kmec scrub-after-reshape race)
-scrub_settled() {
-	local d0 i
-	d0=$(sudo dmesg | grep -c "check done")
-	echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
-	for i in $(seq 1 600); do
-		[ "$(sudo dmesg | grep -c 'check done')" -gt "$d0" ] && {
-			cat "/sys/block/$MDNAME/md/mismatch_cnt"
-			return 0
-		}
-		sleep 0.5
-	done
-	echo "check-never-completed"
+scrub_settled() {	# a scrub seen to complete (raidkm-test-lib.sh)
+	rk_scrub
 }
 
 # ---- T1: array-size-first is enforced ---------------------------------------

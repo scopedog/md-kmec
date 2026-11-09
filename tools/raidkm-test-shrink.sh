@@ -84,31 +84,14 @@ read_md5() {
 	sudo dd if="$MD" bs=1M count="$PATMB" iflag=direct status=none 2>/dev/null |
 		md5sum | cut -d' ' -f1
 }
-# rk_scrub is not robust right after a reshape: md's async reap of the reshape
-# thread INTRs a check written into that window ("md: <dev>: check
-# interrupted."), and an interrupted check leaves a GARBAGE mismatch_cnt — a
-# huge false-fail or a 0-count false-PASS.  Require POSITIVE completion: the
-# check's own "check done." must appear in dmesg after our trigger; anything
-# else (interrupted, never started) retries after a settle.  Verified
-# manually: an 8s-settled post-shrink check runs to completion with
-# mismatch=0 where the racing one was INTR'd at ~0.1s with counts in the
+# A scrub right after a reshape races md's reap of the reshape thread;
+# rk_scrub accepts only a check seen to complete and retries otherwise (see
+# raidkm-test-lib.sh).  An 8 s-settled post-shrink check ran to completion
+# with mismatch=0 where a racing one was INTR'd at ~0.1 s with counts in the
 # hundreds of thousands.
-scrub_settled() {
-	local try d0 mm i
-	sleep 3					# let the reshape reap settle
-	for try in 1 2 3 4 5; do
-		d0=$(sudo dmesg | grep -c "check done")
-		echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
-		for i in $(seq 1 600); do
-			[ "$(sudo dmesg | grep -c 'check done')" -gt "$d0" ] && {
-				cat "/sys/block/$MDNAME/md/mismatch_cnt"
-				return 0
-			}
-			sleep 0.5
-		done
-		sleep 3
-	done
-	echo "check-never-completed"
+scrub_settled() {	# let the reshape reap settle, then a checked scrub
+	sleep 3
+	rk_scrub
 }
 
 # ---- T1: array-size-first is enforced ---------------------------------------

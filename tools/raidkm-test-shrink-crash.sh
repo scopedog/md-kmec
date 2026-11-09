@@ -37,20 +37,9 @@ read_md5() {
 	sudo dd if="$MD" bs=1M count="$PATMB" iflag=direct status=none 2>/dev/null |
 		md5sum | cut -d' ' -f1
 }
-scrub_settled() {	# positive-completion scrub (see raidkm-test-shrink.sh)
-	local try d0 i
+scrub_settled() {	# let the reshape reap settle, then a checked scrub
 	sleep 3
-	for try in 1 2 3; do
-		d0=$(sudo dmesg | grep -c "check done")
-		echo check | sudo tee "/sys/block/$MDNAME/md/sync_action" >/dev/null
-		for i in $(seq 1 600); do
-			[ "$(sudo dmesg | grep -c 'check done')" -gt "$d0" ] &&
-				{ cat "/sys/block/$MDNAME/md/mismatch_cnt"; return 0; }
-			sleep 0.5
-		done
-		sleep 3
-	done
-	echo "check-never-completed"
+	rk_scrub
 }
 
 for ROUND in 1 2; do
