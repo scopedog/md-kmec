@@ -9,6 +9,14 @@
 # via the top-level Makefile's symlink.
 ccflags-y += -I$(src)/../md
 
+# queue_limits->max_hw_wzeroes_unmap_sectors (mainline 6.17) must be
+# cleared in raid5_set_limits() wherever it exists.  Probed from the
+# target's headers rather than tied to a TARGET, so a distro backport
+# (e.g. a later RHEL 10.x) picks it up on its own.
+ifneq ($(shell grep -qs max_hw_wzeroes_unmap_sectors $(srctree)/include/linux/blkdev.h && echo y),)
+ccflags-y += -DRAIDKM_HAS_WZEROES_UNMAP
+endif
+
 # Opt-in debug fault injection for the COW-staged reshape (the
 # raidkm_reshape_inject sysfs knob exercised by tools/raidkm-test-reshape-crash.sh).
 # Off by default; build with `make RAIDKM_FAULT_INJECT=1` to enable.

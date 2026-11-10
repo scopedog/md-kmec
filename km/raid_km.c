@@ -133,6 +133,24 @@ static void __maybe_unused raidkm_mddev_abi_checks(void)
 	BUILD_BUG_ON(offsetof(struct mddev, recovery_active)	!= 608);
 	BUILD_BUG_ON(offsetof(struct mddev, cluster_ops)	!= 2040);
 	BUILD_BUG_ON(offsetof(struct md_rdev, meta_bdev)	!= 40);
+#elif defined(RAIDKM_TARGET_UBUNTU2604)
+	/* Ubuntu 26.04 md core (kernel 7.0; md is builtin, like RHEL 10 —
+	 * struct mddev in vmlinux BTF).  Stock 7.0.0-43 headers
+	 * (md-ubuntu2604/); the same layout in every 7.0 flavour's BTF but
+	 * realtime (md-ubuntu2604/README).  The deploy-time re-check lives in
+	 * check-mddev-abi.sh. */
+	BUILD_BUG_ON(sizeof(struct mddev)			!= 1936);
+	BUILD_BUG_ON(offsetof(struct mddev, gendisk)		!= 120);
+	BUILD_BUG_ON(offsetof(struct mddev, dm_gendisk)		!= 128);
+	BUILD_BUG_ON(offsetof(struct mddev, level)		!= 264);
+	BUILD_BUG_ON(offsetof(struct mddev, reshape_position)	!= 352);
+	BUILD_BUG_ON(offsetof(struct mddev, sync_io_depth)	!= 488);
+	BUILD_BUG_ON(offsetof(struct mddev, normal_io_events)	!= 600);
+	BUILD_BUG_ON(offsetof(struct mddev, recovery_active)	!= 608);
+	BUILD_BUG_ON(offsetof(struct mddev, cluster_ops)	!= 1896);
+	BUILD_BUG_ON(offsetof(struct md_rdev, meta_bdev)	!= 40);
+	/* builtin md core's own width (atomic_t), not the fork's atomic64_t */
+	BUILD_BUG_ON(sizeof_field(struct mddev, recovery_active) != 4);
 #else
 	/* mainline / Debian 6.12 md core (verified via BTF on Debian 13
 	 * trixie, 6.12.x-amd64). The kernel-side check (check-mddev-abi.sh,
@@ -242,13 +260,58 @@ module_param(default_row_dread, bool, 0644);
 MODULE_PARM_DESC(default_row_dread,
 		 "Initial rk_row_dread for new arrays: serve degraded reads through the row layer (default Y; N restores the 4 KiB stripe-cache path).");
 
-static bool default_row_write;
+/*
+ * On by default: a full, aligned row written through the 4 KiB stripe cache
+ * costs a stripe_head, a hash-lock round trip and (where raidkm counts the
+ * bitmap) a bitmap count per 4 KiB per member, and those serialise -- an
+ * NVMe array tops out near 4-6 GiB/s with most CPUs idle (a field report).  The
+ * row path takes the same write as one request per member.
+ */
+static bool default_row_write = true;
 module_param(default_row_write, bool, 0644);
 MODULE_PARM_DESC(default_row_write,
-		 "Initial rk_row_write for new arrays: write a full, aligned row as one request per member instead of through the 4 KiB stripe cache (default N).");
+		 "Initial rk_row_write for new arrays: write a full, aligned row as one request per member instead of through the 4 KiB stripe cache (default Y; N sends every write through the stripe cache).");
 
-#define RK_ROW_WRITE_DEPTH	64	/* rows in flight through the row path */
+/*
+ * Rows in flight through the row path.  A row that finds none free goes
+ * through the stripe cache (write_nobuf) -- slowly, and it holds up the rows
+ * around it.  1 MiB rows on NVMe members modelled at 5.5 GB/s (null_blk,
+ * a field-reported setup) took 23-27% of rows to the stripe cache at 64 rows under 96-256
+ * x 4 MiB writes and ~0% at 256, writing 20-30% more; light load was the
+ * same either way.  Auto sizing aims at 256 MiB of row data in flight, at
+ * least the old fixed 64 rows, and in any case at most 256 MiB of parity
+ * buffers: each context holds m chunks of them, and the pool keeps what a
+ * burst built until the knob changes or the array stops.
+ */
+#define RK_ROW_WRITE_BYTES	(256ULL << 20)	/* row data in flight (auto) */
+#define RK_ROW_PARITY_BYTES	(256ULL << 20)	/* parity buffers held (auto) */
+#define RK_ROW_WRITE_DEPTH_MIN	64
 #define RK_ROW_WRITE_DEPTH_MAX	1024
+
+static int default_row_write_depth = -1;
+module_param(default_row_write_depth, int, 0644);
+MODULE_PARM_DESC(default_row_write_depth,
+		 "Initial rk_row_write_depth for new arrays (<= 0 = auto: 256 MiB of row data in flight, at least 64 rows, at most 256 MiB of parity buffers and 1024 rows; N = N rows, at most 1024).");
+
+/*
+ * The auto rk_row_write_depth for the current geometry: k chunks of data
+ * and m of parity buffer a row.  The row path is off on declustered arrays,
+ * so their k does not matter here.
+ */
+static int raidkm_row_write_depth_auto(struct r5conf *conf)
+{
+	u64 chunk = (u64)conf->chunk_sectors << 9;
+	u64 k = max(conf->raid_disks - conf->m, 1);
+	u64 m = max(conf->m, 1);
+	u64 rows;
+
+	if (!chunk)
+		return RK_ROW_WRITE_DEPTH_MIN;
+	rows = max_t(u64, div64_u64(RK_ROW_WRITE_BYTES, chunk * k),
+		     RK_ROW_WRITE_DEPTH_MIN);
+	rows = min(rows, div64_u64(RK_ROW_PARITY_BYTES, chunk * m));
+	return clamp_t(u64, rows, 1, RK_ROW_WRITE_DEPTH_MAX);
+}
 unsigned int raidkm_dcl_pop_window = RKDCL_REB_WINDOW;
 module_param(raidkm_dcl_pop_window, uint, 0644);
 MODULE_PARM_DESC(raidkm_dcl_pop_window,
@@ -301,7 +364,7 @@ raidkm_row_bucket(struct r5conf *conf, sector_t member_sector, int group)
  * the row either happened before the walk -- the writer then finds the stripe
  * in use and gives the row up -- or sees the slot and waits.
  */
-#define RAIDKM_ROW_WLOCK_BITS	14
+#define RAIDKM_ROW_WLOCK_BITS	16	/* 64 x RK_ROW_WRITE_DEPTH_MAX slots */
 #define RAIDKM_ROW_WLOCK_SLOTS	(1 << RAIDKM_ROW_WLOCK_BITS)
 /*
  * Fairness.  A stripe-cache request that waits for a row sets WANTED on the
@@ -4588,7 +4651,7 @@ static void raidkm_csum_sync_fn(struct work_struct *w)
 		return;
 	smp_mb__after_atomic();	/* the close before the snapshots */
 	raidkm_csum_writeback(conf, true);
-	md_done_sync(conf->mddev, 1, 1);
+	raidkm_md_done_sync(conf->mddev, 1, 1);
 }
 
 /* md's quiesce and the stop, after raidkm_csum_writeback(): give back a
@@ -4602,7 +4665,7 @@ static void raidkm_csum_sync_close(struct r5conf *conf)
 		return;
 	cancel_delayed_work_sync(&c->sync_dw);
 	if (test_and_clear_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags))
-		md_done_sync(conf->mddev, 1, 1);
+		raidkm_md_done_sync(conf->mddev, 1, 1);
 }
 
 static bool csum_bitmap_resync = true;
@@ -7489,7 +7552,7 @@ static void raid5_error(struct mddev *mddev, struct md_rdev *rdev)
 
 	if (has_failed(conf)) {
 		set_bit(MD_BROKEN, &conf->mddev->flags);
-		conf->recovery_disabled = mddev->recovery_disabled;
+		raidkm_recovery_disabled_snapshot(conf, mddev);
 
 		pr_crit("md/raid:%s: Cannot continue operation (%d/%d failed).\n",
 			mdname(mddev), mddev->degraded, conf->raid_disks);
@@ -8614,8 +8677,7 @@ handle_failed_sync(struct r5conf *conf, struct stripe_head *sh,
 				abort = 1;
 		}
 		if (abort)
-			conf->recovery_disabled =
-				conf->mddev->recovery_disabled;
+			raidkm_recovery_disabled_snapshot(conf, conf->mddev);
 	}
 	/*
 	 * Declustered population: the address being populated cannot be
@@ -8642,7 +8704,7 @@ handle_failed_sync(struct r5conf *conf, struct stripe_head *sh,
 				   (unsigned long long)sh->sector);
 		abort = 1;	/* ok = 0: INTR ends the pass */
 	}
-	md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), !abort);
+	raidkm_md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), !abort);
 }
 
 static int want_replace(struct stripe_head *sh, int disk_idx)
@@ -10878,7 +10940,7 @@ static void handle_stripe(struct stripe_head *sh)
 	if ((s.syncing || s.replacing) && s.locked == 0 &&
 	    !test_bit(STRIPE_COMPUTE_RUN, &sh->state) &&
 	    test_bit(STRIPE_INSYNC, &sh->state)) {
-		md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
+		raidkm_md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
 		clear_bit(STRIPE_SYNCING, &sh->state);
 		/* Declustered population: this address's spare write is on
 		 * disk (locked drained through the write endio) — advance
@@ -10998,7 +11060,7 @@ static void handle_stripe(struct stripe_head *sh)
 		clear_bit(STRIPE_EXPAND_READY, &sh->state);
 		atomic_dec(&conf->reshape_stripes);
 		wake_up(&conf->wait_for_reshape);
-		md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
+		raidkm_md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
 	}
 
 	if (s.expanding && s.locked == 0 &&
@@ -17295,7 +17357,7 @@ static sector_t raidkm_reshape_cow(struct mddev *mddev, sector_t sector_nr,
 	 * release it here — the transient negative is benign: md_do_sync is
 	 * our single caller and only inspects recovery_active after its add.
 	 */
-	md_done_sync(mddev, chunk, 1);
+	raidkm_md_done_sync(mddev, chunk, 1);
 	return chunk;
 }
 
@@ -17411,7 +17473,7 @@ static sector_t raidkm_reshape_cow_shrink(struct mddev *mddev,
 	/* synchronous band I/O: report real progress (throttle accounting),
 	 * releasing the recovery_active md_do_sync adds after we return —
 	 * same contract as the forward driver. */
-	md_done_sync(mddev, chunk, 1);
+	raidkm_md_done_sync(mddev, chunk, 1);
 	return chunk;
 }
 
@@ -17817,7 +17879,7 @@ static sector_t raidkm_reshape_dcl_cow(struct mddev *mddev, sector_t sector_nr,
 	mddev->reshape_position = conf->reshape_progress;
 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
 
-	md_done_sync(mddev, chunk, 1);
+	raidkm_md_done_sync(mddev, chunk, 1);
 	return chunk;
 }
 
@@ -18228,7 +18290,7 @@ static bool raidkm_dcl_pop_claim(struct mddev *mddev, sector_t sector_nr,
 	if (admit && !raidkm_dcl_pop_admit(conf, sector_nr,
 					   sector_nr + did - 1))
 		return false;
-	md_done_sync(mddev, did, 1);
+	raidkm_md_done_sync(mddev, did, 1);
 	for (s = 0; s < did; s += RAID5_STRIPE_SECTORS(conf))
 		raidkm_dcl_pop_done(conf, sector_nr + s);
 	raidkm_dcl_maybe_checkpoint(conf);
@@ -19371,6 +19433,9 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 	if (sector_nr >= max_sector) {
 		/* just being told to finish up .. nothing much to do */
 		int cpop, cst;
+#ifdef RAIDKM_MD_INTR_REPAIR_SETS_OFFSET
+		bool pop_intr_clean = false;
+#endif
 
 		raidkm_rowmap_pass_end(mddev, max_sector);
 
@@ -19431,6 +19496,14 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 
 			/* the pass is over: the next populate call starts one */
 			conf->reb_next = U64_MAX;
+#ifdef RAIDKM_MD_INTR_REPAIR_SETS_OFFSET
+			/* interrupted on an array with no resync pending: the
+			 * population changed no parity, so the array stays
+			 * clean (see the end of this block) */
+			pop_intr_clean =
+				test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+				mddev->recovery_cp == MaxSector;
+#endif
 			/* A pass that ENDED CLEANLY hit no unreconstructable
 			 * address — that INTRs it, via md_done_sync(ok=0), which
 			 * lands before this call even from the final drain — so
@@ -19482,6 +19555,26 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 		if (mddev->bitmap)
 			mddev->bitmap_ops->close_sync(mddev);
 
+#ifdef RAIDKM_MD_INTR_REPAIR_SETS_OFFSET
+		/*
+		 * md_finish_sync(), called right after this, records an
+		 * interrupted repair's position as resync_offset even on a
+		 * clean array (older md core kept MaxSector there).  A
+		 * declustered population rides a repair pass but writes only
+		 * spare columns from decoded data, so a clean array is still
+		 * clean when it stops: report the pass as reaching the end so
+		 * md records MaxSector.  Otherwise a stop or reboot during the
+		 * population leaves a degraded array "dirty" and the next
+		 * assemble refuses it (cannot start dirty degraded array).
+		 * Relies on md_do_sync()'s tail as of Ubuntu 7.0.0-43: this
+		 * call, then md_finish_sync() (nothing in between touches
+		 * curr_resync or resync_offset), then curr_resync reset to
+		 * MD_RESYNC_NONE.  raidkm-test-declustered-populate.sh (stop
+		 * mid-population, degraded re-assemble) fails if md changes it.
+		 */
+		if (pop_intr_clean)
+			mddev->curr_resync = MaxSector;
+#endif
 		return 0;
 	}
 
@@ -19675,7 +19768,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 			 * adds our return to recovery_active after we return
 			 * and nothing else would take it back off.
 			 */
-			md_done_sync(mddev, did, 1);
+			raidkm_md_done_sync(mddev, did, 1);
 			raidkm_row_rb_pace(mddev, did, band_started);
 			return did;
 		}
@@ -21802,7 +21895,8 @@ raidkm_row_write_depth_store(struct mddev *mddev, const char *page, size_t len)
 
 	if (len >= PAGE_SIZE)
 		return -EINVAL;
-	if (kstrtoul(page, 10, &new) || !new || new > RK_ROW_WRITE_DEPTH_MAX)
+	/* 0: back to the auto depth, which a reshape recomputes */
+	if (kstrtoul(page, 10, &new) || new > RK_ROW_WRITE_DEPTH_MAX)
 		return -EINVAL;
 	err = mddev_lock(mddev);
 	if (err)
@@ -21811,7 +21905,13 @@ raidkm_row_write_depth_store(struct mddev *mddev, const char *page, size_t len)
 	if (!conf) {
 		err = -ENODEV;
 	} else {
-		WRITE_ONCE(conf->row_write_depth, new);
+		/* the lock orders this against end_reshape's recompute
+		 * (raidkm_update_row_limits), which has no mddev lock */
+		spin_lock(&conf->row_wctx_lock);
+		conf->row_write_depth_auto = !new;
+		WRITE_ONCE(conf->row_write_depth,
+			   new ?: raidkm_row_write_depth_auto(conf));
+		spin_unlock(&conf->row_wctx_lock);
 		/* a smaller pool shrinks as contexts come back */
 		raidkm_row_wctx_free_idle(conf);
 	}
@@ -22791,7 +22891,6 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 				   sizeof(*conf->row_wlock), GFP_KERNEL);
 	if (!conf->row_wlock)
 		goto abort;
-	conf->row_write_depth = RK_ROW_WRITE_DEPTH;
 	atomic_set(&conf->row_writes, 0);
 	init_waitqueue_head(&conf->row_write_wait);
 	spin_lock_init(&conf->row_wctx_lock);
@@ -22884,7 +22983,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 					       RK_BIO_SORT_SYNC);
 
 	conf->bypass_threshold = BYPASS_THRESHOLD;
-	conf->recovery_disabled = mddev->recovery_disabled - 1;
+	raidkm_recovery_disabled_init(conf, mddev);
 
 	conf->raid_disks = mddev->raid_disks;
 	if (mddev->reshape_position == MaxSector)
@@ -23166,6 +23265,10 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 					     max(per_stripe_kb, 1),
 					     NR_STRIPES, RAIDKM_STRIPE_CACHE_START);
 	}
+	conf->row_write_depth_auto = default_row_write_depth <= 0;
+	conf->row_write_depth = conf->row_write_depth_auto ?
+		raidkm_row_write_depth_auto(conf) :
+		min(default_row_write_depth, RK_ROW_WRITE_DEPTH_MAX);
 	if (mddev->reshape_position != MaxSector) {
 		int stripes = max_t(int,
 			((mddev->chunk_sectors << 9) / RAID5_STRIPE_SIZE(conf)) * 4,
@@ -23376,6 +23479,14 @@ static void raidkm_update_row_limits(struct r5conf *conf)
 	struct mddev *mddev = conf->mddev;
 	struct queue_limits lim;
 
+	/* the auto depth follows the new row; contexts built for the old
+	 * geometry are rebuilt as they are taken (raidkm_row_wctx_get) */
+	spin_lock(&conf->row_wctx_lock);
+	if (conf->row_write_depth_auto)
+		WRITE_ONCE(conf->row_write_depth,
+			   raidkm_row_write_depth_auto(conf));
+	spin_unlock(&conf->row_wctx_lock);
+	raidkm_row_wctx_free_idle(conf);
 	if (mddev_is_dm(mddev))
 		return;
 	/* as mddev_update_io_opt(): not worth it if we cannot suspend */
@@ -23454,6 +23565,15 @@ static int raid5_set_limits(struct mddev *mddev)
 	lim.features |= BLK_FEAT_STABLE_WRITES;
 	lim.discard_granularity = stripe;
 	lim.max_write_zeroes_sectors = 0;
+#ifdef RAIDKM_HAS_WZEROES_UNMAP
+	/*
+	 * Must match max_write_zeroes_sectors or blk_validate_limits() fails
+	 * the array with a bare -EINVAL; it stacks as a min, so members that
+	 * advertise unmapping write-zeroes (NVMe with DEAC) would leave it
+	 * non-zero.  Stock raid5 clears it the same way.
+	 */
+	lim.max_hw_wzeroes_unmap_sectors = 0;
+#endif
 	mddev_stack_rdev_limits(mddev, &lim, 0);
 	rdev_for_each(rdev, mddev)
 		queue_limits_stack_bdev(&lim, rdev->bdev, rdev->new_data_offset,
@@ -24126,7 +24246,7 @@ static int raid5_remove_disk(struct mddev *mddev, struct md_rdev *rdev)
 	 * isn't possible.
 	 */
 	if (!test_bit(Faulty, &rdev->flags) &&
-	    mddev->recovery_disabled != conf->recovery_disabled &&
+	    raidkm_recovery_can_remove(mddev, conf) &&
 	    !has_failed(conf) &&
 	    (!p->replacement || p->replacement == rdev) &&
 	    number < conf->raid_disks) {
@@ -24196,7 +24316,7 @@ static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 
 		return 0;
 	}
-	if (mddev->recovery_disabled == conf->recovery_disabled)
+	if (raidkm_recovery_add_busy(mddev, conf))
 		return -EBUSY;
 
 	if (rdev->saved_raid_disk < 0 && has_failed(conf))
@@ -24453,7 +24573,7 @@ static int raid5_resize(struct mddev *mddev, sector_t sectors)
 		if (mddev->external_size && mddev->array_sectors > newsize)
 			return -EINVAL;
 		if (mddev->bitmap) {
-			ret = mddev->bitmap_ops->resize(mddev, sectors, 0, false);
+			ret = raidkm_bitmap_resize(mddev, sectors, 0, false);
 			if (ret)
 				return ret;
 		}
@@ -24491,7 +24611,7 @@ static int raid5_resize(struct mddev *mddev, sector_t sectors)
 		return -EINVAL;
 
 	if (mddev->bitmap) {
-		ret = mddev->bitmap_ops->resize(mddev, sectors, 0, false);
+		ret = raidkm_bitmap_resize(mddev, sectors, 0, false);
 		if (ret)
 			return ret;
 	}

@@ -1208,9 +1208,11 @@ md-kmec/
 │   ├── compat-rhel10.h  # RHEL 10.x personality-API shim (force-included by the build)
 │   ├── compat-rhel9.h   # RHEL 9.x shim (md_submodule head-style personality)
 │   ├── compat-rhel98.h  # RHEL 9.8 shim (9.8 moved struct mddev)
+│   ├── compat-ubuntu2604.h # Ubuntu 26.04 / kernel 7.0 shim
 │   └── compat-vanilla.h # mainline-kernel shim
 ├── md-rhel9/            # vendored RHEL 9.x md headers (ABI matches in-kernel md-mod)
 ├── md-rhel98/           # vendored RHEL 9.8 md headers
+├── md-ubuntu2604/       # vendored Ubuntu 26.04 (7.0.0-43) md headers
 ├── md-vanilla/          # vendored mainline md headers
 ├── tools/
 │   ├── raidkm-test.sh               # run the full test suite (functional/degraded/grow)
@@ -1308,8 +1310,9 @@ building or loading raidkm changes.  The prefix shows up only in
 
 ### Kernel targets
 
-One source tree builds against three kernel flavours.  The build picks a
-`TARGET` from the running kernel release and force-includes the matching
+One source tree builds against four kernel families.  The build picks a
+`TARGET` from the kernel release (`tools/detect-target.sh`, the map the
+umbrella Makefile and the ABI check share) and force-includes the matching
 `compat/compat-*.h` shim, so the verbatim raid5.c fork compiles against each
 kernel's personality API (`register_md_submodule` etc.) unchanged:
 
@@ -1317,7 +1320,8 @@ kernel's personality API (`register_md_submodule` etc.) unchanged:
 |-----------|-------------------|--------------|-------|
 | `rhel10`  | `.el10` release   | built mdraid tree | flat `md_personality` with `.level` |
 | `rhel9`   | `.el9` release    | `md-rhel9/` (9.7 and earlier), `md-rhel98/` on a `.el9_8` release | `md_submodule_head`-style personality (level comes from `head.id`); 9.8 moved `struct mddev`, so 9.8 gets its own headers and `compat-rhel98.h` |
-| `rhel98`  | never (forced)    | `md-rhel98/` | for a 9.8-based kernel whose release does not say `.el9_8` (CentOS Stream 9, a local build) |
+| `rhel98`  | `.el9_8` release, or forced | `md-rhel98/` | forced for a 9.8-based kernel whose release does not say `.el9_8` (CentOS Stream 9, a local build) |
+| `ubuntu2604` | `7.0.0-<abi>-<flavour>` for the Ubuntu flavours checked against their BTF (generic, aws, azure, azure-fde, gcp, gke, ibm, oracle, vmware, oem, nvidia, nvidia-bos) | `md-ubuntu2604/` | md core is builtin and stock, so the stock 7.0 headers, not the fork's.  Any other 7.x kernel, `realtime` (PREEMPT_RT: another `struct mddev`) included, is refused rather than built against the 6.12 headers |
 | `vanilla` | anything else     | `md-vanilla/` | mainline |
 
 Override the auto-detection with `make TARGET=rhel9` (or `TARGET=rhel98`)

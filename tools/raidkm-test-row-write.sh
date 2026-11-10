@@ -116,6 +116,19 @@ dropc()  { echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
 qlim()   { cat "/sys/block/$MDNAME/queue/$1"; }
 ROWB=0	# bytes per row, set by setup
 
+# auto_depth <k> <m>: what default_row_write_depth=-1 gives a k+m array of
+# CHUNK_KB chunks -- 256 MiB of row data, at least 64 rows, at most 256 MiB
+# of parity buffers and 1024 rows (raidkm_row_write_depth_auto)
+auto_depth() {
+	local c=$(( CHUNK_KB * 1024 )) d p
+	d=$(( (256 << 20) / (c * $1) )); [ "$d" -lt 64 ] && d=64
+	p=$(( (256 << 20) / (c * $2) )); [ "$p" -lt "$d" ] && d=$p
+	[ "$d" -lt 1 ] && d=1; [ "$d" -gt 1024 ] && d=1024
+	echo "$d"
+}
+# depth_is_auto: the module was loaded with the auto depth
+depth_is_auto() { [ "$(cat /sys/module/raidkm/parameters/default_row_write_depth 2>/dev/null || echo -1)" -le 0 ]; }
+
 # setup <layout> <ndisks>: a fresh array with the row path on
 setup() {
 	rk_create "$1" "${MEMBERS[@]:0:$2}" || return 1
@@ -316,6 +329,14 @@ scrub_clean && rk_pass "T5: scrub clean after the rebuild" || rk_fail "T5: parit
 # context for every row (all or nothing), so this is the smallest depth at
 # which it can at all, and 32 bios in flight compete for it.
 TDEPTH=$(( 1048576 / ROWB ))
+DEPTH0=$(cat "$(SYS rk_row_write_depth)")
+if depth_is_auto; then
+	WANT=$(auto_depth $(( ROWB / (CHUNK_KB * 1024) )) "$M")
+	[ "$DEPTH0" = "$WANT" ] && rk_pass "T6: default depth $DEPTH0 rows for $((ROWB / 1024)) KiB rows" \
+		|| rk_fail "T6: default depth $DEPTH0, expected $WANT for $((ROWB / 1024)) KiB rows"
+else
+	rk_skip_check "T6: default_row_write_depth is set, not auto"
+fi
 if [ "$TDEPTH" -lt 1 ]; then
 	# a row over 1 MiB: dd/fio's 1 MiB bios never hold one, nothing to share
 	rk_skip_check "T6: rows of $((ROWB / 1024)) KiB exceed a 1 MiB bio"
@@ -336,7 +357,13 @@ NB1=$(row_stat write_nobuf); D1=$(row_stat write_done)
 	&& rk_pass "T6: rows shared out ($((D1 - D0)) row path, $((NB1 - NB0)) without a context -> stripe cache)" \
 	|| rk_fail "T6: expected both paths (done +$((D1 - D0)), nobuf +$((NB1 - NB0)))"
 fi
-knob rk_row_write_depth 64
+if depth_is_auto; then	# 0 hands it back to the auto depth (and a reshape)
+	knob rk_row_write_depth 0
+	[ "$(cat "$(SYS rk_row_write_depth)")" = "$DEPTH0" ] && rk_pass "T6: rk_row_write_depth=0 restores the auto depth $DEPTH0" \
+		|| rk_fail "T6: rk_row_write_depth=0 gave $(cat "$(SYS rk_row_write_depth)"), auto is $DEPTH0"
+else
+	knob rk_row_write_depth "$DEPTH0"
+fi
 scrub_clean && rk_pass "T6: scrub clean" || rk_fail "T6: parity mismatch"
 
 # ---- T7: a scrub running under row writes ------------------------------------
@@ -511,6 +538,11 @@ if setup "${M}r" $(( N - 2 )); then
 	WANT=$(( ROWB / 512 < CAP ? ROWB / 512 : CAP ))
 	[ "$(qlim chunk_sectors)" = "$WANT" ] && rk_pass "T12: chunk_sectors $WANT (the $(( N - 2 - M ))+$M row $(( ROWB / 512 )), bio cap $CAP)" \
 		|| rk_fail "T12: chunk_sectors $(qlim chunk_sectors), want $WANT (row $(( ROWB / 512 )), bio cap $CAP)"
+	if depth_is_auto; then
+		D=$(auto_depth $(( N - 2 - M )) "$M")
+		[ "$(cat "$(SYS rk_row_write_depth)")" = "$D" ] && rk_pass "T12: auto depth $D for $(( N - 2 - M ))+$M" \
+			|| rk_fail "T12: depth $(cat "$(SYS rk_row_write_depth)"), auto wants $D for $(( N - 2 - M ))+$M"
+	fi
 	HP0=$(cat /proc/sys/vm/nr_hugepages)
 	echo 64 | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
 	HPOK=0; [ "$(awk '/HugePages_Free/{print $2}' /proc/meminfo)" -ge 8 ] && HPOK=1
@@ -539,6 +571,11 @@ if setup "${M}r" $(( N - 2 )); then
 		WANT=$(( ROWB / 512 < CAP ? ROWB / 512 : CAP ))
 		[ "$(qlim chunk_sectors)" = "$WANT" ] && rk_pass "T12: after the grow chunk_sectors $WANT (the $(( N - M ))+$M row $(( ROWB / 512 )), bio cap $CAP)" \
 			|| rk_fail "T12: after the grow chunk_sectors $(qlim chunk_sectors), want $WANT (row $(( ROWB / 512 )), bio cap $CAP)"
+		if depth_is_auto; then
+			D=$(auto_depth $(( N - M )) "$M")
+			[ "$(cat "$(SYS rk_row_write_depth)")" = "$D" ] && rk_pass "T12: after the grow the auto depth follows: $D for $(( N - M ))+$M" \
+				|| rk_fail "T12: after the grow depth $(cat "$(SYS rk_row_write_depth)"), auto wants $D for $(( N - M ))+$M"
+		fi
 		# a bio over the cap is split at the cap and the row, so its whole
 		# row still goes through -- unless the row itself is over the cap
 		if [ "$HPOK" = 1 ] && [ $(( ROWB / 512 )) -le "$CAP" ]; then

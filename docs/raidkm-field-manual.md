@@ -835,6 +835,8 @@ then available, which is the usual reason to convert.
 | `group_thread_cnt` | Same state, stock-compatible view: threads *per* worker group. Either knob updates the other | auto |
 | `skip_copy` | Zero-copy full-stripe writes (needs stable pages — free for O_DIRECT workloads) | `1` |
 | `stripe_cache_size` | Auto-sized when the array is created. Raise to `4096` when a rebuild runs or the write load keeps many full stripes in flight; do not pin it to stock's 256 | **1024** (128 MiB cache budget, floor 256) |
+| `rk_row_write` | Full-row writes: a whole, aligned row goes to the members as one request each instead of through the 4 KiB stripe cache. `0` sends every write through the stripe cache, which levels off around 4–6 GiB/s per array with most CPUs idle. Like every sysfs knob it is not kept across a restart: to keep it off, load the module with `default_row_write=N` | **`1`** |
+| `rk_row_write_depth` | Rows in flight on the row path; a row that finds none free takes the stripe cache (`write_nobuf` in `rk_row_stats`). Each context holds m chunks of parity buffer, and the pool keeps what a burst built until the value changes or the array stops. Writing N fixes it; writing `0` returns to auto, which a reshape recomputes for the new row | auto: 256 MiB of row data in flight, at least 64 rows, at most 256 MiB of parity buffers and 1024 rows (256 at 2+2 × 512K) |
 | `preread_bypass_threshold` | Irrelevant to full-row writes | stock |
 | `rmw_level` | Inherited raid5 RMW policy | stock |
 | `sync_action` | `check` / `repair` / `idle` — scrub control | `idle` |
@@ -859,6 +861,8 @@ that never runs, and the read-back counts its workers. Debug builds add `raidkm_
 | Parameter | Purpose | Default |
 |---|---|---|
 | `default_group_thread_cnt` | Initial `group_thread_cnt` for new arrays; `0` disables worker groups | `-1` (auto) |
+| `default_row_write` | Initial `rk_row_write` for every array started | `Y` |
+| `default_row_write_depth` | Initial `rk_row_write_depth`; `N` = N rows (at most 1024), `0` or below = auto | `-1` (auto) |
 | `raidkm_csum_cache_pages` | Soft ceiling on resident CRC-region pages; `0` auto-sizes from geometry | `0` |
 | `raidkm_csum_shards` | Checksum cache/verify shards — parallel verify workers; `0` = auto per-CPU, capped | `0` |
 | `native_csum` | In-core CRC-32C with *no persistence* — a bring-up/debug path, not the shipping feature | `N` |

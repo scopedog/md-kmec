@@ -7,6 +7,31 @@
 #include <linux/local_lock.h>
 
 #include "raid_km_reshape.h"
+
+/*
+ * md core API that differs by kernel: the compat shim (force-included) may
+ * define these; the defaults are the 6.12-era md core's own calls.  7.0
+ * (compat-ubuntu2604.h) dropped md_done_sync()'s ok argument, the resize
+ * init argument and mddev->recovery_disabled.
+ */
+#ifndef raidkm_md_done_sync
+#define raidkm_md_done_sync(mddev, sectors, ok)				\
+	md_done_sync((mddev), (sectors), (ok))
+#endif
+#ifndef raidkm_bitmap_resize
+#define raidkm_bitmap_resize(mddev, blocks, chunksize, init)		\
+	(mddev)->bitmap_ops->resize((mddev), (blocks), (chunksize), (init))
+#endif
+#ifndef raidkm_recovery_disabled_snapshot
+#define raidkm_recovery_disabled_snapshot(conf, mddev)			\
+	((conf)->recovery_disabled = (mddev)->recovery_disabled)
+#define raidkm_recovery_disabled_init(conf, mddev)			\
+	((conf)->recovery_disabled = (mddev)->recovery_disabled - 1)
+#define raidkm_recovery_can_remove(mddev, conf)				\
+	((mddev)->recovery_disabled != (conf)->recovery_disabled)
+#define raidkm_recovery_add_busy(mddev, conf)				\
+	((mddev)->recovery_disabled == (conf)->recovery_disabled)
+#endif
 #include "raid_km_dcl.h"	/* struct dcl_geom: the declustered dual-geometry
 				 * stripe keys below deref conf->prev_dcl */
 
@@ -956,6 +981,7 @@ struct r5conf {
 	int			row_write;		/* sysfs rk_row_write */
 	atomic64_t		*row_wlock;		/* rows being row-written: slot = row + 1 */
 	int			row_write_depth;	/* rows in flight, at most */
+	bool			row_write_depth_auto;	/* from the geometry: redone after a reshape */
 	atomic_t		row_writes;		/* in flight now: the sync fence */
 	wait_queue_head_t	row_write_wait;		/* ... reaching zero */
 	spinlock_t		row_wctx_lock;

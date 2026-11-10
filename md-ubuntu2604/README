@@ -1,0 +1,26 @@
+# Ubuntu 26.04 private md headers (drivers/md/)
+#
+# EXACT copy of the Ubuntu 26.04 kernel's drivers/md/ headers, extracted from
+# linux-source-7.0.0 7.0.0-43.43 (resolute-updates).  Same vendoring rule as
+# md-rhel9/, md-rhel98/ and md-vanilla/: always the target kernel's exact
+# drivers/md/, never the fork's patched copy.
+#
+# Why stock, not the mdraid fork's 7.0 md/: Ubuntu builds md core into vmlinux
+# (CONFIG_BLK_DEV_MD=y), so the fork can replace raid456/raid0/dm-raid but never
+# md core itself.  The fork's md.h patches describe an md core that is not the
+# one running: it makes mddev->recovery_active atomic64_t, where the running
+# kernel has a 4-byte atomic_t (offset 608, padding to 616), and widens
+# md_done_sync()/rdev_set_badblocks() arguments to sector_t.  raidkm must be
+# compiled against what the kernel really has.
+#
+# Layout checked against every 7.0 flavour's vmlinux BTF (2026-11-09):
+# generic 29 and 43, aws 1017, azure 1019, azure-fde 1016, gcp 1017, gke 1010,
+# ibm 1018, nvidia 1025, nvidia-bos 2024, oem 1018, oracle 1016, vmware 1006:
+# struct mddev 1936, md_rdev 384, bitmap_operations 272, md_done_sync 2 args,
+# identical member offsets (29, nvidia, nvidia-bos and azure-fde still carry
+# mddev.noio_flag in a hole; no offset moves, raidkm does not use it).
+# realtime (PREEMPT_RT, 43) differs: struct mddev 2392 — NOT supported by these
+# headers: tools/detect-target.sh refuses it, as it does any 7.x flavour not
+# listed above (check-mddev-abi.sh fails on it; km/raid_km.c pins the layout).
+#
+# Files: md.h md-bitmap.h md-cluster.h raid1.h raid5.h raid10.h

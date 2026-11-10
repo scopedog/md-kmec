@@ -448,7 +448,14 @@ for it in $(seq 1 "$ITERS"); do
 		rk_fail "$tag: unexpected state '$state' after crash"; break;;
 	esac
 	rk_unthrottle
-	rk_wait_idle
+	# a resumed population starts through deferred md_start_sync work, so
+	# mdstat can read idle before its first pass: wait on the mark itself
+	# (rk_wait_populated), as the populate gate does, not one idle sample
+	if [ "$MULTI" = 1 ]; then	# F was populated before the crash: wait on F2
+		rk_wait_populated "$F2" || rk_wait_idle
+	else
+		rk_wait_populated || rk_wait_idle
+	fi
 	if [ "$MULTI" = 1 ]; then
 		rk_pop_show | grep -q "^populated $F " && rk_pop_show | grep -q "^populated $F2 " \
 			&& rk_pass "$tag: BOTH populations COMPLETE after crash ($(rk_pop_show | tr '\n' ';'))" \

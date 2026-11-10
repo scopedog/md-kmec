@@ -25,7 +25,8 @@
 #   quick   smoke + the same rebuilds on the 4 KiB stripe path
 #           (replace@default_row_rebuild=0), declustered population, and the
 #           functional, degraded and replace suites again with full-row writes
-#           on (@default_row_write=1) (~50 min).
+#           off (@default_row_write=0), so every write takes the stripe cache
+#           (~50 min).
 #   full    quick + the core regression (grow, reshape) and the declustered
 #           crash / multi-assignment suites.  Several of those stop EVERY md array
 #           on the host (mdadm --stop --scan): refused without --allow-stop-all.
@@ -97,9 +98,10 @@ SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window
 # <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.
-# <suite>@default_row_write=1 runs a suite written for the stripe cache with
-# full-row writes on: every aligned whole-row write it issues takes the row
-# path instead, and its own data and parity checks gate it.
+# Full-row writes are on by default (default_row_write=Y), so every suite's
+# aligned whole-row writes take the row path; <suite>@default_row_write=0 runs
+# it with them off, every write through the 4 KiB stripe cache that the row
+# path falls back to, and its own data and parity checks gate that path.
 # <suite>@default_row_sync=1 runs a suite's resyncs, checks and repairs of a
 # healthy array through the row layer (rk_row_sync, off by default) instead of
 # the stripe cache; its own data and parity checks gate it.
@@ -109,8 +111,8 @@ SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window
 # backpressure (populate-window T6, the mark-stall fix) is exercised.
 QUICK=("${SMOKE[@]}" replace@default_row_rebuild=0 declustered-populate
        declustered-populate@default_dcl_row_rebuild=0
-       functional@default_row_write=1 degraded@default_row_write=1
-       replace@default_row_write=1
+       functional@default_row_write=0 degraded@default_row_write=0
+       replace@default_row_write=0
        functional@default_row_sync=1 degraded@default_row_sync=1
        scrub-badblocks@default_row_sync=1 row-write@default_row_sync=1
        gtc-swap)

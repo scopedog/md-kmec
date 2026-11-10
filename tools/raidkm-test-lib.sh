@@ -384,11 +384,11 @@ rk_wait_full() {
 # for RK_POP_STALL seconds while mdstat is idle is a genuine kernel stall.
 # returns 0 iff populated, 1 on a real stall (caller dumps DIAG).
 RK_POP_STALL=${RK_POP_STALL:-60}
-rk_wait_populated() {
-	local last=-1 mk stall=0 i
+rk_wait_populated() {	# [index]: that assignment (default: any)
+	local last=-1 mk stall=0 i want="^populated${1:+ $1 }" sel="^[a-z]*${1:+ $1 }"
 	for i in $(seq 1 2400); do		# ~20 min hard ceiling
-		rk_pop_show | grep -q "^populated" && return 0
-		mk=$(rk_pop_mark); : "${mk:=0}"
+		rk_pop_show | grep -q "$want" && return 0
+		mk=$(rk_pop_show | grep "$sel" | sed -n 's/.*mark \([0-9]*\)\/.*/\1/p' | head -1); : "${mk:=0}"
 		if [ "$mk" -gt "$last" ]; then
 			last=$mk; stall=0		# forward progress
 		elif grep -qiE 'resync|recovery|reshape|check' /proc/mdstat; then
