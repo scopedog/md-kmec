@@ -22764,6 +22764,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 	int group_cnt;
 	struct r5worker_group *new_group;
 	int ret = -ENOMEM;
+	int scs, rwd;
 
 	if (mddev->new_level != 5
 	    && mddev->new_level != 4
@@ -23252,12 +23253,15 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 		conf->prev_algo = conf->algorithm;
 	}
 
+	/* The 0644 module parameters can change under us: read each once,
+	 * so a concurrent write cannot pass one test and fail the next. */
+	scs = READ_ONCE(default_stripe_cache_size);
+	rwd = READ_ONCE(default_row_write_depth);
 	conf->min_nr_stripes = NR_STRIPES;
-	if (default_stripe_cache_size > 0) {
+	if (scs > 0) {
 		/* the same bounds raid_km_set_cache_size() accepts */
-		conf->min_nr_stripes = clamp(default_stripe_cache_size, 17,
-					     RAID5_MAX_NR_STRIPES);
-	} else if (default_stripe_cache_size < 0) {
+		conf->min_nr_stripes = clamp(scs, 17, RAID5_MAX_NR_STRIPES);
+	} else if (scs < 0) {
 		int per_stripe_kb = (sizeof(struct stripe_head) +
 			max_disks * (sizeof(struct bio) + PAGE_SIZE)) / 1024;
 
@@ -23265,10 +23269,10 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 					     max(per_stripe_kb, 1),
 					     NR_STRIPES, RAIDKM_STRIPE_CACHE_START);
 	}
-	conf->row_write_depth_auto = default_row_write_depth <= 0;
+	conf->row_write_depth_auto = rwd <= 0;
 	conf->row_write_depth = conf->row_write_depth_auto ?
 		raidkm_row_write_depth_auto(conf) :
-		min(default_row_write_depth, RK_ROW_WRITE_DEPTH_MAX);
+		min(rwd, RK_ROW_WRITE_DEPTH_MAX);
 	if (mddev->reshape_position != MaxSector) {
 		int stripes = max_t(int,
 			((mddev->chunk_sectors << 9) / RAID5_STRIPE_SIZE(conf)) * 4,
