@@ -139,6 +139,19 @@ for kv in $mddev_fields; do
 	[ "$got" = "$want" ] || miss "offsetof(mddev,$f)" "$want" "$got"
 done
 
+# mddev.recovery_active width: raidkm_recovery_active_add() (compat/*.h) is a
+# 32-bit atomic_add on every target, matching the md core that runs (an
+# atomic_t everywhere; the RHEL 10 fork's md.h says atomic64_t, but its md.c
+# is never built).  If md core ever widens the field, the add would update
+# only its low half.
+got=$(printf '%s\n' "$dump" | grep -E "[[:space:]*]recovery_active;" | head -1 \
+	| sed -nE 's:.*/\*[[:space:]]*[0-9]+[[:space:]]+([0-9]+).*:\1:p')
+if [ -z "$got" ]; then
+	echo "$tag note: could not parse the size of mddev.recovery_active (skipping)"
+else
+	[ "$got" = 4 ] || miss "sizeof(mddev.recovery_active)" 4 "$got"
+fi
+
 # struct md_rdev: meta_bdev (offset pinned only for the RHEL target)
 if [ -n "$exp_rdev_meta_bdev" ]; then
 	rdump=$(pahole -C md_rdev $PAHOLE_BTF 2>/dev/null)

@@ -301,21 +301,26 @@ cd ../md-kmec  && make          # km/raidkm.ko
 cd ../mdadm && make CXFLAGS=-DNO_LIBUDEV mdadm
 ```
 
-One source tree builds against three kernel flavours. The build picks a `TARGET`
-from the running kernel release and force-includes the matching
+One source tree builds against four kernel families. The build picks a
+`TARGET` from the kernel release (`tools/detect-target.sh`, the one map the
+umbrella Makefile and the ABI check also use) and force-includes the matching
 `compat/compat-*.h` shim, so the verbatim raid5.c fork compiles against each
 kernel's personality API unchanged:
 
 | `TARGET` | Selected when | md headers | Personality API |
 |---|---|---|---|
 | `rhel10` | `.el10` | built mdraid tree | flat `md_personality` with `.level` |
-| `rhel9` | `.el9` | `md-rhel9/` | `md_submodule_head` style (level from `head.id`) |
-| `vanilla` | anything else | `md-vanilla/` | mainline |
+| `rhel9` | `.el9` (9.7 and earlier) | `md-rhel9/` | `md_submodule_head` style (level from `head.id`) |
+| `rhel98` | `.el9_8`, or forced | `md-rhel98/` | as rhel9; 9.8 moved `struct mddev`. Force it for a 9.8-based kernel whose release lacks `.el9_8` (CentOS Stream 9, a local build) |
+| `ubuntu2604` | `7.0.0-<abi>-<flavour>` | `md-ubuntu2604/` | Ubuntu 26.04: md core is builtin and stock, so raidkm compiles against the stock 7.0 headers. Flavours checked against their BTF: generic, aws, azure, azure-fde, gcp, gke, ibm, oracle, vmware, oem, nvidia, nvidia-bos |
+| `vanilla` | anything else | `md-vanilla/` | mainline, Debian 6.12, Ubuntu before 26.04 |
 
-Override with `make TARGET=rhel9` — useful against a KDIR whose release string
-lacks the distro suffix, e.g. a locally-built debug kernel. RHEL 9 is
-production-grade: the 12-suite matrix passes 211 checks under KASAN + lockdep
-with zero splats.
+Any other 7.x kernel, the Ubuntu `realtime` (PREEMPT_RT) flavour included, is
+refused: its `struct mddev` differs, and the 6.12 headers would build a wrong
+module. Override with `make TARGET=rhel10|rhel9|rhel98|ubuntu2604|vanilla` —
+useful against a KDIR whose release string lacks the distro suffix, e.g. a
+locally-built debug kernel. RHEL 9 is production-grade: the 12-suite matrix
+passes 211 checks under KASAN + lockdep with zero splats.
 
 ```sh
 # load — the async_tx family is not pulled in by raid6_pq alone

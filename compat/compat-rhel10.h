@@ -30,13 +30,20 @@
 	(mddev)->bitmap_ops->endwrite((mddev), (off), (sects))
 
 /*
- * mddev->recovery_active is atomic64_t in the RHEL-ported md.h (see the
- * port-fix #6 comment there) but atomic_t on mainline; the declustered
- * sync-credit accounting goes through this shim so raid_km.c stays
- * single-source.
+ * mddev->recovery_active: the md core that runs is the kernel's builtin one
+ * (CONFIG_BLK_DEV_MD=y; the fork's md.c is never built), and there it is a
+ * 4-byte atomic_t at 608 followed by 4 bytes of padding (recovery_wait at
+ * 616; vmlinux BTF of 6.12.0-211.74.1.el10_2), which md_do_sync() and
+ * md_done_sync() update with 32-bit atomics.  The fork's md.h declares it
+ * atomic64_t (port fix #6, written when raidkm never touched the field), so
+ * add to the 4 bytes md core uses: an atomic64_add carried into the padding
+ * whenever md core had taken the word below zero first, and gave md core the
+ * right value only because x86 and arm64 are little-endian.
+ * check-mddev-abi.sh pins the width at 4.  The declustered sync-credit
+ * accounting goes through this shim so raid_km.c stays single-source.
  */
 #define raidkm_recovery_active_add(mddev, sectors)			\
-	atomic64_add((sectors), &(mddev)->recovery_active)
+	atomic_add((sectors), (atomic_t *)&(mddev)->recovery_active)
 
 /*
  * RHEL 10 struct md_personality layout (192 bytes, verified by binary diff):
