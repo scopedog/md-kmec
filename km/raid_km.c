@@ -2261,6 +2261,8 @@ struct raidkm_csum_page {
 #define RAIDKM_CSUM_P_DIRTY	0	/* modified since last write-back */
 #define RAIDKM_CSUM_P_REBUILD	1	/* rotted on load; slots absent until a
 					 * scrub/write repopulates them */
+/* raidkm_csum_shard.pages mark: the page may be DIRTY (raidkm_csum_dirty) */
+#define RAIDKM_CSUM_XA_DIRTY	XA_MARK_0
 
 /* Batched region I/O: up to this many dirty pages of one shard are written
  * back as async writes at once (raidkm_csum_flush_batch), and the pages a
@@ -2370,6 +2372,7 @@ struct raidkm_csum_cache {
 	 * mddev->recovery_active, so md moves no resync checkpoint (nor ends
 	 * the resync) until sync_dw's pass has written them back */
 	unsigned long		sync_flags;
+	unsigned long		sync_last;	/* jiffies: the last sync pass ended */
 	struct delayed_work	sync_dw;
 	/* plan A step 3, the write-intent bitmap (raidkm_csum_bmh_mark): per
 	 * bitmap chunk with a stored CRC, the latest epoch generation that
@@ -2400,6 +2403,8 @@ static void raidkm_csum_sync_note(struct r5conf *conf);
 static void raidkm_csum_sync_fn(struct work_struct *w);
 static void raidkm_csum_bmh_mark(struct r5conf *conf, unsigned long blk);
 static void raidkm_csum_bmh_fn(struct work_struct *w);
+static void raidkm_csum_redirty(struct raidkm_csum_shard *s,
+				struct raidkm_csum_page *pg);
 
 /* A store in progress holds md's writes_pending, as a write does from
  * md_write_start() to md_write_end(): md cannot mark the array clean while
@@ -2697,7 +2702,7 @@ static bool raidkm_csum_page_flush(struct raidkm_csum_shard *s,
 		 * and fail the member, as md does for any write it could not
 		 * place -- left in, it would read back its old CRCs after a
 		 * crash or the next assembly (no resync covers a clean stop) */
-		set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+		raidkm_csum_redirty(s, pg);
 		pr_warn_ratelimited("md/raid:%s: native csum page write failed disk %d\n",
 				    mdname(conf->mddev), m);
 		md_error(conf->mddev, rdev);
@@ -2868,8 +2873,7 @@ static bool raidkm_csum_flush_batch(struct raidkm_csum_shard *s,
 				if (wb->ent[k].rdev != rdev)
 					continue;
 				if (bad)
-					set_bit(RAIDKM_CSUM_P_DIRTY,
-						&wb->ent[k].pg->flags);
+					raidkm_csum_redirty(s, wb->ent[k].pg);
 				bio_uninit(&wb->ent[k].bio);
 				wb->ent[k].rdev = NULL;
 				rdev_dec_pending(rdev, conf->mddev);
@@ -2910,13 +2914,59 @@ static bool raidkm_csum_get_slot(struct raidkm_csum_page *pg,
 	return true;
 }
 
+/* Mark resident page @pg of shard @s dirty, under pg->slock.  An epoch's
+ * pass (raidkm_csum_writeback) finds the pages to write by the xarray mark
+ * RAIDKM_CSUM_XA_DIRTY instead of walking every resident page (a full-
+ * coverage cache of a big array holds millions).  The mark is set on DIRTY's
+ * 0 -> 1 edge, before the store's epoch note (its barrier orders the mark
+ * before the epoch test, as it does the slot).  Every 0 -> 1 edge is made
+ * here, under pg->slock, so a second setter that finds the bit set finds the
+ * mark set too.  The bit is cleared elsewhere (a write-back, with or without
+ * the slock) and the mark may outlive it: raidkm_csum_unmark_clean() drops
+ * it with the bit re-tested under the xa lock, and a store that sets the bit
+ * after that test sets the mark after the lock is released.  So a DIRTY page
+ * is always marked.  (A store takes the xa lock once per page per epoch.) */
+static void raidkm_csum_dirty(struct raidkm_csum_shard *s,
+			      struct raidkm_csum_page *pg)
+{
+	lockdep_assert_held(&pg->slock);
+	if (!test_and_set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
+		xa_set_mark(&s->pages, pg->key, RAIDKM_CSUM_XA_DIRTY);
+}
+
+/* A write-back of @pg failed: dirty again (its CRCs are not on the member) */
+static void raidkm_csum_redirty(struct raidkm_csum_shard *s,
+				struct raidkm_csum_page *pg)
+{
+	spin_lock(&pg->slock);
+	raidkm_csum_dirty(s, pg);
+	spin_unlock(&pg->slock);
+}
+
+/* Drop the dirty marks of the clean pages among @pgs (shard lock held, so
+ * they are resident), under one xa lock. */
+static void raidkm_csum_unmark_clean(struct raidkm_csum_shard *s,
+				     struct raidkm_csum_page **pgs,
+				     unsigned int n)
+{
+	unsigned int i;
+
+	xa_lock(&s->pages);
+	for (i = 0; i < n; i++)
+		if (!test_bit(RAIDKM_CSUM_P_DIRTY, &pgs[i]->flags))
+			__xa_clear_mark(&s->pages, pgs[i]->key,
+					RAIDKM_CSUM_XA_DIRTY);
+	xa_unlock(&s->pages);
+}
+
 /* A NEW CRC set here must be pinned and noted (raidkm_csum_epoch_pin,
  * raidkm_csum_epoch_note), as raidkm_csum_store() does, or, for a resync's
  * re-derive, held against md's checkpoint (raidkm_csum_sync_note, as in
  * raidkm_csum_verify_stripe()): otherwise md may mark the array clean, or
  * record a resync checkpoint past it, with it in the cache only (plan A).  Landing a parked store needs neither: it
  * was noted when it parked. */
-static void raidkm_csum_set_slot(struct raidkm_csum_page *pg,
+static void raidkm_csum_set_slot(struct raidkm_csum_shard *s,
+				 struct raidkm_csum_page *pg,
 				 unsigned long blk, u32 crc)
 {
 	__le32 *crcs = kmap_local_page(pg->page);
@@ -2925,7 +2975,7 @@ static void raidkm_csum_set_slot(struct raidkm_csum_page *pg,
 		cpu_to_le32(crc ? crc : RAIDKM_CSUM_ZERO_MARK);
 	kunmap_local(crcs);
 	clear_bit(RAIDKM_CSUM_P_REBUILD, &pg->flags);
-	set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+	raidkm_csum_dirty(s, pg);
 }
 
 /* --- the cache (per-shard mutex-guarded; workqueue-only) --------------- */
@@ -3462,7 +3512,8 @@ static void raidkm_csum_wait_clears(struct raidkm_csum_cache *c)
 
 /* empty the slot of @blk in resident page @pg (pg->slock held); true when
  * it held a CRC (the page is then dirty) */
-static bool raidkm_csum_clear_slot_locked(struct raidkm_csum_page *pg,
+static bool raidkm_csum_clear_slot_locked(struct raidkm_csum_shard *s,
+					  struct raidkm_csum_page *pg,
 					  unsigned long blk)
 {
 	__le32 *crcs = kmap_local_page(pg->page);
@@ -3471,7 +3522,7 @@ static bool raidkm_csum_clear_slot_locked(struct raidkm_csum_page *pg,
 	crcs[raidkm_csum_slot(blk)] = 0;
 	kunmap_local(crcs);
 	if (had)
-		set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+		raidkm_csum_dirty(s, pg);
 	return had;
 }
 
@@ -3565,9 +3616,9 @@ static void raidkm_csum_store_one(struct r5conf *conf, int member,
 				raidkm_csum_in_discard(c, member, blk);
 
 			if (hit)
-				had = raidkm_csum_clear_slot_locked(pg, blk);
+				had = raidkm_csum_clear_slot_locked(s, pg, blk);
 			else
-				raidkm_csum_set_slot(pg, blk, crc);
+				raidkm_csum_set_slot(s, pg, blk, crc);
 			spin_unlock(&pg->slock);
 			rcu_read_unlock();
 			if (had)
@@ -3775,7 +3826,7 @@ static bool raidkm_csum_drop_rows_io(struct r5conf *conf, u64 first_row,
 				spin_lock(&pg->slock);
 				raidkm_csum_drop_range_locked(c, mk | p,
 						page_address(pg->page));
-				set_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags);
+				raidkm_csum_dirty(s, pg);
 				spin_unlock(&pg->slock);
 				if (!raidkm_csum_page_flush(s, pg))
 					ok = false;
@@ -3928,7 +3979,7 @@ static void raidkm_csum_verify_stripe(struct raidkm_csum_shard *s,
 			if (pg && test_bit(STRIPE_SYNCING, &sh->state) &&
 			    raidkm_csum_get_slot(pg, blk, &want)) {
 				spin_lock(&pg->slock);
-				raidkm_csum_set_slot(pg, blk,
+				raidkm_csum_set_slot(s, pg, blk,
 					raidkm_block_crc(conf, dev->page, dev->offset));
 				spin_unlock(&pg->slock);
 				/* not an epoch's: the resync checkpoint
@@ -3986,7 +4037,7 @@ static void raidkm_csum_land(struct raidkm_csum_shard *s, unsigned long idx,
 		/* a block being discarded: empty, on disk before the discard
 		 * attaches (raidkm_csum_disc) */
 		spin_lock(&pg->slock);
-		raidkm_csum_clear_slot_locked(pg, blk);
+		raidkm_csum_clear_slot_locked(s, pg, blk);
 		spin_unlock(&pg->slock);
 		if (test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags) &&
 		    !raidkm_csum_page_flush(s, pg))
@@ -3994,7 +4045,7 @@ static void raidkm_csum_land(struct raidkm_csum_shard *s, unsigned long idx,
 					    mdname(conf->mddev));
 	} else if (pg) {
 		spin_lock(&pg->slock);
-		raidkm_csum_set_slot(pg, blk, (u32)xa_to_value(e));
+		raidkm_csum_set_slot(s, pg, blk, (u32)xa_to_value(e));
 		spin_unlock(&pg->slock);
 	} else if (e == RAIDKM_CSUM_PCLEAR) {
 		pr_warn_ratelimited("md/raid:%s: native csum: a CRC of a block being discarded could not be cleared\n",
@@ -4160,16 +4211,23 @@ static void raidkm_csum_writeback(struct r5conf *conf, bool live)
 		 * lock is dropped between batches: a pass may write thousands
 		 * of pages of a shard, and its worker (faults, landings,
 		 * verifies) must not wait for all of them.  A page dirtied
-		 * after the walk passed it is in the next epoch. */
+		 * after the walk passed it is in the next epoch.  Only the
+		 * marked pages are visited (raidkm_csum_dirty); a mark left on
+		 * a page written back since is dropped here. */
 		key = 0;
 		mutex_lock(&s->lock);
-		for (pg = xa_find(&s->pages, &key, ULONG_MAX, XA_PRESENT); pg;
-		     pg = xa_find_after(&s->pages, &key, ULONG_MAX, XA_PRESENT)) {
-			if (!test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags))
+		for (pg = xa_find(&s->pages, &key, ULONG_MAX,
+				  RAIDKM_CSUM_XA_DIRTY); pg;
+		     pg = xa_find_after(&s->pages, &key, ULONG_MAX,
+					RAIDKM_CSUM_XA_DIRTY)) {
+			if (!test_bit(RAIDKM_CSUM_P_DIRTY, &pg->flags)) {
+				raidkm_csum_unmark_clean(s, &pg, 1);
 				continue;
+			}
 			batch[n++] = pg;
 			if (n == RAIDKM_CSUM_WB_BATCH) {
 				raidkm_csum_flush_batch(s, batch, n);
+				raidkm_csum_unmark_clean(s, batch, n);
 				n = 0;
 				mutex_unlock(&s->lock);
 				cond_resched();
@@ -4177,6 +4235,7 @@ static void raidkm_csum_writeback(struct r5conf *conf, bool live)
 			}
 		}
 		raidkm_csum_flush_batch(s, batch, n);
+		raidkm_csum_unmark_clean(s, batch, n);
 		mutex_unlock(&s->lock);
 	}
 	/* then every member's cache, once: the pages above, and what
@@ -4431,11 +4490,15 @@ static void raidkm_csum_bmh_fn(struct work_struct *w)
 	/* Not under bmh_lock: start_write sleeps while a chunk's counter is
 	 * full, until writes end -- whose stores may need the lock.  TAKING
 	 * keeps a release off the entry (and its active_io pin, the bitmap's
-	 * guard) until the hold is taken. */
+	 * guard) until the hold is taken.  Each batch resumes after the last
+	 * one's entries, not from 0: an entry added behind the cursor comes
+	 * with a queue_work() of its own, which runs this again. */
+	idx = 0;
 	for (;;) {
 		nb = 0;
 		mutex_lock(&c->bmh_lock);
-		xa_for_each(&c->bmh, idx, e) {
+		for (e = xa_find(&c->bmh, &idx, ULONG_MAX, XA_PRESENT); e;
+		     e = xa_find_after(&c->bmh, &idx, ULONG_MAX, XA_PRESENT)) {
 			v = xa_to_value(e);
 			if (v & RAIDKM_CSUM_BMH_FLAGS)
 				continue;
@@ -4449,6 +4512,9 @@ static void raidkm_csum_bmh_fn(struct work_struct *w)
 		mutex_unlock(&c->bmh_lock);
 		if (!nb)
 			break;
+		/* the next batch starts after this one's last entry (a chunk
+		 * index: far below ULONG_MAX) */
+		idx = batch[nb - 1] + 1;
 		for (i = 0; i < nb; i++) {
 			raidkm_csum_bmh_range(conf, batch[i], &sector, &n);
 			if (n)
@@ -4478,16 +4544,28 @@ static void raidkm_csum_bmh_fn(struct work_struct *w)
 
 /* Release the entries of generations up to @gen: their pages were written
  * back by a pass that began after their stores (or by a quiesce's
- * write-back).  An entry whose hold was not taken yet needs none any more. */
+ * write-back).  An entry whose hold was not taken yet needs none any more.
+ *
+ * The lock is dropped between batches of RAIDKM_CSUM_WB_BATCH entries: a
+ * big array under scattered writes may hold thousands, and every store of
+ * a new generation waits for the lock in raidkm_csum_bmh_mark().  Whether
+ * an entry goes is decided by its generation, not by when the walk meets
+ * it: a store that reads @gen or older before the flip is in this pass's
+ * write-back (the barrier pairing of raidkm_csum_epoch_note), so its entry
+ * may be released whether it was made before the walk, behind it or ahead
+ * of it.  Passes do not overlap (one delayed work; the close cancels it
+ * first). */
 static void raidkm_csum_bmh_release(struct r5conf *conf, unsigned long gen)
 {
 	struct raidkm_csum_cache *c = conf->csum;
-	unsigned long idx, v, n;
+	unsigned long idx = 0, v, n;
+	unsigned int nr = 0;
 	sector_t sector;
 	void *e;
 
 	mutex_lock(&c->bmh_lock);
-	xa_for_each(&c->bmh, idx, e) {
+	for (e = xa_find(&c->bmh, &idx, ULONG_MAX, XA_PRESENT); e;
+	     e = xa_find_after(&c->bmh, &idx, ULONG_MAX, XA_PRESENT)) {
 		v = xa_to_value(e);
 		/* a hold being taken: the next pass (the entry is left) */
 		if (v >> RAIDKM_CSUM_BMH_SHIFT > gen ||
@@ -4501,6 +4579,12 @@ static void raidkm_csum_bmh_release(struct r5conf *conf, unsigned long gen)
 		}
 		xa_erase(&c->bmh, idx);
 		percpu_ref_put(&conf->mddev->active_io);
+		if (++nr == RAIDKM_CSUM_WB_BATCH) {
+			nr = 0;
+			mutex_unlock(&c->bmh_lock);
+			cond_resched();
+			mutex_lock(&c->bmh_lock);
+		}
 	}
 	mutex_unlock(&c->bmh_lock);
 }
@@ -4625,14 +4709,20 @@ static void raidkm_csum_sync_note(struct r5conf *conf)
 	if (!conf->csum_epoch)
 		return;
 	smp_mb();
-	if (test_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags) ||
-	    test_and_set_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags))
+	if (test_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags))
 		return;
 	/* md_do_sync() waits for recovery_active to reach 0 before it moves
 	 * a checkpoint or ends the resync; the re-deriving stripe's own
 	 * sectors are still counted (its md_done_sync comes after this
-	 * verify), so the count never touches 0 in between */
+	 * verify), so the count never touches 0 in between.  Counted BEFORE
+	 * SYNC_OPEN is set: a pass (kicked, raidkm_csum_sync_kick) gives a
+	 * sector back as soon as it sees the bit.  The loser of a race gives
+	 * its own back. */
 	raidkm_recovery_active_add(conf->mddev, 1);
+	if (test_and_set_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags)) {
+		raidkm_md_done_sync(conf->mddev, 1, 1);
+		return;
+	}
 	queue_delayed_work(system_unbound_wq, &c->sync_dw,
 			   msecs_to_jiffies(csum_epoch_quiet_ms));
 }
@@ -4651,7 +4741,52 @@ static void raidkm_csum_sync_fn(struct work_struct *w)
 		return;
 	smp_mb__after_atomic();	/* the close before the snapshots */
 	raidkm_csum_writeback(conf, true);
+	WRITE_ONCE(c->sync_last, jiffies);
 	raidkm_md_done_sync(conf->mddev, 1, 1);
+}
+
+/* Kicked sync passes come at most this often (each writes back and
+ * flushes every member) */
+#define RAIDKM_CSUM_SYNC_GAP_MS	10
+
+/* A sync completion left recovery_active at no more than the one sector
+ * raidkm_csum_sync_note holds.  md_do_sync() issues nothing more until the
+ * count reaches 0 when it throttles for other I/O (it waits for every
+ * resync I/O in flight to end, about every 128 KiB per member, while the
+ * array is not idle), moves a checkpoint or ends: it may be waiting for the
+ * pass.  Run the pass now (or RAIDKM_CSUM_SYNC_GAP_MS after the last), not
+ * csum_epoch_quiet_ms after the first re-derive: under foreground writes
+ * that delay made a resync that re-derives CRCs ~10x slower.  At most 1,
+ * not exactly: the row bands, the declustered population and the reshape
+ * COW drivers report their sectors from inside raid5_sync_request(),
+ * before md adds them, so the count is short by those then.  When md is not
+ * waiting the pass only comes early, and when the last completion beat md's
+ * add (its sectors not counted yet), md waits for the queued pass as
+ * before.  Never from the pass itself (SYNC_OPEN is clear there), and not
+ * after raidkm_csum_sync_close() (no sync I/O ends after a quiesce). */
+static void raidkm_csum_sync_kick(struct r5conf *conf)
+{
+	struct raidkm_csum_cache *c = conf->csum;
+	unsigned long now, at;
+
+	if (!conf->csum_epoch ||
+	    !test_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags) ||
+	    raidkm_recovery_active_read(conf->mddev) > 1)
+		return;
+	now = jiffies;
+	at = READ_ONCE(c->sync_last) +
+	     msecs_to_jiffies(min_t(unsigned int, RAIDKM_CSUM_SYNC_GAP_MS,
+				    csum_epoch_quiet_ms));
+	mod_delayed_work(system_unbound_wq, &c->sync_dw,
+			 time_after(at, now) ? at - now : 0);
+}
+
+/* md_done_sync() for raidkm's sync I/O (every caller but the sync pass's
+ * own give-back) */
+static void raidkm_done_sync(struct mddev *mddev, int sectors, int ok)
+{
+	raidkm_md_done_sync(mddev, sectors, ok);
+	raidkm_csum_sync_kick(mddev->private);
 }
 
 /* md's quiesce and the stop, after raidkm_csum_writeback(): give back a
@@ -4663,9 +4798,12 @@ static void raidkm_csum_sync_close(struct r5conf *conf)
 
 	if (!c || !conf->csum_epoch)
 		return;
-	cancel_delayed_work_sync(&c->sync_dw);
+	/* clear before the cancel: a kick (gated on SYNC_OPEN) can then not
+	 * re-arm sync_dw behind it.  A pass that won the bit gives its own
+	 * sector back before the cancel returns. */
 	if (test_and_clear_bit(RAIDKM_CSUM_SYNC_OPEN, &c->sync_flags))
 		raidkm_md_done_sync(conf->mddev, 1, 1);
+	cancel_delayed_work_sync(&c->sync_dw);
 }
 
 static bool csum_bitmap_resync = true;
@@ -4791,6 +4929,7 @@ static struct raidkm_csum_cache *raidkm_csum_cache_alloc(struct r5conf *conf)
 	init_waitqueue_head(&c->clear_wq);
 	INIT_DELAYED_WORK(&c->epoch_dw, raidkm_csum_epoch_fn);
 	INIT_DELAYED_WORK(&c->sync_dw, raidkm_csum_sync_fn);
+	c->sync_last = jiffies - msecs_to_jiffies(RAIDKM_CSUM_SYNC_GAP_MS);
 	mutex_init(&c->bmh_lock);
 	xa_init(&c->bmh);
 	INIT_WORK(&c->bmh_work, raidkm_csum_bmh_fn);
@@ -4861,11 +5000,12 @@ static void raidkm_csum_cache_free(struct r5conf *conf)
 	WARN_ON_ONCE(!xa_empty(&c->bmh));
 	xa_destroy(&c->bmh);
 	if (atomic64_read(&c->nr_evict))
-		pr_info("md/raid:%s: native csum cache: %lld region page reads, %lld written back, %lld evicted\n",
+		pr_info("md/raid:%s: native csum cache: %lld region page reads, %lld written back, %lld evicted, %lld epoch passes\n",
 			mdname(conf->mddev),
 			(long long)atomic64_read(&c->nr_fault),
 			(long long)atomic64_read(&c->nr_wb),
-			(long long)atomic64_read(&c->nr_evict));
+			(long long)atomic64_read(&c->nr_evict),
+			(long long)atomic64_read(&c->nr_pass));
 	if (c->abio_wq)
 		destroy_workqueue(c->abio_wq);		/* drains bypass verifies */
 	if (c->wq)
@@ -8704,7 +8844,7 @@ handle_failed_sync(struct r5conf *conf, struct stripe_head *sh,
 				   (unsigned long long)sh->sector);
 		abort = 1;	/* ok = 0: INTR ends the pass */
 	}
-	raidkm_md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), !abort);
+	raidkm_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), !abort);
 }
 
 static int want_replace(struct stripe_head *sh, int disk_idx)
@@ -10940,7 +11080,7 @@ static void handle_stripe(struct stripe_head *sh)
 	if ((s.syncing || s.replacing) && s.locked == 0 &&
 	    !test_bit(STRIPE_COMPUTE_RUN, &sh->state) &&
 	    test_bit(STRIPE_INSYNC, &sh->state)) {
-		raidkm_md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
+		raidkm_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
 		clear_bit(STRIPE_SYNCING, &sh->state);
 		/* Declustered population: this address's spare write is on
 		 * disk (locked drained through the write endio) — advance
@@ -11060,7 +11200,7 @@ static void handle_stripe(struct stripe_head *sh)
 		clear_bit(STRIPE_EXPAND_READY, &sh->state);
 		atomic_dec(&conf->reshape_stripes);
 		wake_up(&conf->wait_for_reshape);
-		raidkm_md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
+		raidkm_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
 	}
 
 	if (s.expanding && s.locked == 0 &&
@@ -17357,7 +17497,7 @@ static sector_t raidkm_reshape_cow(struct mddev *mddev, sector_t sector_nr,
 	 * release it here — the transient negative is benign: md_do_sync is
 	 * our single caller and only inspects recovery_active after its add.
 	 */
-	raidkm_md_done_sync(mddev, chunk, 1);
+	raidkm_done_sync(mddev, chunk, 1);
 	return chunk;
 }
 
@@ -17473,7 +17613,7 @@ static sector_t raidkm_reshape_cow_shrink(struct mddev *mddev,
 	/* synchronous band I/O: report real progress (throttle accounting),
 	 * releasing the recovery_active md_do_sync adds after we return —
 	 * same contract as the forward driver. */
-	raidkm_md_done_sync(mddev, chunk, 1);
+	raidkm_done_sync(mddev, chunk, 1);
 	return chunk;
 }
 
@@ -17879,7 +18019,7 @@ static sector_t raidkm_reshape_dcl_cow(struct mddev *mddev, sector_t sector_nr,
 	mddev->reshape_position = conf->reshape_progress;
 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
 
-	raidkm_md_done_sync(mddev, chunk, 1);
+	raidkm_done_sync(mddev, chunk, 1);
 	return chunk;
 }
 
@@ -18290,7 +18430,7 @@ static bool raidkm_dcl_pop_claim(struct mddev *mddev, sector_t sector_nr,
 	if (admit && !raidkm_dcl_pop_admit(conf, sector_nr,
 					   sector_nr + did - 1))
 		return false;
-	raidkm_md_done_sync(mddev, did, 1);
+	raidkm_done_sync(mddev, did, 1);
 	for (s = 0; s < did; s += RAID5_STRIPE_SECTORS(conf))
 		raidkm_dcl_pop_done(conf, sector_nr + s);
 	raidkm_dcl_maybe_checkpoint(conf);
@@ -19768,7 +19908,7 @@ static sector_t raid5_sync_request(struct mddev *mddev, sector_t sector_nr,
 			 * adds our return to recovery_active after we return
 			 * and nothing else would take it back off.
 			 */
-			raidkm_md_done_sync(mddev, did, 1);
+			raidkm_done_sync(mddev, did, 1);
 			raidkm_row_rb_pace(mddev, did, band_started);
 			return did;
 		}

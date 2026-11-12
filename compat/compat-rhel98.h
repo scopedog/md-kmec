@@ -65,6 +65,8 @@ static inline void md_sync_acct_bio(struct bio *bio,
  */
 #define raidkm_recovery_active_add(mddev, sectors)			\
 	atomic_add((sectors), &(mddev)->recovery_active)
+#define raidkm_recovery_active_read(mddev)				\
+	atomic_read(&(mddev)->recovery_active)
 
 /*
  * el9 does not export raid6_get_zero_page(); the global zero page is an

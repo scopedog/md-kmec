@@ -44,6 +44,8 @@
  */
 #define raidkm_recovery_active_add(mddev, sectors)			\
 	atomic_add((sectors), (atomic_t *)&(mddev)->recovery_active)
+#define raidkm_recovery_active_read(mddev)				\
+	atomic_read((atomic_t *)&(mddev)->recovery_active)
 
 /*
  * RHEL 10 struct md_personality layout (192 bytes, verified by binary diff):

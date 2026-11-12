@@ -56,6 +56,8 @@
  */
 #define raidkm_recovery_active_add(mddev, sectors)			\
 	atomic_add((sectors), &(mddev)->recovery_active)
+#define raidkm_recovery_active_read(mddev)				\
+	atomic_read(&(mddev)->recovery_active)
 
 
 /*

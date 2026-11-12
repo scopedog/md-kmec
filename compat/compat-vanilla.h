@@ -44,6 +44,8 @@
  */
 #define raidkm_recovery_active_add(mddev, sectors)			\
 	atomic_add((sectors), &(mddev)->recovery_active)
+#define raidkm_recovery_active_read(mddev)				\
+	atomic_read(&(mddev)->recovery_active)
 
 /*
  * RHEL 10.2 exports raid6_get_zero_page(); mainline does not.  The

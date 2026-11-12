@@ -721,7 +721,8 @@ coverage 7.3K -> 10.5K. Sequential writes are unaffected. If
 random-write speed matters, keep the cache at full coverage: set
 `raidkm_csum_cache_pages` to the "full region coverage" figure the clamp hint
 logs, RAM permitting. At a stop the stats line `native csum cache: N region
-page reads, ... evicted` shows whether the cache was evicting.
+page reads, ... evicted, M epoch passes` shows whether the cache was evicting
+(and how many write-back epochs closed while it did).
 
 > **Crash semantics — know what you bought.** Native checksums recompute CRCs
 > over the resync window after an unclean shutdown. That is the same class of
