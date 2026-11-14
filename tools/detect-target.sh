@@ -9,8 +9,7 @@
 #   *.el*               -> rhel10      RHEL/Rocky 10.x builtin md
 #   7.0.0-<abi>-<flavour> -> ubuntu2604 Ubuntu 26.04 kernel 7.0 (builtin md), the
 #                          flavours whose md layout was checked against their BTF
-#                          (md-ubuntu2604/README): generic, aws, azure, azure-fde,
-#                          gcp, gke, ibm, oracle, vmware, oem, nvidia, nvidia-bos
+#                          (md-ubuntu2604/README): UBUNTU2604_FLAVOURS below
 #   7.*                 -> unsupported  realtime (PREEMPT_RT: struct mddev 2392),
 #                          an unchecked flavour, or any other 7.x kernel: the
 #                          vanilla headers are 6.12's, so never fall through to them
@@ -24,21 +23,53 @@
 # This is only the default: a caller may override with TARGET= (e.g. a locally
 # built kernel whose release lacks a distro suffix).  Prints the target; exits 2
 # if no kernel release is given.
+#
+#   detect-target.sh --flavours ubuntu2604
+# prints the checked 7.0 flavours, space-separated.  raidkm's DKMS package
+# renders its BUILD_EXCLUSIVE_KERNEL from this, so the list lives only here.
 set -u
+
+# Ubuntu 26.04 kernel 7.0 flavours whose struct mddev was checked against BTF.
+UBUNTU2604_FLAVOURS="generic aws azure azure-fde gcp gke ibm oracle vmware oem nvidia nvidia-bos"
+
+if [ "${1:-}" = --flavours ]; then
+	case "${2:-}" in
+	ubuntu2604)	echo "$UBUNTU2604_FLAVOURS"; exit 0 ;;
+	*)		echo "detect-target.sh: --flavours: unknown target '${2:-}' (known: ubuntu2604)" >&2
+			exit 2 ;;
+	esac
+fi
+
 kver="${1:-}"
 if [ -z "$kver" ]; then
 	echo "detect-target.sh: no kernel release given (usage: detect-target.sh <kver>)" >&2
 	exit 2
 fi
+
+# 7.0.0-<abi>-<flavour>: is <flavour> on the list (and <abi> all digits)?
+is_ubuntu2604() {
+	rest=${1#7.0.0-}
+	[ "$rest" != "$1" ] || return 1
+	abi=${rest%%-*}
+	flavour=${rest#*-}
+	[ "$flavour" != "$rest" ] || return 1
+	case "$abi" in ''|*[!0-9]*) return 1 ;; esac
+	for f in $UBUNTU2604_FLAVOURS; do
+		[ "$f" = "$flavour" ] && return 0
+	done
+	return 1
+}
+
 case "$kver" in
-	*.el9_8*)	echo rhel98 ;;
-	*.el9*)		echo rhel9 ;;
-	*.el*)		echo rhel10 ;;
-	7.0.0-[0-9]*-generic|7.0.0-[0-9]*-aws|7.0.0-[0-9]*-azure|\
-	7.0.0-[0-9]*-azure-fde|7.0.0-[0-9]*-gcp|7.0.0-[0-9]*-gke|\
-	7.0.0-[0-9]*-ibm|7.0.0-[0-9]*-oracle|7.0.0-[0-9]*-vmware|\
-	7.0.0-[0-9]*-oem|7.0.0-[0-9]*-nvidia|7.0.0-[0-9]*-nvidia-bos)
-			echo ubuntu2604 ;;
+	*.el9_8*)	echo rhel98; exit 0 ;;
+	*.el9*)		echo rhel9; exit 0 ;;
+	*.el*)		echo rhel10; exit 0 ;;
+esac
+if is_ubuntu2604 "$kver"; then
+	echo ubuntu2604
+	exit 0
+fi
+case "$kver" in
 	7.*)
 			echo "detect-target.sh: $kver: no supported md target (Ubuntu realtime and unchecked 7.x kernels are refused)" >&2
 			echo unsupported ;;
