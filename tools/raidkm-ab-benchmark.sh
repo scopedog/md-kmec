@@ -27,6 +27,15 @@
 #                  in for the arm and swapped back at exit
 #   raidkm<M>      raidkm with M parity, rotating layout (raidkm2, raidkm3, ...).
 #                  raidkm2 stores the same bytes as raid6: the cleanest A/B pair
+#   raidkm<M>-csum, dcl<M>-csum
+#                  the same arm created with native per-block CRC-32C
+#                  (mdadm --checksum=crc32c), to price verification against
+#                  the arm without it.  mdadm does not zero the reserved CRC
+#                  region at create, and in an ABBA run the previous -csum
+#                  arm's CRCs (or the precondition fill) would sit there and
+#                  be read as this array's, so the tail of each of the arm's
+#                  members -- 1% of it, at least 64 MiB, against a region of
+#                  ~0.1% plus a chunk -- is zeroed before every create
 #   <arm>@<n>      any md arm built on only the FIRST n of --devs, e.g. raid6@10
 #                  next to dcl2 on 12 devices: stock 8+2 with two idle disks as
 #                  hot spares against declustered 8+2 with two distributed spare
@@ -298,6 +307,8 @@ arm_base() { local a; a=$(arm_core "$1"); echo "${a%%+*}"; }	# ... and without +
 arm_type() { local a; a=$(arm_base "$1"); echo "${a%@*}"; }	# ... and without @<n>
 arm_n() { local a; a=$(arm_base "$1"); case "$a" in *@*) echo "${a##*@}" ;; *) echo "$N" ;; esac; }
 arm_profile() { local a; a=$(arm_core "$1"); case "$a" in *+*) echo "${a#*+}" ;; esac; }
+arm_csum() { [[ "$(arm_type "$1")" == *-csum ]]; }	# raidkm<M>-csum / dcl<M>-csum
+arm_m() { local t; t=$(arm_type "$1"); t="${t%-csum}"; t="${t#raidkm}"; echo "${t#dcl}"; }	# parity count
 # arm_ko <arm>: the raidkm module the arm runs on
 arm_ko() { local t; t=$(arm_tag "$1"); if [ -n "$t" ]; then echo "${KOS[$t]}"; else echo "$DEFAULT_RAIDKM_KO"; fi; }
 arm_select() {					# -> AM (members), AN, ALAST
@@ -342,6 +353,7 @@ for t in "${!KOS[@]}"; do
 done
 NEED_RAIDKM=0
 NEED_INTREE=0
+NEED_CSUM=0
 for arm in "${ARM_LIST[@]}"; do
 	t=$(arm_type "$arm"); n=$(arm_n "$arm"); prof=$(arm_profile "$arm")
 	if [ -n "$(arm_tag "$arm")" ]; then
@@ -362,23 +374,28 @@ for arm in "${ARM_LIST[@]}"; do
 	raid5|raid5-intree) [ "$n" -ge 3 ] || die "$arm needs >= 3 members" ;;
 	raid6|raid6-intree) ;;
 	raidkm[0-9]*)
-		m="${t#raidkm}"
-		[[ "$m" =~ ^[0-9]+$ ]] || die "bad arm '$arm' (want raidkm<M>)"
+		m=$(arm_m "$arm")
+		[[ "$m" =~ ^[0-9]+$ ]] || die "bad arm '$arm' (want raidkm<M> or raidkm<M>-csum)"
 		[ "$m" -ge 2 ] || die "$arm: raidkm needs M >= 2"
 		[ $((n - m)) -ge 2 ] || die "$arm: $n members leave k=$((n - m)) data disks, need >= 2"
 		NEED_RAIDKM=1 ;;
 	dcl[0-9]*)
-		m="${t#dcl}"
-		[[ "$m" =~ ^[0-9]+$ ]] || die "bad arm '$arm' (want dcl<M>)"
+		m=$(arm_m "$arm")
+		[[ "$m" =~ ^[0-9]+$ ]] || die "bad arm '$arm' (want dcl<M> or dcl<M>-csum)"
 		[ "$m" -ge 2 ] || die "$arm: declustered needs M >= 2"
 		[ -n "$DCL_G" ] || die "$arm: --group-width is required for a dcl arm"
 		[ $((DCL_G - m)) -ge 2 ] || die "$arm: group width $DCL_G leaves k=$((DCL_G - m)), need >= 2"
 		[ "$n" -gt "$DCL_G" ] || die "$arm: pool ($n) must be WIDER than the group ($DCL_G); equal scatters nothing"
 		NEED_RAIDKM=1 ;;
-	*) die "unknown arm '$arm' (raw, raid5, raid6, raid5-intree, raid6-intree, raidkm<M>, dcl<M>, each optionally @<n> and +<profile>)" ;;
+	*) die "unknown arm '$arm' (raw, raid5, raid6, raid5-intree, raid6-intree, raidkm<M>[-csum], dcl<M>[-csum], each optionally @<n> and +<profile>)" ;;
 	esac
 	[[ "$t" == *-intree ]] && NEED_INTREE=1
+	[[ "$t" == *-csum ]] && NEED_CSUM=1
 done
+if [ "$NEED_CSUM" = 1 ]; then
+	grep -qa -- '--checksum' "$MDADM" 2>/dev/null ||
+		preflight_fail "a -csum arm needs an mdadm with native-checksum support (the fork's): $MDADM"
+fi
 
 # ---- member pre-flight ------------------------------------------------------
 
@@ -546,11 +563,11 @@ arm_create_cmd() {
 	case "$t" in
 	raw) ;;
 	raidkm*)
-		CREATE_CMD=("$MDADM" --create "$MD" --level=raidkm --parity-count="${t#raidkm}"
+		CREATE_CMD=("$MDADM" --create "$MD" --level=raidkm --parity-count="$(arm_m "$arm")"
 			--layout=rotating --raid-devices="$AN" --chunk="$CHUNK"
 			--bitmap="$BITMAP" --assume-clean --run --force "${AM[@]}") ;;
 	dcl*)
-		CREATE_CMD=("$MDADM" --create "$MD" --level=raidkm --parity-count="${t#dcl}"
+		CREATE_CMD=("$MDADM" --create "$MD" --level=raidkm --parity-count="$(arm_m "$arm")"
 			--layout=declustered --group-width="$DCL_G" --spare-columns="$DCL_S"
 			--raid-devices="$AN" --chunk="$CHUNK"
 			--bitmap="$BITMAP" --assume-clean --run --force "${AM[@]}") ;;
@@ -560,6 +577,9 @@ arm_create_cmd() {
 			--raid-devices="$AN" --chunk="$CHUNK"
 			--bitmap="$BITMAP" --assume-clean --run --force "${AM[@]}") ;;
 	esac
+	# the option goes before the member list
+	arm_csum "$arm" && CREATE_CMD=("${CREATE_CMD[@]:0:3}" --checksum=crc32c "${CREATE_CMD[@]:3}")
+	return 0
 }
 
 # arm_bench_args <arm> <dir> <target> : set BENCH_ARGS for raidkm-standard-benchmark.sh
@@ -612,6 +632,34 @@ apply_profile() {
 	done
 }
 
+# csum_tail <dev> : "<seek MiB> <count MiB>" of the tail zeroed before a -csum
+# arm's create -- 1% of the member, at least 64 MiB (see the -csum arm notes)
+csum_tail() {
+	local bytes mib tail
+	# a failed blockdev must fail here, not abort the caller's $( ) with an
+	# arithmetic syntax error before its || fallback runs
+	bytes=$(blockdev --getsize64 "$1") || return 1
+	[[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+	mib=$(( bytes / 1048576 ))
+	tail=$(( mib / 100 )); [ "$tail" -ge 64 ] || tail=64
+	[ "$tail" -le "$mib" ] || tail=$mib
+	echo "$(( mib - tail )) $tail"
+}
+
+# zero_csum_tails <arm> : zero the CRC region's room on each of the arm's members
+zero_csum_tails() {
+	local d st pids=() rc=0 p
+	arm_select "$1"
+	for d in "${AM[@]}"; do
+		read -r -a st <<< "$(csum_tail "$d")"
+		[ "${#st[@]}" -eq 2 ] || { rc=1; continue; }
+		dd if=/dev/zero of="$d" bs=1M seek="${st[0]}" count="${st[1]}" \
+		   oflag=direct conv=notrunc status=none & pids+=($!)
+	done
+	for p in "${pids[@]}"; do wait "$p" || rc=1; done
+	return $rc
+}
+
 # create_arm <arm> : build the arm; sets TARGET
 create_arm() {
 	local arm="$1"
@@ -636,6 +684,9 @@ create_arm() {
 	esac
 	wipe_members
 	udevadm settle
+	if arm_csum "$arm"; then
+		zero_csum_tails "$arm" || die "$arm: cannot zero the members' CRC region room"
+	fi
 	ARM_UP=1
 	arm_create_cmd "$arm"
 	printf 'y\n' | "${CREATE_CMD[@]}" || die "$arm: mdadm --create failed"
@@ -693,10 +744,11 @@ record_arm() {
 			[ -n "$(arm_profile "$arm")" ] &&
 				echo "profile=$(arm_profile "$arm") ($PROFILE_SET)"
 			echo "preread_bypass_threshold=$(md_attr preread_bypass_threshold)"
+			arm_csum "$arm" && echo "checksum=crc32c (member tails zeroed before create: 1%, >= 64 MiB)"
 			echo "mdadm=$MDADM ($("$MDADM" --version 2>&1 | head -1))"
 		fi
 		case "$(arm_type "$arm")" in
-		raid*-*|raid5|raid6) echo "module=$(describe_456)" ;;
+		raid5|raid6|raid5-intree|raid6-intree) echo "module=$(describe_456)" ;;
 		dcl*) echo "group_width=$DCL_G spare_columns=$DCL_S"
 		      echo "module=raidkm $(rk_module_id)" ;;
 		raidkm*) echo "module=raidkm $(rk_module_id)" ;;
@@ -790,6 +842,13 @@ if [ "$DRYRUN" = 1 ]; then
 			[ "$(arm_type "$arm")" = raw ] || { printf '  '; q "$MDADM" --zero-superblock "$d"; }
 			printf '  '; q wipefs -a "$d"
 		done
+		if arm_csum "$arm"; then
+			arm_select "$arm"
+			for d in "${AM[@]}"; do
+				read -r -a st <<< "$(csum_tail "$d" 2>/dev/null || echo "? ?")"
+				printf '  '; q dd if=/dev/zero of="$d" bs=1M seek="${st[0]}" count="${st[1]}" oflag=direct conv=notrunc
+			done
+		fi
 		arm_create_cmd "$arm"
 		if [ "${#CREATE_CMD[@]}" -gt 0 ]; then
 			printf '  '; q "${CREATE_CMD[@]}"

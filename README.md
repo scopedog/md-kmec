@@ -93,7 +93,7 @@ These are load-bearing for the design and not up for negotiation:
 | m=2 array activates natively at level 71, no shim | ✅ done (2026-05-23) |
 | Basic I/O works (writes + reads) | ✅ done (2026-05-23) — 1.9 GB/s write, 7.9 GB/s read on brd |
 | Resync / scrub path works | ✅ done (2026-05-23) — completes cleanly in ~2.4 s for 2 GiB |
-| Standard benchmark passes vs stock raid6 | ✅ done — **re-measured 2026-09-17 against stock and stock tuned by hand** (see *Benchmark — raidkm vs stock raid6*): healthy workloads match tuned stock (the gain over stock is the defaults); degraded reads lead tuned stock 1.43-1.79× on random read; rebuild under a foreground read serves 1.36× its read |
+| Standard benchmark passes vs stock raid6 | ✅ done — **re-measured 2026-11-13 on the current release against tuned stock, both layouts** (see *Benchmark — raidkm vs stock raid6*): the better layout is ≥ 1.00× tuned stock on every item, rebuild under a foreground read included (declustered 1.03× its rebuild rate at 2.20× its foreground read); degraded random read 1.44× (rotating) / 1.64× (declustered); idle rebuild 1.04× / 1.65×.  2026-09-17: against stock as it ships, the healthy-array gain is the defaults |
 | Reliability soak: long fio randwrite+verify, disk-fail mid-I/O, scrub/repair | ✅ done (2026-05-25) — ~230 GiB crc32c-verified across healthy/2-fail/3-fail; a member failed mid-fio survives with correct data; scrub mismatch_cnt=0; surfaced + fixed an nsrc<k WARN on mid-I/O failure |
 | Reliability: hot-replace / rebuild onto a spare | ✅ done (2026-05-25) — fail a member, `mdadm --add` a spare, recovery reconstructs (data via decode, parity via re-encode) and writes the rebuilt member; validated for data-disk, parity-disk, and rebuild-while-still-degraded — spare holds correct bytes, scrub mismatch_cnt=0 |
 | Write-intent bitmap (unclean-shutdown resync only the dirty bits) | ✅ done (2026-05-25) — internal bitmap created/assembled on level 71; writes set dirty bits and `endwrite` clears them after settle; a write-while-degraded marks only the affected region dirty (3/128 chunks for an 8M write); `--re-add` does a bitmap-scoped recovery (17s vs 171s full rebuild, throttled) with correct data; a fresh-spare `--add` still does a full rebuild (not wrongly scoped). Inherited from raid5.c — no kernel changes needed |
@@ -147,6 +147,60 @@ needed to make it land:
   both call sites use that instead.
 
 ### Benchmark — raidkm vs stock raid6
+
+#### Current release vs tuned stock, both layouts (2026-11-13)
+
+Stock md tuned by hand to raidkm's knobs (`group_thread_cnt=8`,
+`stripe_cache_size=1024`, `skip_copy=1`) against raidkm in both layouts, on the
+same 12 disks with **the same usable capacity**: stock 8+2 on 10 members with
+two idle hot spares, raidkm rotating 8+2 on the same 10 with the same two
+spares, and raidkm declustered 8+2 over all 12 with two distributed spare
+columns.  Declustering therefore works 12 drives where the other two work 10 —
+that is what a distributed spare is for, and it should travel with any
+declustered margin quoted.  GCP `n2-standard-32` (32 vCPU, 2 NUMA nodes), 12 ×
+16 GiB partitions of local NVMe, Rocky 10 kernel `6.12.0-211.74.1.el10_2`,
+md-kmec `8c9a6d3` with its shipping defaults (row writes on, declustered
+population on the row engine with 32 rows in flight), no `--checksum` (the
+changes since touch only the checksum code);
+sequential fill + 300 s of 4 KiB random writes first, a discarded warm-up pass,
+2 rounds in ABBA order, 20 s per workload:
+
+```
+tools/raidkm-ab-benchmark.sh --arms=raid6@10+tuned,raidkm2@10,dcl2 \
+    --baseline=raid6@10+tuned --group-width=10 --spare-columns=2 --chunk=128 \
+    --rounds=2 --runtime=20 --precondition=steady --precondition-time=300 \
+    --workloads=1,3,4,8,9 --degraded --rebuild --rebuild-load=seqread
+```
+
+| Workload | tuned stock | raidkm rotating | raidkm declustered | best vs tuned stock |
+|---|---|---|---|---|
+| Random 4K write, IOPS | 118,190 | 121,449 (1.03×) | 127,276 (1.08×) | **1.08×** |
+| 70/30 4K, 16 jobs, IOPS | 263,820 | 260,341 (0.99×) | 280,075 (1.06×) | **1.06×** |
+| OLTP 70/30 16K, IOPS | 79,736 | 79,257 (0.99×) | 93,044 (1.17×) | **1.17×** |
+| Sequential 1 MiB write, MiB/s | 2,721 | 2,758 (1.01×) | 2,917 (1.07×) | **1.07×** |
+| Sequential 1 MiB read, MiB/s | 5,329 | 5,458 (1.02×) | 5,815 (1.09×) | **1.09×** |
+| Degraded sequential 1 MiB read, MiB/s (% of healthy) | 4,561 (86%) | 4,981 (91%) | 5,591 (96%) | **1.23×** |
+| Degraded random 4K read, IOPS | 176,087 | 254,272 (1.44×) | 289,080 (1.64×) | **1.64×** |
+| Rebuild, idle array, MiB/s (busy cores) | 370 (3.8) | 384 (2.7) | 610 (3.9) | **1.65×** |
+| Rebuild under a 1 MiB sequential read, MiB/s | 324 | 239 (0.74×) | 335 (1.03×) | **1.03×** |
+| … and the foreground read it served, MiB/s | 1,247 | 3,400 (2.73×) | 2,740 (2.20×) | |
+
+**The better of the two layouts is at least tuned stock on every item**,
+both rebuild items included — the two where tuned stock led on NVMe, idle
+and under a foreground read, in the 2026-09-17 run below.  Under that load
+the declustered population now rebuilds at stock's rate while serving 2.2×
+its read.  Rotating rebuilds under that load at 0.74× stock's rate, but
+it is serving 2.7× the read on half the cores (3.1 against 6.2) — a different
+operating point, which `rk_row_rebuild_workers` moves.  On an idle array the
+row rebuild now beats tuned stock on both layouts — rotating on fewer cores —
+and writes the rebuilt member in 128 KiB pieces.  Degraded reads reach the members as
+128 KiB rows on both raidkm layouts against stock's 13.4 KiB.  Each arm's two
+rounds agree within 4%; the sequential write on the declustered arm sits at
+this instance's write ceiling (2,917 MiB/s at cv 0.0%).  The command above
+reproduces every number, plus p99 latency, busy cores and each run in
+execution order.
+
+#### Stock as it ships vs tuned stock vs raidkm (2026-09-17)
 
 Stock md as it ships, stock md with raidkm's default knobs set by hand, and
 raidkm, on the same members in one run (2026-09-17).  8+2 (`raid6` /
@@ -219,7 +273,8 @@ default: on the same instance an idle rebuild went from 279 to 386 MiB/s on
 the NVMe members (385 with 16 rows, the rate one local SSD writes) and from
 459 to 757 MiB/s on null_blk (+5% more with 16 rows, on twice the cores);
 under a foreground read, 8 rows rebuild as fast as 4 on NVMe and 1.3× faster
-on null_blk, for 5% less read.  The table above predates that change.  Under a foreground read raidkm
+on null_blk, for 5% less read.  The table above predates that change (the
+default is 16 rows now); the 2026-11-13 table has the current rebuild.  Under a foreground read raidkm
 serves 1.37× (NVMe) and 1.36× (null_blk) the read of tuned stock, and on
 null_blk also rebuilds 2.1× faster; on the NVMe it rebuilds at 0.75× of tuned
 stock while doing so.
@@ -360,6 +415,48 @@ survive power loss torn-write-free), a stronger guarantee than native or
 bitmap, both of which recompute checksums over the resync window after an
 unclean shutdown — that guarantee is what journal's ~2× write cost buys.
 Design + full write-up: `notes/native-checksum-read-redesign-2026-07-14.md`.
+
+#### With `--checksum` against tuned stock (2026-11-13)
+
+The same rig, method and workloads as *Current release vs tuned stock, both
+layouts* above, in one run of five arms on a second instance of the same
+type: tuned stock, both raidkm layouts without checksums, and both with
+`--checksum=crc32c` (`tools/raidkm-ab-benchmark.sh
+--arms=raid6@10+tuned,raidkm2@10,raidkm2-csum@10,dcl2,dcl2-csum …`; a `-csum`
+arm zeroes the CRC region's room at each member's tail before its create).
+"Cost" is the layout with checksums over the same layout without, in the same
+run:
+
+| Workload | rotating + csum vs tuned stock | cost of csum | declustered + csum vs tuned stock | cost of csum |
+|---|---|---|---|---|
+| Random 4K write | 0.96× | 0.97 | **1.01×** | 0.95 |
+| 70/30 4K, 16 jobs | 0.97× | 0.97 | **1.02×** | 0.96 |
+| OLTP 70/30 16K | 0.97× | 0.99 | **1.14×** | 1.00 |
+| Sequential 1 MiB write | **1.00×** | 1.00 | **1.00×** | 1.00 |
+| Sequential 1 MiB read | **1.00×** | 1.02 | **1.08×** | 1.00 |
+| Degraded sequential 1 MiB read | **1.10×** | 1.01 | **1.23×** | 1.01 |
+| Degraded random 4K read | **1.45×** | 1.00 | **1.65×** | 1.00 |
+| Rebuild, idle array (busy cores) | **1.04×** (3.1) | 1.00 | **1.74×** (4.9) | 0.99 |
+| Rebuild under a sequential read | 0.78× at 2.59× the read | 1.01 | **1.07×** at 2.27× the read | 0.95 |
+
+**Checksums cost at most 5% of throughput and of the rebuild rate** —
+several items land inside noise either way — on a few tenths of a core to
+one core more: a sequential read that took 0.3 busy cores takes 1.0, an idle
+rebuild 4.2 → 4.9 (declustered).  With them on, the declustered layout still
+clears tuned stock — which verifies nothing — on every item.  Both numbers
+depend on two changes in this release: the row layer no longer computes a
+chunk's CRCs under the CRC cache's shard lock (a region page covers ~32
+chunks, so a population's 32 workers queued on one mutex: a `--checksum`
+populate ran at 0.54× of the same populate without, on 3× the cores), and
+raidkm takes its own `crc32c` transform at module load (where libcrc32c is
+built in and `crc32c-intel` is a module, as on RHEL 9 and 10, the library
+binds the table-driven generic CRC at boot and keeps it).  The release
+carries one more change on that path, made after this run: the row layer
+looks up a chunk's stored CRCs under one hold of the lock, drops it, and
+CRCs only the blocks that have one — it removes work, so it can only help
+these numbers.  Before the first two, the same comparison measured a 0–9%
+cost, 0.77–0.86× the idle rebuild rate and 3–4× its cores.  No region page
+was rotted and no block mismatched in any run.
 
 ### Cost of `--grow --add-data` (online capacity grow)
 
@@ -1260,6 +1357,7 @@ md-kmec/
 │   │                                    # and Test-7L rebuild under a foreground load
 │   ├── raidkm-ab-benchmark.sh         # A/B vs stock md on the same disks:
 │   │                                    # raw / raid6 / raid6-intree / raidkm<M> / dcl<M>,
+│   │                                    # raidkm<M>-csum / dcl<M>-csum (--checksum),
 │   │                                    # <arm>+tuned (stock with raidkm's knobs),
 │   │                                    # --degraded, --rebuild-load,
 │   │                                    # ABBA order + discarded warm-up pass,

@@ -65,6 +65,8 @@
  * above).  raid_km.c's native-checksum paths still call crc32c_le().
  */
 #define crc32c_le(crc, data, length)	crc32c((crc), (data), (length))
+/* ... and it is the arch-accelerated CRC (6.14+): raidkm takes no transform */
+#define RAIDKM_CRC32C_LIB_ACCEL	1
 
 /*
  * 7.0 removed md_sync_acct(): the per-disk sync_io accounting it fed was

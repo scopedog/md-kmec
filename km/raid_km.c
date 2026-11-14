@@ -48,6 +48,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/crc32c.h>
+#include <crypto/hash.h>
 #include <linux/xarray.h>
 #include <linux/highmem.h>
 #include <linux/mm.h>
@@ -2207,11 +2208,63 @@ static inline u32 raidkm_csum_fold(u32 crc)
 	return crc == RAIDKM_CSUM_ZERO_MARK ? RAIDKM_CSUM_ZERO_MARK - 1 : crc;
 }
 
+/*
+ * CRC-32C for the native checksums, through raidkm's own "crc32c" shash.
+ * The library crc32c() is no faster where libcrc32c is built in and the
+ * arch driver is a module -- RHEL 9 and 10 (LIBCRC32C=y, CRC32C_INTEL=m):
+ * libcrc32c takes its transform at boot, before crc32c-intel can load, and
+ * stays on the table-driven crc32c-generic for good.  A transform taken when
+ * raidkm loads gets the best driver there is (crc32c-intel: crc32 + PCLMUL;
+ * crc32-arm64), several times the generic rate; the checksum region and the
+ * verify of every read and rebuild run on it.  Same function, same value:
+ * the drivers' update is the raw CRC from the seed, as crc32c_le() is.
+ * Callable in any context: crc32c-intel takes the FPU only where SIMD is
+ * usable and otherwise uses the crc32 instruction.  NULL (allocation failed)
+ * falls back to crc32c_le().
+ */
+#ifdef RAIDKM_CRC32C_LIB_ACCEL
+/* the library crc32c() is the arch driver already (6.14+): nothing to pick */
+static inline u32 raidkm_crc32c(u32 crc, const void *buf, unsigned int len)
+{
+	return crc32c_le(crc, buf, len);
+}
+#else
+static struct crypto_shash *raidkm_crc32c_tfm;
+
+/*
+ * ext4's form (before 6.15) rather than SHASH_DESC_ON_STACK's ~400 B, which
+ * would land in the endio and stripe-handling frames: the drivers' context
+ * is the bare u32 CRC.  raidkm_crc32c_init() checks the context size and the
+ * results against crc32c_le() before it keeps the transform.
+ */
+struct raidkm_crc32c_desc {
+	struct shash_desc shash;
+	u32 ctx;
+};
+
+static u32 raidkm_crc32c(u32 crc, const void *buf, unsigned int len)
+{
+	struct crypto_shash *tfm = raidkm_crc32c_tfm;
+
+	BUILD_BUG_ON(offsetof(struct raidkm_crc32c_desc, ctx) !=
+		     offsetof(struct shash_desc, __ctx));
+	if (tfm) {
+		struct raidkm_crc32c_desc desc;
+
+		desc.shash.tfm = tfm;
+		desc.ctx = crc;
+		if (!crypto_shash_update(&desc.shash, buf, len))
+			return desc.ctx;
+	}
+	return crc32c_le(crc, buf, len);
+}
+#endif
+
 static u32 raidkm_block_crc(struct r5conf *conf, struct page *page,
 			    unsigned int offset)
 {
 	void *addr = kmap_local_page(page);
-	u32 crc = crc32c_le(0, addr + offset, RAID5_STRIPE_SIZE(conf));
+	u32 crc = raidkm_crc32c(0, addr + offset, RAID5_STRIPE_SIZE(conf));
 
 	kunmap_local(addr);
 	return raidkm_csum_fold(crc);
@@ -2654,7 +2707,7 @@ static void raidkm_csum_snapshot(struct r5conf *conf,
 		g = 1;
 	conf->csum_gen = g;
 	tr->gen = cpu_to_le32(g);
-	tr->self_crc = cpu_to_le32(crc32c_le(0, crcs, RAIDKM_CSUM_BODY));
+	tr->self_crc = cpu_to_le32(raidkm_crc32c(0, crcs, RAIDKM_CSUM_BODY));
 }
 
 /* Snapshot-and-write a dirty page to its region.  DIRTY is cleared under
@@ -3115,7 +3168,7 @@ static struct raidkm_csum_page *raidkm_csum_install(struct raidkm_csum_shard *s,
 		if (le32_to_cpu(tr->gen) == 0) {
 			clear_page(crcs);			/* never written */
 		} else if (le32_to_cpu(tr->self_crc) !=
-			   crc32c_le(0, crcs, RAIDKM_CSUM_BODY)) {
+			   raidkm_crc32c(0, crcs, RAIDKM_CSUM_BODY)) {
 			pr_warn_ratelimited("md/raid:%s: native csum region page rotted (disk %lu page %lu); slots absent, will re-derive\n",
 				mdname(conf->mddev), key >> 40,
 				key & ((1UL << 40) - 1));
@@ -11426,7 +11479,7 @@ static int raidkm_csum_verify_abio(struct r5conf *conf, struct bio *bio,
 			unsigned int n = min_t(unsigned int, len,
 					       RAID5_STRIPE_SIZE(conf) - done);
 
-			crc = crc32c_le(crc, addr + off, n);
+			crc = raidkm_crc32c(crc, addr + off, n);
 			done += n;
 			off += n;
 			len -= n;
@@ -11725,8 +11778,20 @@ static inline unsigned int raidkm_row_csum_align(struct r5conf *conf)
 
 static inline u32 raidkm_row_block_crc(struct r5conf *conf, const void *buf)
 {
-	return raidkm_csum_fold(crc32c_le(0, buf, RAID5_STRIPE_SIZE(conf)));
+	return raidkm_csum_fold(raidkm_crc32c(0, buf, RAID5_STRIPE_SIZE(conf)));
 }
+
+/*
+ * Blocks raidkm_row_csum_check() looks up under one hold of the shard lock
+ * before it CRCs, with the lock dropped, those that have a stored CRC.  The
+ * buffer is the caller's own, so its CRCs need no lock; only the lookups do.
+ * Computing them under the lock serialised every row on one region page
+ * (1022 blocks: ~32 chunks of 128 KiB) behind each other's CRC work -- a
+ * declustered population's 32 workers spent most of their CPU spinning on
+ * that mutex.  Looking up first keeps the old short-circuit: a block with no
+ * stored CRC (never written, being discarded) is not CRC'd at all.
+ */
+#define RAIDKM_ROW_CSUM_BATCH	32
 
 /*
  * Verify [asect, asect + len) of physical member `member`, whose content is
@@ -11743,34 +11808,54 @@ static int raidkm_row_csum_check(struct r5conf *conf, int member,
 				 unsigned int len)
 {
 	unsigned long blk = raidkm_csum_blkidx(conf, asect);
-	unsigned int bsize = RAID5_STRIPE_SIZE(conf), off;
-	struct raidkm_csum_shard *s = NULL;
+	unsigned int bsize = RAID5_STRIPE_SIZE(conf), off = 0, n, i;
+	u32 want[RAIDKM_ROW_CSUM_BATCH];
+	DECLARE_BITMAP(have, RAIDKM_ROW_CSUM_BATCH);
 	int ret = 0;
 
 	if (!conf->csum || raidkm_csum_rederive(conf))
 		return 0;		/* resync window: stored CRCs are stale */
 
-	for (off = 0; off < len; off += bsize, blk++) {
-		struct raidkm_csum_shard *ns =
-			raidkm_csum_shard_for(conf->csum, blk);
-		u32 want;
+	while (!ret && off < len) {
+		struct raidkm_csum_shard *s = NULL;
 
-		/* consecutive blocks share a shard until the region page
-		 * changes, so this takes the mutex once per region page */
-		if (ns != s) {
-			if (s)
-				mutex_unlock(&s->lock);
-			s = ns;
-			mutex_lock(&s->lock);
-		}
-		if (raidkm_csum_expected(s, member, blk, &want) &&
-		    want != raidkm_row_block_crc(conf, buf + off)) {
+		n = min_t(unsigned int, RAIDKM_ROW_CSUM_BATCH,
+			  (len - off) / bsize);
+		if (WARN_ON_ONCE(!n)) {
+			/* spans are whole CRC blocks; a partial tail is
+			 * unverified, not clean: the stripe cache checks it */
 			ret = -EBADMSG;
 			break;
 		}
+		bitmap_zero(have, RAIDKM_ROW_CSUM_BATCH);
+		for (i = 0; i < n; i++, blk++) {
+			struct raidkm_csum_shard *ns =
+				raidkm_csum_shard_for(conf->csum, blk);
+
+			/* consecutive blocks share a shard until the region
+			 * page changes: the mutex once per page per batch */
+			if (ns != s) {
+				if (s)
+					mutex_unlock(&s->lock);
+				s = ns;
+				mutex_lock(&s->lock);
+			}
+			if (raidkm_csum_expected(s, member, blk, &want[i]))
+				__set_bit(i, have);
+		}
+		if (s)
+			mutex_unlock(&s->lock);
+		/* a CRC stored since the lookup is a write racing this read:
+		 * the mismatch is not trusted (see above) */
+		for_each_set_bit(i, have, n) {
+			if (raidkm_row_block_crc(conf, buf + off + i * bsize) !=
+			    want[i]) {
+				ret = -EBADMSG;
+				break;
+			}
+		}
+		off += n * bsize;
 	}
-	if (s)
-		mutex_unlock(&s->lock);
 	return ret;
 }
 
@@ -15230,7 +15315,7 @@ static void raidkm_row_write_go(struct mddev *mddev,
 		raidkm_row_encode(conf, run, k, m, w->src, w->dst);
 		if (conf->csum)
 			for (i = 0; i < k; i++)
-				w->crc[i] = crc32c_le(w->crc[i], w->src[i], run);
+				w->crc[i] = raidkm_crc32c(w->crc[i], w->src[i], run);
 		for (i = 0; i < k; i++)
 			bio_advance_iter_single(raid_bio, &w->it[i], run);
 		done += run;
@@ -26146,18 +26231,90 @@ static struct md_personality raid_km_personality =
 	.prepare_suspend = raid5_prepare_suspend,
 };
 
+#ifdef RAIDKM_CRC32C_LIB_ACCEL
+static void raidkm_crc32c_init(void) { }
+static void raidkm_crc32c_exit(void) { }
+#else
+/*
+ * Keep the transform only if it computes what crc32c_le() does: seeds that
+ * are and are not inverted, lengths across the drivers' byte, word and
+ * folding (>= 512 B) paths, aligned and not.  A driver whose context is not
+ * the bare CRC, or whose update is not the raw CRC from the seed, would
+ * otherwise write CRCs no other kernel verifies.
+ */
+static bool raidkm_crc32c_selftest(struct crypto_shash *tfm)
+{
+	static const u32 seeds[] = { 0, ~0U, 0x12345678 };
+	static const unsigned int lens[] = { 1, 7, 64, 513, 1000, 4096 };
+	unsigned int s, l, o, i;
+	bool ok = true;
+	u8 *buf;
+
+	if (crypto_shash_descsize(tfm) != sizeof(u32))
+		return false;
+	buf = kmalloc(4096 + 1, GFP_KERNEL);
+	if (!buf)
+		return false;
+	for (i = 0; i < 4096 + 1; i++)
+		buf[i] = i * 131 + (i >> 8);
+	for (s = 0; s < ARRAY_SIZE(seeds) && ok; s++)
+		for (l = 0; l < ARRAY_SIZE(lens) && ok; l++)
+			for (o = 0; o < 2 && ok; o++)
+				ok = raidkm_crc32c(seeds[s], buf + o, lens[l]) ==
+				     crc32c_le(seeds[s], buf + o, lens[l]);
+	kfree(buf);
+	return ok;
+}
+
+static void raidkm_crc32c_init(void)
+{
+	struct crypto_shash *tfm;
+
+	/* insmod skips MODULE_SOFTDEP: load the arch driver (crc32c-intel)
+	 * now, or the allocation gets the built-in crc32c-generic for good */
+	request_module("crypto-crc32c");
+	tfm = crypto_alloc_shash("crc32c", 0, 0);
+	if (IS_ERR(tfm)) {
+		pr_warn("md/raidkm: no crc32c transform (%ld); native checksums use crc32c_le()\n",
+			PTR_ERR(tfm));
+		return;
+	}
+	raidkm_crc32c_tfm = tfm;
+	if (!raidkm_crc32c_selftest(tfm)) {
+		pr_warn("md/raidkm: %s disagrees with crc32c_le(); native checksums use crc32c_le()\n",
+			crypto_shash_driver_name(tfm));
+		raidkm_crc32c_tfm = NULL;
+		crypto_free_shash(tfm);
+		return;
+	}
+	pr_info("md/raidkm: native checksums use %s\n",
+		crypto_shash_driver_name(tfm));
+}
+
+static void raidkm_crc32c_exit(void)
+{
+	if (raidkm_crc32c_tfm)
+		crypto_free_shash(raidkm_crc32c_tfm);
+	raidkm_crc32c_tfm = NULL;
+}
+#endif
+
 static int __init raid5_init(void)
 {
 	int ret;
 
+	raidkm_crc32c_init();
 	raid5_wq = alloc_workqueue("raidkmwq",
 		WQ_UNBOUND|WQ_MEM_RECLAIM|WQ_CPU_INTENSIVE|WQ_SYSFS, 0);
-	if (!raid5_wq)
+	if (!raid5_wq) {
+		raidkm_crc32c_exit();
 		return -ENOMEM;
+	}
 	raidkm_row_wq = alloc_workqueue("raidkm_row",
 		WQ_UNBOUND|WQ_MEM_RECLAIM|WQ_CPU_INTENSIVE|WQ_SYSFS, 0);
 	if (!raidkm_row_wq) {
 		destroy_workqueue(raid5_wq);
+		raidkm_crc32c_exit();
 		return -ENOMEM;
 	}
 
@@ -26168,6 +26325,7 @@ static int __init raid5_init(void)
 	if (ret < 0) {
 		destroy_workqueue(raidkm_row_wq);
 		destroy_workqueue(raid5_wq);
+		raidkm_crc32c_exit();
 		return ret;
 	}
 	raid_km_cpuhp_state = ret;
@@ -26181,6 +26339,7 @@ static void raid5_exit(void)
 	cpuhp_remove_multi_state(raid_km_cpuhp_state);
 	destroy_workqueue(raidkm_row_wq);
 	destroy_workqueue(raid5_wq);
+	raidkm_crc32c_exit();
 }
 
 module_init(raid5_init);
@@ -26190,3 +26349,7 @@ MODULE_DESCRIPTION("raidkm — k+m Reed-Solomon md personality (fork of raid5.c)
 MODULE_ALIAS("md-personality-71");
 MODULE_ALIAS("md-raidkm");
 MODULE_ALIAS("md-level-71");
+#ifndef RAIDKM_CRC32C_LIB_ACCEL
+/* the best crc32c driver (crc32c-intel) loaded before raidkm_crc32c_init() */
+MODULE_SOFTDEP("pre: crc32c");
+#endif

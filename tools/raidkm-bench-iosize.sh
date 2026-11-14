@@ -146,7 +146,7 @@ rk_resolve_mdadm || exit 1
 
 CSUM_OPT=""
 if [ "$CSUM" = 1 ]; then
-	grep -qa checksum "$MDADM" ||
+	grep -qa -- '--checksum' "$MDADM" ||
 		die "--checksum: this mdadm has no native-checksum support (build the fork)"
 	CSUM_OPT="--checksum"
 fi
