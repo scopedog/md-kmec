@@ -39,6 +39,7 @@
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/raid/pq.h>
+#include <linux/raid/xor.h>
 #include <linux/async_tx.h>
 #include <linux/module.h>
 #include <linux/async.h>
@@ -5609,6 +5610,21 @@ ops_run_compute5(struct stripe_head *sh, struct raid5_percpu *percpu)
 	return tx;
 }
 
+/*
+ * Does this stripe encode, update and scrub its parity with ISA-L rather than
+ * raid6's P+Q routines?  Always at m > 2.  At m == 2 when the stripe holds
+ * fewer than 2 data blocks: a declustered group of width m + 1 (k == 1),
+ * which raid6 cannot take -- async_syndrome_val BUG()s below 4 disks and
+ * gen_syndrome's unrolled loops read before ptrs[0] (raidkm_row_encode()
+ * makes the same choice).  ISA-L's m == 2 matrix is raid6's (P = XOR,
+ * Q = sum 2^d D_d), so the parity bytes are the same either way.  The scrub
+ * pair ops_run_check_pq / handle_parity_checks6 must agree on this.
+ */
+static inline bool raidkm_sh_isal(struct r5conf *conf, struct stripe_head *sh)
+{
+	return conf->m > 2 || sh->disks - raidkm_sh_m(sh) < 2;
+}
+
 /* set_syndrome_sources - populate source buffers for gen_syndrome
  * @srcs - (struct page *) array of size sh->disks
  * @offs - (unsigned int) array of offset for each page
@@ -5732,7 +5748,291 @@ struct raidkm_decode_scratch {
 	unsigned char dtbls1[RAIDKM_MAX_STRIPE_DISKS * 32];	/* one-row table */
 	int srcsl[RAIDKM_MAX_STRIPE_DISKS];			/* survivor slot list */
 	unsigned char *src[RAIDKM_MAX_STRIPE_DISKS];		/* survivor data ptrs */
+	void *pw[RAIDKM_MAX_STRIPE_DISKS + 2];	/* raidkm_decode_q() work ptrs */
 };
+
+/*
+ * Fast decode paths.  A decode or re-encode row whose coefficients are all
+ * 0 or 1 is a plain XOR of the sources with coefficient 1, so it needs no
+ * GF(2^8) multiply.  With the Vandermonde generator (m <= 3, which includes
+ * m == 2) the first parity row is all ones (P is the XOR of the data), so the
+ * common single-failure cases are such rows:
+ *   - a lost data block, decoded from the other k - 1 data blocks and P;
+ *   - a lost P, re-encoded from the k data blocks.
+ * The kernel's xor_blocks() does these with SSE/AVX2/NEON on any CPU.  The GF
+ * path would instead run ISA-L's scalar ec_encode_data_base on CPUs without
+ * GFNI (the patent-cleared ISA-L has no PSHUFB kernels), which costs several
+ * times more CPU.
+ *
+ * At m == 2 the remaining single-failure row is a lost Q re-encoded from the
+ * data: raidkm_decode_q() runs it through raid6's gen_syndrome, the shift and
+ * conditional-XOR (MULTBY2) SIMD loop raidkm already encodes m == 2 parity
+ * with — no table lookup.  So a single member lost at m == 2 rebuilds with no
+ * GF table math at all.  Other rows (a lost R at m == 3, two lost blocks, any
+ * Cauchy row at m >= 4) keep the GF path.  Results are identical by
+ * construction.
+ *
+ * raidkm_ec_row() is the one single-row decode / re-encode every site uses
+ * (stripe-cache decode and parity re-encode, row decode, the stripe-cache
+ * rebuild's parity re-encode, the m > 2 scrub, the reshape band decode), so
+ * all of them take the fast paths.  The multi-row write-path encodes do not:
+ * at m == 2 they already run raid6's gen_syndrome.
+ *
+ * fast_decode: -1 (default) uses the fast paths only on CPUs without GFNI,
+ * where they save the most; with GFNI the GF kernels already run near memory
+ * speed and are left as they were.  1 uses them on every CPU (tests, A/B),
+ * 0 never (A/B and escape hatch).  The decode_xor/decode_syndrome/decode_gf
+ * counters (4 KiB blocks done each way, summed over CPUs) let tests check
+ * which path ran.
+ */
+static int raidkm_fast_decode_mode = -1;
+module_param_named(fast_decode, raidkm_fast_decode_mode, int, 0644);
+MODULE_PARM_DESC(fast_decode,
+		 "XOR / raid6-syndrome decode where the coefficients allow: -1 = only on CPUs without GFNI (default), 0 = never, 1 = always");
+
+/* 4 KiB blocks done each way, per CPU; read as module parameters */
+static DEFINE_PER_CPU(u64, raidkm_decode_xor_cnt);
+static DEFINE_PER_CPU(u64, raidkm_decode_syn_cnt);
+static DEFINE_PER_CPU(u64, raidkm_decode_gf_cnt);
+
+static u64 raidkm_decode_cnt_sum(u64 __percpu *cnt)
+{
+	u64 sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += *per_cpu_ptr(cnt, cpu);
+	return sum;
+}
+
+/* read-only counters; a value given at module load is refused, not used
+ * (parse_one() calls ->set without checking it) */
+static int raidkm_decode_cnt_set(const char *val, const struct kernel_param *kp)
+{
+	return -EPERM;
+}
+
+#define RAIDKM_DECODE_CNT_PARAM(name, cnt, desc)				\
+static int raidkm_##name##_get(char *buf, const struct kernel_param *kp)	\
+{										\
+	return sysfs_emit(buf, "%llu\n", raidkm_decode_cnt_sum(&cnt));		\
+}										\
+static const struct kernel_param_ops raidkm_##name##_ops = {			\
+	.set = raidkm_decode_cnt_set,						\
+	.get = raidkm_##name##_get,						\
+};										\
+module_param_cb(name, &raidkm_##name##_ops, NULL, 0444);			\
+MODULE_PARM_DESC(name, desc)
+
+RAIDKM_DECODE_CNT_PARAM(decode_xor, raidkm_decode_xor_cnt,
+			"4 KiB blocks decoded or re-encoded with plain XOR");
+RAIDKM_DECODE_CNT_PARAM(decode_syndrome, raidkm_decode_syn_cnt,
+			"4 KiB blocks of m=2 parity re-encoded with raid6 gen_syndrome");
+RAIDKM_DECODE_CNT_PARAM(decode_gf, raidkm_decode_gf_cnt,
+			"4 KiB blocks decoded or re-encoded with GF(2^8) tables");
+
+static inline void raidkm_decode_count(u64 __percpu *cnt, size_t len)
+{
+	this_cpu_add(*cnt, DIV_ROUND_UP(len, 4096));
+}
+
+static bool raidkm_fast_decode_on(void)
+{
+	int mode = READ_ONCE(raidkm_fast_decode_mode);
+
+	return mode > 0 ||
+	       (mode < 0 && !isal_have_gfni() && !isal_have_avx512_gfni());
+}
+
+/*
+ * dst = XOR of src[j] over the j with row[j] == 1, if every row[j] is 0 or 1.
+ * Returns false, leaving dst alone, when the row needs GF math, when no
+ * coefficient is 1, when the fast paths are off, or when len (0 included) or
+ * an address does not suit xor_blocks() (x86 AVX: 512-byte lines, aligned
+ * loads).
+ * dst must not be one of the sources.
+ */
+static bool raidkm_decode_xor(const unsigned char *row, int k,
+			      unsigned char **src, unsigned char *dst,
+			      size_t len)
+{
+	void *xs[MAX_XOR_BLOCKS];
+	unsigned long align = (unsigned long)dst | len;
+	int j, first = -1, n = 0;
+
+	if (!len || len > UINT_MAX || !raidkm_fast_decode_on())
+		return false;
+	for (j = 0; j < k; j++) {
+		if (row[j] > 1)
+			return false;
+		if (row[j]) {
+			if (first < 0)
+				first = j;
+			align |= (unsigned long)src[j];
+		}
+	}
+	if (first < 0 || (align & 63) || (len & 511))
+		return false;
+
+	memcpy(dst, src[first], len);
+	for (j = first + 1; j < k; j++) {
+		if (!row[j])
+			continue;
+		xs[n++] = src[j];
+		if (n == MAX_XOR_BLOCKS) {
+			xor_blocks(n, len, dst, xs);
+			n = 0;
+		}
+	}
+	if (n)
+		xor_blocks(n, len, dst, xs);
+	raidkm_decode_count(&raidkm_decode_xor_cnt, len);
+	return true;
+}
+
+/*
+ * gen_syndrome's preconditions: at least 2 data blocks (raid6 wants 4 disks;
+ * its singly-unrolled kernels read ptrs[-1] at 3 — reachable on a declustered
+ * group of width m + 1, k == 1, as raidkm_row_encode() notes), 64-byte aligned
+ * buffers, 512-byte multiples.
+ */
+static bool raidkm_syndrome_ok(int k, unsigned char **src,
+			       unsigned long addrs, size_t len)
+{
+	int j;
+
+	if (k < 2)
+		return false;
+	for (j = 0; j < k; j++)
+		addrs |= (unsigned long)src[j];
+	return !(addrs & 63) && len && !(len & 511);
+}
+
+/*
+ * m == 2 only: P and Q of the k data blocks src[] into pdst and qdst with one
+ * raid6 gen_syndrome pass (MULTBY2, no table lookup) — both parities lost.
+ * @pw has room for k + 2 pointers.  Returns false, writing nothing, when the
+ * fast paths are off or a length or address does not suit the SIMD loops.
+ */
+static bool raidkm_encode_pq2(int k, unsigned char **src, unsigned char *pdst,
+			      unsigned char *qdst, size_t len, void **pw)
+{
+	int j;
+
+	if (!raidkm_fast_decode_on() ||
+	    !raidkm_syndrome_ok(k, src, (unsigned long)pdst |
+				(unsigned long)qdst, len))
+		return false;
+	for (j = 0; j < k; j++)
+		pw[j] = src[j];
+	pw[k] = pdst;
+	pw[k + 1] = qdst;
+	raid6_call.gen_syndrome(k + 2, len, pw);
+	raidkm_decode_count(&raidkm_decode_syn_cnt, 2 * len);
+	return true;
+}
+
+/*
+ * m == 2 only: dst = Q of the k data blocks src[], through raid6's
+ * gen_syndrome.  gen_syndrome also writes P, which goes to @scratch
+ * (@scratch_len bytes at a time); a NULL @scratch means allocate one here, up
+ * to 64 KiB (so a chunk-sized row takes a few passes, not one per page).
+ * @pw has room for k + 2 pointers.  Returns false, leaving dst alone, when
+ * the fast paths are off, no scratch could be had, or a length or address
+ * does not suit the SIMD loops.
+ */
+static bool raidkm_decode_q(int k, unsigned char **src, unsigned char *dst,
+			    size_t len, unsigned char *scratch,
+			    size_t scratch_len, void **pw)
+{
+	struct page *page = NULL;
+	unsigned int order = 0;
+	size_t off, piece;
+	int j;
+
+	if (!raidkm_fast_decode_on() ||
+	    !raidkm_syndrome_ok(k, src, (unsigned long)dst, len))
+		return false;
+	if (!scratch) {
+		order = min_t(unsigned int, get_order(len), get_order(SZ_64K));
+		page = alloc_pages(GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY,
+				   order);
+		if (!page && order) {
+			order = 0;
+			page = alloc_page(GFP_NOIO | __GFP_NOWARN);
+		}
+		if (!page)
+			return false;
+		scratch = page_address(page);
+		scratch_len = PAGE_SIZE << order;
+	}
+	if (((unsigned long)scratch | scratch_len) & 511) {
+		if (page)
+			__free_pages(page, order);
+		return false;
+	}
+
+	for (off = 0; off < len; off += piece) {
+		piece = min(scratch_len, len - off);
+		for (j = 0; j < k; j++)
+			pw[j] = src[j] + off;
+		pw[k] = scratch;
+		pw[k + 1] = dst + off;
+		raid6_call.gen_syndrome(k + 2, piece, pw);
+	}
+	if (page)
+		__free_pages(page, order);
+	raidkm_decode_count(&raidkm_decode_syn_cnt, len);
+	return true;
+}
+
+/*
+ * raidkm_ec_row - the single-row decode / re-encode every site uses:
+ * dst = the GF(2^8) dot product of one coefficient row with k sources.
+ *   @row            the k raw coefficients
+ *   @g_gfni/@g_base the row's precomputed ISA-L tables, or NULL to build them
+ *                   from @row into @tbuf (k * 32 bytes)
+ *   @q2             the row is Q of an m == 2 array and @src are its k data
+ *                   blocks in order (the gen_syndrome path may take it)
+ *   @scratch/@scratch_len  P scratch for that path, or NULL to allocate
+ *   @pw             k + 2 work pointers for that path
+ * Tries the plain XOR, then (q2) gen_syndrome, then the GF tables: GFNI when
+ * the CPU has it, else ISA-L's scalar base code.  dst must not be a source.
+ */
+static void raidkm_ec_row(const unsigned char *row, int k,
+			  unsigned char **src, unsigned char *dst, size_t len,
+			  const unsigned char *g_gfni,
+			  const unsigned char *g_base, unsigned char *tbuf,
+			  bool q2, unsigned char *scratch, size_t scratch_len,
+			  void **pw)
+{
+	unsigned char *d1[1] = { dst };
+
+	if (raidkm_decode_xor(row, k, src, dst, len))
+		return;
+	if (q2 && pw &&
+	    raidkm_decode_q(k, src, dst, len, scratch, scratch_len, pw))
+		return;
+	raidkm_decode_count(&raidkm_decode_gf_cnt, len);
+	if (isal_have_avx512_gfni() || isal_have_gfni()) {
+		if (!g_gfni) {
+			ec_init_tables_gfni(k, 1, (unsigned char *)row, tbuf);
+			g_gfni = tbuf;
+		}
+		if (isal_have_avx512_gfni())
+			ec_encode_data_avx512_gfni(len, k, 1,
+				(unsigned char *)g_gfni, src, d1);
+		else
+			ec_encode_data_avx2_gfni(len, k, 1,
+				(unsigned char *)g_gfni, src, d1);
+	} else {
+		if (!g_base) {
+			ec_init_tables_base(k, 1, (unsigned char *)row, tbuf);
+			g_base = tbuf;
+		}
+		ec_encode_data_base(len, k, 1, (unsigned char *)g_base, src, d1);
+	}
+}
 
 static struct dma_async_tx_descriptor *
 ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
@@ -5768,11 +6068,19 @@ ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
 		goto complete;
 
 	/* k surviving uptodate slots to decode from.  fetch_block only
-	 * requests this compute once at least k survivors are UPTODATE. */
-	for (i = 0; i < disks && nsrc < k; i++)
+	 * requests this compute once at least k survivors are UPTODATE.
+	 * Take them in generator-row order: the data slots, then the parity
+	 * slots P, Q, ...  With one data block lost the set is then the other
+	 * k - 1 data blocks plus P, whose decode row is all ones (a plain XOR,
+	 * raidkm_decode_xor()); a set holding Q in place of P would need GF
+	 * math.  Any k independent survivors decode correctly either way. */
+	for (j = 0; j < k + m && nsrc < k; j++) {
+		i = j < k ? raidkm_data_slot(sh, j) :
+			    raidkm_parity_slot(sh, j - k);
 		if (!test_bit(R5_Wantcompute, &sh->dev[i].flags) &&
 		    test_bit(R5_UPTODATE, &sh->dev[i].flags))
 			srcsl[nsrc++] = i;
+	}
 	if (nsrc < k) {
 		/*
 		 * A decode source vanished between fetch_block requesting this
@@ -5859,7 +6167,6 @@ ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
 	for (p = 0; p < nmiss; p++) {
 		int s = miss[p];
 		int d;
-		unsigned char *d1[1];
 
 		if (is_parity_disk(sh, s)) {
 			have_parity_miss = true;
@@ -5868,49 +6175,62 @@ ops_run_compute_km(struct stripe_head *sh, struct raid5_percpu *percpu,
 		d = raidkm_data_index(sh, s);
 		for (j = 0; j < k; j++)
 			row1[j] = inv[d * k + j];
-		d1[0] = page_address(sh->dev[s].page) + sh->dev[s].offset;
-		if (isal_have_avx512_gfni()) {
-			ec_init_tables_gfni(k, 1, row1, dtbls1);
-			ec_encode_data_avx512_gfni(bytes, k, 1, dtbls1, src, d1);
-		} else if (isal_have_gfni()) {
-			ec_init_tables_gfni(k, 1, row1, dtbls1);
-			ec_encode_data_avx2_gfni(bytes, k, 1, dtbls1, src, d1);
-		} else {
-			ec_init_tables_base(k, 1, row1, dtbls1);
-			ec_encode_data_base(bytes, k, 1, dtbls1, src, d1);
-		}
+		raidkm_ec_row(row1, k, src,
+			      page_address(sh->dev[s].page) + sh->dev[s].offset,
+			      bytes, NULL, NULL, dtbls1, false, NULL, 0, NULL);
 	}
 
 	/* missing PARITY slots: all data is present now, re-encode each */
 	if (have_parity_miss) {
 		unsigned char **data = src;	/* reuse the decode survivor buffer
 						 * (the decode is finished here) */
+		unsigned char *pdst = NULL, *qdst = NULL;
 
 		for (i = 0; i < k; i++) {
 			int slot = raidkm_data_slot(sh, i);
 			data[i] = page_address(sh->dev[slot].page) +
 				  sh->dev[slot].offset;
 		}
+
+		/* m == 2 with P and Q both lost: one gen_syndrome writes both */
+		if (m == 2) {
+			for (p = 0; p < nmiss; p++) {
+				int s = miss[p];
+				unsigned char *a = page_address(sh->dev[s].page) +
+						   sh->dev[s].offset;
+
+				if (s == raidkm_parity_slot(sh, 0))
+					pdst = a;
+				else if (s == raidkm_parity_slot(sh, 1))
+					qdst = a;
+			}
+			if (!(pdst && qdst &&
+			      raidkm_encode_pq2(k, data, pdst, qdst, bytes,
+						ks->pw)))
+				pdst = qdst = NULL;
+		}
 		for (p = 0; p < nmiss; p++) {
 			int s = miss[p];
 			int pj;			/* parity index of slot s */
 			size_t toff;
-			unsigned char *d1[1];
 
-			if (!is_parity_disk(sh, s))
-				continue;
+			if (!is_parity_disk(sh, s) || pdst)
+				continue;	/* data, or P+Q done above */
 			pj = (s - sh->pd_idx + disks) % disks;
 			toff = (size_t)pj * k * 32;
-			d1[0] = page_address(sh->dev[s].page) + sh->dev[s].offset;
-			if (isal_have_avx512_gfni())
-				ec_encode_data_avx512_gfni(bytes, k, 1,
-					raidkm_g_gfni(sh) + toff, data, d1);
-			else if (isal_have_gfni())
-				ec_encode_data_avx2_gfni(bytes, k, 1,
-					raidkm_g_gfni(sh) + toff, data, d1);
-			else
-				ec_encode_data_base(bytes, k, 1,
-					raidkm_g_base(sh) + toff, data, d1);
+			/* the generator's own row for parity pj (P: all ones);
+			 * Q at m == 2 may go to gen_syndrome, P into spare_page
+			 * (no allocation here: this runs under the percpu lock) */
+			raidkm_ec_row(raidkm_a_matrix(sh) + (size_t)(k + pj) * k,
+				      k, data,
+				      page_address(sh->dev[s].page) +
+				      sh->dev[s].offset, bytes,
+				      raidkm_g_gfni(sh) + toff,
+				      raidkm_g_base(sh) + toff, NULL,
+				      m == 2 && pj == 1 && percpu->spare_page,
+				      percpu->spare_page ?
+				      page_address(percpu->spare_page) : NULL,
+				      PAGE_SIZE, ks->pw);
 		}
 	}
 
@@ -6194,7 +6514,7 @@ ops_run_prexor6(struct stripe_head *sh, struct raid5_percpu *percpu,
 
 	count = set_syndrome_sources(blocks, offs, sh, SYNDROME_SRC_WANT_DRAIN);
 
-	if (is_raidkm(conf) && conf->m > 2) {
+	if (is_raidkm(conf) && raidkm_sh_isal(conf, sh)) {
 		/*
 		 * raid_km redesign: m > 2 prexor uses ec_encode_data_update
 		 * to fold the OLD data contribution out of parity in place.
@@ -6598,7 +6918,7 @@ void raidkm_compute_partial_parity(struct stripe_head *sh)
 	if (sh->reconstruct_state != reconstruct_state_drain_run)
 		return;
 
-	if (m == 2) {
+	if (m == 2 && k >= 2) {	/* raid6 wants at least 4 disks */
 		/*
 		 * P+Q over the UPTODATE (not-overwritten) data via raid6_call;
 		 * zero-page fill for non-contributing slots preserves the 2^i
@@ -6669,7 +6989,9 @@ void raidkm_ppl_encode_modified(struct r5conf *conf, void **src,
 	int m = conf->m;
 	int k = conf->raid_disks - conf->max_degraded;
 
-	if (m == 2) {
+	/* raid6 wants at least 4 disks: k == 1 takes ISA-L, as
+	 * raidkm_compute_partial_parity() does, so both sides agree */
+	if (m == 2 && k >= 2) {
 		void *ptrs[RAIDKM_MAX_STRIPE_DISKS];
 		int c;
 
@@ -6738,7 +7060,7 @@ again:
 		list_first_entry(&sh->batch_list,
 				 struct stripe_head, batch_list) == head_sh;
 
-	if (is_raidkm(sh->raid_conf) && sh->raid_conf->m > 2) {
+	if (is_raidkm(sh->raid_conf) && raidkm_sh_isal(sh->raid_conf, sh)) {
 		/*
 		 * raid_km redesign: bypass async_gen_syndrome (raid6_call
 		 * P+Q only) for m > 2.  Two dispatch shapes:
@@ -6856,7 +7178,7 @@ static void ops_run_check_pq(struct stripe_head *sh, struct raid5_percpu *percpu
 	BUG_ON(sh->batch_head);
 	count = set_syndrome_sources(srcs, offs, sh, SYNDROME_SRC_ALL);
 
-	if (is_raidkm(conf) && conf->m > 2) {
+	if (is_raidkm(conf) && raidkm_sh_isal(conf, sh)) {
 		/*
 		 * raid_km redesign: m > 2 scrub.  set_syndrome_sources put the
 		 * data pages at srcs[0..k-1] and the on-disk parity at
@@ -6913,15 +7235,12 @@ static void ops_run_check_pq(struct stripe_head *sh, struct raid5_percpu *percpu
 						continue;	/* check-only: count, don't repair */
 				}
 
-				if (isal_have_avx512_gfni())
-					ec_encode_data_avx512_gfni(bytes, k, 1,
-						raidkm_g_gfni(sh) + toff, data, dst);
-				else if (isal_have_gfni())
-					ec_encode_data_avx2_gfni(bytes, k, 1,
-						raidkm_g_gfni(sh) + toff, data, dst);
-				else
-					ec_encode_data_base(bytes, k, 1,
-						raidkm_g_base(sh) + toff, data, dst);
+				/* rows of 0/1 (P, and Q at k == 1) take plain XOR */
+				raidkm_ec_row(raidkm_a_matrix(sh) + (size_t)(k + p) * k,
+					      k, data, dst[0], bytes,
+					      raidkm_g_gfni(sh) + toff,
+					      raidkm_g_base(sh) + toff, NULL,
+					      false, NULL, 0, NULL);
 
 				if (!uptodate) {
 					/* healing a corrupt/unreadable parity on a live
@@ -9969,6 +10288,22 @@ static void handle_parity_checks5(struct r5conf *conf, struct stripe_head *sh,
 	}
 }
 
+/*
+ * Is stripe slot i written by this rebuild?  The populate slot of a
+ * declustered population, or a slot whose member is live but not yet in sync
+ * (a recovering member).  The member holding slot i is slot-dependent under
+ * declustering.
+ */
+static bool raidkm_rebuild_target(struct r5conf *conf, struct stripe_head *sh,
+				  int i, int pop)
+{
+	struct md_rdev *rdev = conf->disks[raidkm_sh_pdisk(conf, sh, i)].rdev;
+
+	return i == pop ||
+	       (rdev && !test_bit(Faulty, &rdev->flags) &&
+		!test_bit(In_sync, &rdev->flags));
+}
+
 static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 				  struct stripe_head_state *s,
 				  int disks)
@@ -10051,7 +10386,9 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 			if (ndata < kk)
 				return;
 
-			data = kmalloc_array(kk, sizeof(*data), GFP_NOIO);
+			/* kk data pointers, then kk + 2 work pointers for
+			 * the m == 2 gen_syndrome path */
+			data = kmalloc_array(2 * kk + 2, sizeof(*data), GFP_NOIO);
 			if (!data) {
 				set_bit(STRIPE_HANDLE, &sh->state);
 				return;
@@ -10061,16 +10398,28 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 				data[i] = page_address(sh->dev[slot].page) +
 					  sh->dev[slot].offset;
 			}
+			/* m == 2 rebuilding both P and Q: one gen_syndrome */
+			if (raidkm_sh_m(sh) == 2) {
+				int ps = raidkm_parity_slot(sh, 0);
+				int qs = raidkm_parity_slot(sh, 1);
+
+				if (raidkm_rebuild_target(conf, sh, ps, pop) &&
+				    raidkm_rebuild_target(conf, sh, qs, pop) &&
+				    !test_bit(R5_UPTODATE, &sh->dev[ps].flags) &&
+				    !test_bit(R5_UPTODATE, &sh->dev[qs].flags) &&
+				    raidkm_encode_pq2(kk, data,
+					page_address(sh->dev[ps].page) +
+					sh->dev[ps].offset,
+					page_address(sh->dev[qs].page) +
+					sh->dev[qs].offset, bytes,
+					(void **)(data + kk))) {
+					set_bit(R5_UPTODATE, &sh->dev[ps].flags);
+					set_bit(R5_UPTODATE, &sh->dev[qs].flags);
+				}
+			}
 
 			for (i = 0; i < disks; i++) {
-				/* i is a stripe SLOT; the member holding it
-				 * is slot-dependent under declustering */
-				struct md_rdev *rdev = conf->disks[
-					raidkm_sh_pdisk(conf, sh, i)].rdev;
-
-				if (i != pop &&
-				    !(rdev && !test_bit(Faulty, &rdev->flags) &&
-				      !test_bit(In_sync, &rdev->flags)))
+				if (!raidkm_rebuild_target(conf, sh, i, pop))
 					continue;	/* not a rebuild target */
 
 				if (is_parity_disk(sh, i) && !test_bit(R5_UPTODATE,
@@ -10080,22 +10429,18 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 					 * from the data into the slot's page. */
 					int pj = (i - sh->pd_idx + disks) % disks;
 					size_t toff = (size_t)pj * kk * 32;
-					unsigned char *dst[1] = {
-						page_address(sh->dev[i].page) +
-						sh->dev[i].offset };
 
-					if (isal_have_avx512_gfni())
-						ec_encode_data_avx512_gfni(bytes, kk, 1,
-							raidkm_g_gfni(sh) + toff,
-							data, dst);
-					else if (isal_have_gfni())
-						ec_encode_data_avx2_gfni(bytes, kk, 1,
-							raidkm_g_gfni(sh) + toff,
-							data, dst);
-					else
-						ec_encode_data_base(bytes, kk, 1,
-							raidkm_g_base(sh) + toff,
-							data, dst);
+					/* P: plain XOR; Q at m == 2: gen_syndrome
+					 * (scratch allocated: not under the percpu
+					 * lock here) */
+					raidkm_ec_row(raidkm_a_matrix(sh) +
+						      (size_t)(kk + pj) * kk, kk, data,
+						      page_address(sh->dev[i].page) +
+						      sh->dev[i].offset, bytes,
+						      raidkm_g_gfni(sh) + toff,
+						      raidkm_g_base(sh) + toff, NULL,
+						      raidkm_sh_m(sh) == 2 && pj == 1,
+						      NULL, 0, (void **)(data + kk));
 					set_bit(R5_UPTODATE, &sh->dev[i].flags);
 				}
 				if (!test_bit(R5_UPTODATE, &sh->dev[i].flags))
@@ -10111,9 +10456,10 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 		}
 	}
 
-	if (is_raidkm(conf) && conf->m > 2) {
+	if (is_raidkm(conf) && raidkm_sh_isal(conf, sh)) {
 		/*
-		 * raid_km redesign: m > 2 scrub.  The verify/repair compute is
+		 * raid_km redesign: m > 2 scrub (and m == 2 at k == 1, see
+		 * raidkm_sh_isal).  The verify/repair compute is
 		 * a synchronous ISA-L re-encode in ops_run_check_pq, which sets
 		 * zero_sum_result to a per-parity mismatch bitmask (bit p ==
 		 * parity slot k+p) and, when repairing, fixes the mismatched
@@ -12058,11 +12404,12 @@ static void raidkm_row_read_free(struct raidkm_row_read *rr)
 static int raidkm_row_decode(struct raidkm_row_read *rr)
 {
 	int k = rr->k, total = rr->k + rr->m, i, j, err = 0;
-	unsigned char *a, *b, *inv, *row1, *tbls, *dst[1];
+	unsigned char *a, *b, *inv, *row1, *tbls;
 	unsigned char **src;
 
 	a = kmalloc(total * k + 2 * k * k + k + k * 32, GFP_NOIO);
-	src = kmalloc_array(k, sizeof(*src), GFP_NOIO);
+	/* k sources, then k + 2 work pointers for raidkm_ec_row()'s Q path */
+	src = kmalloc_array(2 * k + 2, sizeof(*src), GFP_NOIO);
 	if (!a || !src) {
 		err = -ENOMEM;
 		goto out;
@@ -12105,18 +12452,11 @@ static int raidkm_row_decode(struct raidkm_row_read *rr)
 tables:
 	for (i = 0; i < k; i++)
 		src[i] = rr->src[i].addr;
-	dst[0] = rr->out_addr;
-
-	if (isal_have_avx512_gfni()) {
-		ec_init_tables_gfni(k, 1, row1, tbls);
-		ec_encode_data_avx512_gfni(rr->len, k, 1, tbls, src, dst);
-	} else if (isal_have_gfni()) {
-		ec_init_tables_gfni(k, 1, row1, tbls);
-		ec_encode_data_avx2_gfni(rr->len, k, 1, tbls, src, dst);
-	} else {
-		ec_init_tables_base(k, 1, row1, tbls);
-		ec_encode_data_base(rr->len, k, 1, tbls, src, dst);
-	}
+	/* one data block from k - 1 data + P, or P from the data: plain XOR;
+	 * Q at m == 2 from the k data rows: raid6 gen_syndrome */
+	raidkm_ec_row(row1, k, src, rr->out_addr, rr->len, NULL, NULL, tbls,
+		      rr->m == 2 && rr->target == k + 1, NULL, 0,
+		      (void **)(src + k));
 out:
 	kfree(src);
 	kfree(a);
@@ -16995,21 +17335,12 @@ static int raidkm_reshape_reconstruct_band(struct r5conf *conf,
 		for (j = 0; j < k; j++)
 			row1[j] = inv[d * k + j];
 		for (po = 0; po < npages; po++) {
-			unsigned char *d1[1];
-
 			for (j = 0; j < k; j++)
 				src[j] = page_address(band[srcsl[j] * npages + po]);
-			d1[0] = page_address(band[s * npages + po]);
-			if (isal_have_avx512_gfni()) {
-				ec_init_tables_gfni(k, 1, row1, dt);
-				ec_encode_data_avx512_gfni(PAGE_SIZE, k, 1, dt, src, d1);
-			} else if (isal_have_gfni()) {
-				ec_init_tables_gfni(k, 1, row1, dt);
-				ec_encode_data_avx2_gfni(PAGE_SIZE, k, 1, dt, src, d1);
-			} else {
-				ec_init_tables_base(k, 1, row1, dt);
-				ec_encode_data_base(PAGE_SIZE, k, 1, dt, src, d1);
-			}
+			raidkm_ec_row(row1, k, src,
+				      page_address(band[s * npages + po]),
+				      PAGE_SIZE, NULL, NULL, dt, false, NULL, 0,
+				      NULL);
 		}
 	}
 
