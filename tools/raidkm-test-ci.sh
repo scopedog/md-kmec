@@ -22,6 +22,8 @@
 #           not suspend the array (tunables), the row state map (rowmap) and
 #           native snapshots (snap, snap-persist: ~4 min together), the
 #           XOR / gen_syndrome decode paths and which one ran (fast-decode),
+#           write-journal replay after a cut and its m>2 refusal (journal),
+#           PPL refused on raidkm + the --update=no-ppl way back (ppl-refused),
 #           plus the functional and degraded smoke.  Meant for every CI run.
 #   quick   smoke + the same rebuilds on the 4 KiB stripe path
 #           (replace@default_row_rebuild=0), declustered population, and the
@@ -95,7 +97,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SMOKE=(functional degraded row-dread-wide row-csum declustered-populate-window
        declustered-populate-window@default_dcl_row_rebuild=0 declustered-degraded replace
        scrub-badblocks degraded-trust-disk row-rebuild-load wide-row row-write
-       row-sync tunables rowmap snap snap-persist fast-decode)
+       row-sync tunables rowmap snap snap-persist fast-decode journal ppl-refused)
 # <suite>@<param>=<value>: run the suite with a raidkm module parameter set for
 # new arrays, restored afterwards.  replace@default_row_rebuild=0 covers the
 # 4 KiB stripe-cache rebuild that row rebuild falls back to.

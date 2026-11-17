@@ -1577,12 +1577,33 @@ int ppl_init_log(struct r5conf *conf)
 		return -EINVAL;
 
 	/*
-	 * raid_km redesign: PPL is valid for raid5 (single XOR parity) and for
-	 * raidkm (level 71, arbitrary m) where we log all m partial parities.
+	 * raid_km redesign: PPL is valid for raid5 (single XOR parity).  The
+	 * level 71 path (all m partial parities) exists but is refused below.
 	 */
 	if (mddev->level != 5 && mddev->level != RAID_KM_LEVEL) {
 		pr_warn("md/raid:%s PPL is not compatible with raid level %d\n",
 			mdname(mddev), mddev->level);
+		return -EINVAL;
+	}
+
+	/*
+	 * raidkm (level 71): PPL is not supported (2026-11-16).  The m-parity
+	 * extension (log all m partial parities, ppl_recover_entry_km) failed
+	 * power-cut testing: acknowledged writes lost with every member
+	 * present, garbage after recovery without a member, and a rebuild
+	 * after recovery left parity mismatches.  It also costs 43-72% of
+	 * write throughput and excludes the write-intent bitmap, which is the
+	 * supported policy (with the md write journal at m=2 for anyone who
+	 * needs the write hole closed).  Replay was also never right on a
+	 * declustered pool (whole-pool row, not the permuted group).  The
+	 * code is kept, unreachable, so it can come back if it is fixed.
+	 * An array that already has PPL assembles after
+	 * "mdadm --assemble --update=no-ppl".  A running array cannot switch
+	 * to PPL at all: raid5_change_consistency_policy allows it on raid5 only.
+	 */
+	if (mddev->level == RAID_KM_LEVEL) {
+		pr_warn("md/raid:%s: PPL is not supported on raidkm; use the write-intent bitmap (existing array: mdadm --assemble --update=no-ppl)\n",
+			mdname(mddev));
 		return -EINVAL;
 	}
 

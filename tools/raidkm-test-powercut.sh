@@ -44,6 +44,8 @@
 #      array can legitimately fail here (md inheritance; raid6 does too): such
 #      failures are reported as "write-hole" and only counted as failures when
 #      the array claims PPL (PC_CREATE_EXTRA=--consistency-policy=ppl).
+#      raidkm refuses PPL since 2026-11-16 (this harness found it losing
+#      data); PC_CREATE_EXTRA=--consistency-policy=ppl exits 2 until it is fixed.
 #
 # Scenarios (PC_SCENARIOS, space separated):
 #   healthy   workload on a clean array
@@ -150,6 +152,9 @@ if [ -n "${PC_DCL:-}" ]; then	# PC_DCL="N G SC": declustered pool
 	PC_K=$((PC_DCL_G - PC_M))
 fi
 PC_PPL=0; [[ "${PC_CREATE_EXTRA:-}" == *ppl* ]] && PC_PPL=1
+if [ "$PC_PPL" = 1 ]; then
+	echo "PC_CREATE_EXTRA: PPL is refused on raidkm (2026-11-16); use the bitmap"; exit 2
+fi
 PC_WRITEHOLE=0
 PC_REFUSED=0
 PC_FORCED=0

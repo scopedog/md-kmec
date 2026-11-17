@@ -17,6 +17,11 @@
 #      magic and the accepted seed.
 #   5. An illegal geometry (C1 violation) is refused by mdadm before any
 #      device is touched.
+#   6. A declustered pool with --consistency-policy=ppl is refused by the
+#      kernel (PPL is refused on every raidkm array since 2026-11-16, see
+#      raidkm-test-ppl-refused.sh), and the array never runs.
+#   7. Likewise --write-journal: journal replay maps a logged stripe by row
+#      sector and slot index only (no group, no permutation map).
 set -u
 
 . "$(dirname "${BASH_SOURCE[0]}")/raidkm-test-lib.sh"
@@ -38,7 +43,9 @@ trap cleanup EXIT
 
 mkdir -p "$RK_TMP"
 rk_load_modules || exit 1
-rk_setup_brd "$N" || exit 1
+# +1 ram disk for case 7's journal; a real-device rig (RK_DEVS) only needs N,
+# and case 7 skips itself when there is no spare device
+if [ -n "${RK_DEVS:-}" ]; then rk_setup_brd "$N"; else rk_setup_brd $((N + 1)); fi || exit 1
 DISKS=$(rk_pick_disks "$N") || { echo "ERROR: need $N ramdisks" >&2; exit 1; }
 read -r -a MEMBERS <<< "$DISKS"
 
@@ -155,4 +162,50 @@ else
 	rk_pass "illegal create left no superblock behind"
 fi
 
+# ---- 6. PPL on a declustered pool refused by the kernel ---------------------
+sudo "$MDADM" --zero-superblock "${MEMBERS[@]}" 2>/dev/null
+rk_dmesg_window_close
+rk_dmesg_clear
+sudo "$MDADM" --create "$MD" --level=raidkm --parity-count=$M \
+	--layout=declustered --group-width=$G --spare-columns=$SC \
+	--dcl-nbase=$NBASE --chunk="$CHUNK_KB" --raid-devices=$N \
+	--consistency-policy=ppl "${MEMBERS[@]}" --run --force >/dev/null 2>&1
+if grep -q "^$MDNAME : active" /proc/mdstat; then
+	rk_fail "declustered pool with PPL is ACTIVE (must be refused)"
+	sudo "$MDADM" --stop "$MD" 2>/dev/null
+elif sudo dmesg | grep -q "PPL is not supported on raidkm"; then
+	rk_pass "declustered pool with --consistency-policy=ppl refused by the kernel"
+else
+	rk_fail "declustered PPL create not active, but no refusal message"
+	sudo dmesg | tail -4 | sed 's/^/      · /'
+fi
+sudo "$MDADM" --stop "$MD" 2>/dev/null
+sudo "$MDADM" --zero-superblock "${MEMBERS[@]}" 2>/dev/null
+
+# ---- 7. write journal on a declustered pool refused by the kernel -----------
+JDEV=$(rk_pick_disks $((N + 1)) 2>/dev/null | awk '{print $NF}')
+if [ -z "$JDEV" ]; then
+	rk_skip_check "no spare device for a journal (need $((N + 1)))"
+else
+	rk_dmesg_window_close
+	rk_dmesg_clear
+	sudo "$MDADM" --create "$MD" --level=raidkm --parity-count=$M \
+		--layout=declustered --group-width=$G --spare-columns=$SC \
+		--dcl-nbase=$NBASE --chunk="$CHUNK_KB" --raid-devices=$N \
+		--write-journal="$JDEV" "${MEMBERS[@]}" --run --force >/dev/null 2>&1
+	if grep -q "^$MDNAME : active" /proc/mdstat; then
+		rk_fail "declustered pool with a write journal is ACTIVE (must be refused)"
+	elif sudo dmesg | grep -q "write journal is not compatible with a declustered layout"; then
+		rk_pass "declustered pool with --write-journal refused by the kernel"
+	else
+		rk_fail "declustered journal create not active, but no refusal message"
+		sudo dmesg | tail -4 | sed 's/^/      · /'
+	fi
+	sudo "$MDADM" --stop "$MD" 2>/dev/null
+	sudo "$MDADM" --zero-superblock "${MEMBERS[@]}" "$JDEV" 2>/dev/null
+fi
+
+rk_dmesg_window_close
+[ "$RK_DMESG_BAD" = 0 ] && rk_pass "no kernel WARN/BUG during the run (all windows)" \
+			|| rk_fail "kernel WARN/BUG in a window the suite cleared"
 rk_summary

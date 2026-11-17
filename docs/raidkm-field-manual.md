@@ -115,8 +115,9 @@ create-time or sysfs switch; **scoped** ships with a documented boundary.
 
 | Feature | What it does | |
 |---|---|---|
-| Write-intent bitmap | Inherited from raid5.c, works unchanged on level 71: an unclean shutdown resyncs only the dirty bits, and `--re-add` does a bitmap-scoped recovery (measured 17 s vs 171 s full rebuild). A fresh-spare `--add` still does the full rebuild, correctly. | available |
-| PPL<br>`--consistency-policy=ppl` | Closes the parity write hole, extended from raid5's single XOR to **all m partial parities**; recovery rebuilds each as `P_j = PP_j XOR encode_j(modified)`. Costs **−43% to −72%** on RAM-backed devices (a serialized FUA log write), so it is off by default and mutually exclusive with the bitmap. | opt-in |
+| Write-intent bitmap | Inherited from raid5.c, works unchanged on level 71: an unclean shutdown resyncs only the dirty bits, and `--re-add` does a bitmap-scoped recovery (measured 17 s vs 171 s full rebuild). A fresh-spare `--add` still does the full rebuild, correctly. The default consistency policy and the only one supported at every m and layout. It narrows the write hole to the resync of the dirty bits but does not close it: a crash followed by a lost member before that resync finishes can corrupt untouched blocks of the stripes that were being written. md refuses to start such a dirty degraded array unless forced. | available |
+| md write journal<br>`--write-journal=<dev>` | Closes the write hole by logging each write to a separate (fast) device first. m=2 on a rotating or parity-last array only; refused at m>2 and on a declustered pool (see Limits). Write-through (the default) and write-back (`md/journal_mode`) both replay after a power cut with the data intact and mismatch_cnt 0 (`raidkm-test-journal.sh`: rotating in both modes, parity-last in write-through). | scoped |
+| PPL<br>`--consistency-policy=ppl` | **Refused on raidkm** (2026-11-16) at create and assemble. The m-parity extension failed power-cut testing (acknowledged writes lost with every member present), cost 43–72% of write throughput and excluded the bitmap. An array created with PPL by an earlier module comes back with `mdadm --assemble --update=no-ppl`. | refused |
 
 ### Management surfaces
 
@@ -165,7 +166,7 @@ row 4 D0   D1   D2   D3   D4   P0   P1
 N=7, m=2, the create default. `pd_idx = N − 1 − (row mod N)`, parity occupies
 slots `pd_idx … pd_idx+m−1 (mod N)`, data follows. Parity and normal-read
 traffic spread over all members. One slot mapping serves both classic layouts —
-parity-last is simply the `pd_idx == k` case — so encode, decode, scrub and PPL
+parity-last is simply the `pd_idx == k` case — so encode, decode and scrub
 are layout-agnostic.
 
 ```
@@ -320,7 +321,6 @@ parity goes, `--parity-count=` chooses how much of it there is. Data disks =
 | `--spare-columns=s` | declustered: distributed-spare columns per row, 1…127 | smallest legal value |
 | `--dcl-nbase=n` | declustered, advanced: base permutations, 1…64 | chosen by search |
 | `--dcl-seed=x` | declustered, advanced: pin the acceptance-search seed | chosen by search |
-| `--consistency-policy=ppl` | enable PPL (closes the write hole; excludes the bitmap) | off |
 
 ```sh
 # 3 data + 2 parity (m=2 → the raid6-equivalent fast path), rotating
@@ -1125,7 +1125,8 @@ plan a maintenance window is cheaper than discovering them in it.
 | File-backed bitmap on declustered | Refused. The internal bitmap and online member resize are supported. | refused |
 | Multi-group pool shrink | One group's worth of disks per reshape; repeat for more. Online member-size shrink is also excluded. | scoped |
 | `--remove-parity` on declustered | Refused — classic layouts only. | refused |
-| PPL + bitmap | Mutually exclusive; PPL also costs 43–72% of write throughput on RAM-backed devices. | exclusive |
+| PPL (`--consistency-policy=ppl`) | Refused on every raidkm array (2026-11-16): the m-parity PPL lost acknowledged writes in power-cut testing. Use the bitmap (or the write journal at m=2); `mdadm --assemble --update=no-ppl` recovers an array created with PPL earlier. | refused |
+| md write journal (`--write-journal`) | m=2 on a rotating or parity-last array only. Refused at m>2: the journal knows two parity slots and logs the others as data at block 0, so a replay overwrote array block 0 with mismatch_cnt 0 (measured 2026-11-16, m=3). Refused on a declustered pool: the log carries no group and replays slots onto the wrong members. An array made with a journal by an earlier module no longer assembles with it: assemble without the journal device (it starts read-only), `echo resync > /sys/block/mdX/md/consistency_policy`, then `mdadm --readwrite` (checked by hand at m=3, 2026-11-16). | refused |
 | parity-last add-parity window | The brief stop+recreate is **not crash-safe**, and the array is not fully fault-tolerant until the follow-on resync completes. On non-identical disks the recreate must reuse the original `data_offset`. | window |
 | Stock mdadm | Rejects level 71, and `--examine` SIGABRTs on a raidkm member. Deploy the fork as `/usr/sbin/mdadm`. | hard |
 

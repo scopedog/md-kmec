@@ -3076,6 +3076,39 @@ int r5l_init_log(struct r5conf *conf, struct md_rdev *rdev)
 		return -EINVAL;
 
 	/*
+	 * Declustered pools: recovery replays a logged stripe by row sector
+	 * alone (r5c_recovery_alloc_stripe passes dcl_group 0; parity
+	 * payloads carry no group) and writes each slot's page to
+	 * conf->disks[slot] (r5l_recovery_replay_one_stripe), but a
+	 * declustered slot reaches its member only through the permutation
+	 * map (dcl_disk).  Replay would land data and parity on the wrong
+	 * members, so refuse, as ppl_init_log does.  Reshape is refused
+	 * while a log is attached, so layout/new_layout cover every way in.
+	 */
+	if (conf->mddev->level == RAID_KM_LEVEL &&
+	    (conf->dcl || raidkm_layout_is_dcl(conf->mddev->layout) ||
+	     raidkm_layout_is_dcl(conf->mddev->new_layout))) {
+		pr_warn("md/raid:%s: write journal is not compatible with a declustered layout\n",
+			mdname(conf->mddev));
+		return -EINVAL;
+	}
+
+	/*
+	 * m > 2: the log knows only pd_idx and qd_idx as parity.  The middle
+	 * parities (pd_idx+1 .. qd_idx-1) are logged as DATA payloads with
+	 * location raid5_compute_blocknr() == 0 (its "parity slot" answer),
+	 * so a replay writes a parity page over array block 0 and leaves the
+	 * real stripe's middle parities stale.  Measured 2026-11-16: m=3
+	 * write-through replay after a cut corrupts block 0 with
+	 * mismatch_cnt 0 (silent); m=2 replays clean.
+	 */
+	if (conf->mddev->level == RAID_KM_LEVEL && conf->m > 2) {
+		pr_warn("md/raid:%s: write journal supports at most 2 parities (array has %d)\n",
+			mdname(conf->mddev), conf->m);
+		return -EINVAL;
+	}
+
+	/*
 	 * The PAGE_SIZE must be big enough to hold 1 r5l_meta_block and
 	 * raid_disks r5l_payload_data_parity.
 	 *

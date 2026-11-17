@@ -6982,12 +6982,17 @@ void raidkm_compute_partial_parity(struct stripe_head *sh)
  * (P_j = PP_j ^ encode_j(modified) — GF add is XOR for every parity).
  *
  * Runs once during assembly, so the plain-C base path is fine (no GFNI).
+ * Unreachable since 2026-11-16: ppl_init_log refuses PPL on level 71
+ * (failed power-cut testing).  Kept for a future fix; k here is the
+ * pool's data width, which would also be wrong on a declustered pool.
  */
 void raidkm_ppl_encode_modified(struct r5conf *conf, void **src,
 				void **cod, size_t bytes)
 {
 	int m = conf->m;
 	int k = conf->raid_disks - conf->max_degraded;
+
+	WARN_ON_ONCE(conf->dcl);
 
 	/* raid6 wants at least 4 disks: k == 1 takes ISA-L, as
 	 * raidkm_compute_partial_parity() does, so both sides agree */

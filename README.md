@@ -104,7 +104,7 @@ These are load-bearing for the design and not up for negotiation:
 | Reliability soak: long fio randwrite+verify, disk-fail mid-I/O, scrub/repair | ✅ done (2026-05-25) — ~230 GiB crc32c-verified across healthy/2-fail/3-fail; a member failed mid-fio survives with correct data; scrub mismatch_cnt=0; surfaced + fixed an nsrc<k WARN on mid-I/O failure |
 | Reliability: hot-replace / rebuild onto a spare | ✅ done (2026-05-25) — fail a member, `mdadm --add` a spare, recovery reconstructs (data via decode, parity via re-encode) and writes the rebuilt member; validated for data-disk, parity-disk, and rebuild-while-still-degraded — spare holds correct bytes, scrub mismatch_cnt=0 |
 | Write-intent bitmap (unclean-shutdown resync only the dirty bits) | ✅ done (2026-05-25) — internal bitmap created/assembled on level 71; writes set dirty bits and `endwrite` clears them after settle; a write-while-degraded marks only the affected region dirty (3/128 chunks for an 8M write); `--re-add` does a bitmap-scoped recovery (17s vs 171s full rebuild, throttled) with correct data; a fresh-spare `--add` still does a full rebuild (not wrongly scoped). Inherited from raid5.c — no kernel changes needed |
-| PPL (partial parity log) — closes the raid5/6 write hole | ✅ done (2026-05-25) — **opt-in, off by default** (enable with `mdadm --create … --consistency-policy=ppl`). Extended raid5-only PPL to arbitrary m: logs **all m** partial parities (raid5 logs only the single XOR P). RMW copies the m parity pages (prexor already leaves them = partial parity); RCW encodes the not-overwritten data (raid6 at m=2, ISA-L at m>2); recovery rebuilds every parity as `P_j = PP_j XOR encode_j(modified)`. Validated: 2 power-loss crash tests (virsh destroy mid-fio) replay the log on reassembly, `mismatch_count=0`, post-recovery scrub clean. **Cost (opt-in): −43% to −72% on brd** — the inherent serialized FUA log write, exaggerated by RAM-speed backing; arrays without `--consistency-policy=ppl` are unaffected. Mutually exclusive with the write-intent bitmap |
+| PPL (partial parity log) — closes the raid5/6 write hole | ⛔ **withdrawn (2026-11-16): refused on raidkm** at create and assemble. Built 2026-05-25 as raid5 PPL extended to all m partial parities, but the power-cut harness (`tools/raidkm-test-powercut.sh` with `PC_CREATE_EXTRA=--consistency-policy=ppl`) found acknowledged writes lost with every member present and garbage after recovery without a member; it also cost 43–72% of write throughput on brd and excluded the write-intent bitmap. The bitmap is the supported policy; the md write journal (m=2, rotating or parity-last) closes the write hole for those who need it. An array created with PPL by an earlier module assembles with `mdadm --assemble --update=no-ppl` (`tools/raidkm-test-ppl-refused.sh`). The code stays in `raid_km-ppl.c`, unreachable on level 71. |
 | k+m via ISA-L (replace `raid6_call` for m ≥ 3) | ✅ done (2026-05-24) |
 | Full-stripe write works for m=3 | ✅ done (2026-05-24) |
 | Small RMW writes for m=3 | ✅ done (2026-05-24) — `ec_encode_data_update_*` RMW |
@@ -1178,14 +1178,16 @@ md-kmec/
 │   ├── raidkm-test-snap.sh            # native snapshots: content, freeze, copy-path cases
 │   ├── raidkm-test-snap-persist.sh    # native snapshots across stop, replay, degraded, rebuild
 │   ├── raidkm-test-fast-decode.sh     # XOR / gen_syndrome decode paths: data, parity, which path ran
+│   ├── raidkm-test-journal.sh         # md write journal: power-cut replay at m=2, m>2 refused
+│   ├── raidkm-test-ppl-refused.sh     # PPL refused at create/assemble; --update=no-ppl way back
 │   └── raidkm-create.sh               # sysfs array creation; needs adapting
 │                                    # to "raidkm" name / level 71
 └── km/
     ├── Kbuild           # builds raidkm.ko = raid_km.o + raid_km-cache.o + raid_km-ppl.o + ...
     ├── raid_km.c        # fork of mdraid/md/raid5.c with effective_level dispatch
     ├── raid_km.h        # fork of raid5.h (RAID_KM_LEVEL, is_raid6_math, effective_level)
-    ├── raid_km-cache.c  # fork of raid5-cache.c (journal, dormant unless attached)
-    ├── raid_km-ppl.c    # fork of raid5-ppl.c (partial parity log, ditto)
+    ├── raid_km-cache.c  # fork of raid5-cache.c (journal, dormant unless attached; m<=2, not declustered)
+    ├── raid_km-ppl.c    # fork of raid5-ppl.c (partial parity log; refused on level 71)
     ├── raid_km-log.h    # fork of raid5-log.h
     ├── raid_km-rowmap.c # row state map (raid_km_rowmap.h)
     ├── raid_km-snap.c   # native snapshots: copy-on-write, snapshot disks, commands (raid_km_snap.h)
@@ -1259,10 +1261,9 @@ v1.2 superblock.
 
 **Version pairing.** `raidkm.ko` and the patched mdadm are
 co-dependent — features land across both repos together (level-71
-create / assemble / grow, and the PPL consistency policy).  Build and
-run them as a **matched pair**: the mdadm fork that goes with this
-tree is branch **`raidkm-level71`**, currently at commit
-**`b46435d5`** ("raidkm: --snapshots=<reserve %> and mdadm --snapshot
+create / assemble / grow).  Build and run them as a **matched pair**:
+the mdadm fork that goes with this tree is branch **`raidkm-level71`**,
+currently at commit **`b46435d5`** ("raidkm: --snapshots=<reserve %> and mdadm --snapshot
 (native snapshots P2)").  When you advance one repo, rebuild the other from
 its matching commit.  The fork will be wired in as a git submodule once it has a
 published remote (`scopedog/mdadm`); until then it lives in
