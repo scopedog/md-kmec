@@ -33,15 +33,41 @@ K=4
 DMN=()		# dm names created by this suite
 RAWS=()		# their backing devices
 
-# remove our dm devices; one still held is retried with --force, and a
-# name that still will not go stays in DMN so the EXIT trap tries again
+# dm_openers <name>: who holds a dm device (open count, holders, processes),
+# for the line that says a name would not go
+dm_openers() {
+	local n="$1" dm p out
+	dm=$(basename "$(readlink -f "/dev/mapper/$n")")
+	out="open $(sudo dmsetup info -c --noheadings -o open "$n" 2>/dev/null)"
+	out+=", holders [$(ls "/sys/block/$dm/holders" 2>/dev/null | tr '\n' ' ')]"
+	for p in $(sudo find /proc/[0-9]*/fd -lname "/dev/$dm" 2>/dev/null | cut -d/ -f3 | sort -u); do
+		out+=", pid $p $(cat "/proc/$p/comm" 2>/dev/null)"
+	done
+	echo "$out"
+}
+
+# Remove our dm devices.  A udev probe (blkid) can still hold one after the
+# settle: md stops asynchronously here (mdadm 4.4, "async del_gendisk"), so
+# the member release and its probe may trail the settle.  Retry (--retry,
+# then settle and try again) rather than --force at once: --force swaps in
+# an error table under the probe (CI run 44114760751: Buffer I/O errors on
+# the journal's dm-6) and still leaves the name while it is open, so the
+# next case's dmsetup create of that name fails with EBUSY.  A name that
+# will not go is reported with its openers and stays in DMN.
 dm_remove_all_mine() {
-	local n left=()
+	local n tries left=()
+	sudo udevadm settle 2>/dev/null
 	for n in "${DMN[@]:-}"; do
 		[ -n "$n" ] || continue
-		sudo dmsetup remove "$n" 2>/dev/null ||
-			sudo dmsetup remove --force "$n" 2>/dev/null ||
-			left+=("$n")
+		for tries in 1 2 3; do
+			sudo dmsetup info "$n" >/dev/null 2>&1 || continue 2	# gone
+			sudo dmsetup remove --retry "$n" >/dev/null 2>&1 && continue 2
+			[ "$tries" = 3 ] && break
+			sudo udevadm settle 2>/dev/null
+			sleep 1
+		done
+		echo "      · dmsetup remove $n failed: $(dm_openers "$n")" >&2
+		left+=("$n")
 	done
 	DMN=("${left[@]}")
 }
@@ -70,7 +96,11 @@ cleanup() {
 	rk_stop
 	stop_holders
 	dm_remove_all_mine
-	local r
+	# last resort at exit only: a dm device left over holds its ram disk
+	local n r
+	for n in "${DMN[@]:-}"; do
+		[ -n "$n" ] && sudo dmsetup remove --force "$n" >/dev/null 2>&1
+	done
 	for r in "${RAWS[@]:-}"; do
 		[ -n "$r" ] && sudo "$MDADM" --zero-superblock "$r" 2>/dev/null
 	done
@@ -82,6 +112,19 @@ mkdir -p "$RK_TMP"
 rk_load_modules || exit 1
 command -v dmsetup >/dev/null 2>&1 || rk_skip "dmsetup not installed"
 sudo modprobe dm-flakey || rk_skip "dm-flakey not available"
+
+# dm_sweep_leftovers: remove every rkjr name still present (stopping an md
+# array udev assembled on one first); true when none is left.  Run once
+# here, before the rig is sized: a name an earlier RUN left holds its ram
+# disk open, which keeps a brd module reference and makes rk_setup_brd's
+# "rmmod brd" fail (too few ram devices, or the wrong rd_size).
+dm_sweep_leftovers() {
+	read -r -a DMN <<< "$(sudo dmsetup ls 2>/dev/null | awk '$1 ~ /^rkjr[0-9]+$/ {print $1}' | tr '\n' ' ')"
+	stop_holders
+	dm_remove_all_mine
+	[ "${#DMN[@]}" -eq 0 ]
+}
+dm_sweep_leftovers || { rk_fail "rkjr devices left by an earlier run will not go"; rk_summary; exit 1; }
 # T1 needs K+2+1 devices (members + journal); T2 needs K+M+1 and skips an m
 # the rig cannot hold.  Ram disks are made for all of it; a real-device rig
 # (RK_DEVS) only has to hold T1, so a smaller rig still runs the replay gate.
@@ -90,6 +133,10 @@ if [ -n "${RK_DEVS:-}" ]; then rk_setup_brd $((K + 2 + 1)); else rk_setup_brd $(
 # setup_dm <count>: wrap the first <count> devices in dm-linear rkjr0..
 setup_dm() {
 	local cnt="$1" i sz
+	# an rkjr name an earlier case left behind: stop an md array udev
+	# assembled on it, try again, and say who holds it, rather than fail
+	# the create below with EBUSY
+	dm_sweep_leftovers || return 1
 	read -r -a RAWS <<< "$(rk_pick_disks "$cnt" 2>/dev/null)"
 	[ "${#RAWS[@]}" -ge "$cnt" ] || return 1
 	for i in "${!RAWS[@]}"; do
