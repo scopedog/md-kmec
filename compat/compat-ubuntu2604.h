@@ -102,6 +102,28 @@
  */
 #define RAIDKM_MD_INTR_REPAIR_SETS_OFFSET	1
 
+/*
+ * 7.0 md core, as stock 7.0 raid5 uses it (linux-source-7.0.0 7.0.0-43):
+ *   - dm-raid marks a suspend with MD_DM_SUSPENDING; a dm bio across an
+ *     interrupted reshape goes back only then, otherwise it waits;
+ *   - mddev->logical_block_size (1.x superblock, md/logical_block_size)
+ *     seeds the queue's logical block size;
+ *   - fail_last_dev / serialize_policy are mddev->flags bits, which raid5
+ *     lists as unsupported.
+ * md_free_cloned_bio() is still there in 7.0, so the RHEL 10.3 completion
+ * handoff (RAIDKM_MD_RESHAPE_COMPLETION) stays off.
+ */
+#define RAIDKM_MD_DM_SUSPENDING		1
+#define RAIDKM_MD_LBS			1
+#define RAIDKM_MD_FLAG_BITS		1
+
+/*
+ * 7.0 md core has mddev->bitmap_id, and Ubuntu builds the lockless bitmap
+ * (CONFIG_MD_LLBITMAP=y), so md/bitmap_type can select llbitmap: raid_km.c
+ * refuses to run on it.
+ */
+#define RAIDKM_MD_BITMAP_ID		1
+
 /* 7.0 bitmap_ops->resize dropped its trailing `init` bool argument. */
 #define raidkm_bitmap_resize(mddev, blocks, chunksize, init)		\
 	(mddev)->bitmap_ops->resize((mddev), (blocks), (chunksize))

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# check-mddev-abi.sh — build-time ABI guard for the RHEL 10.2 raidkm port.
+# check-mddev-abi.sh — build-time ABI guard for the raidkm ports (RHEL 10.2/10.3, 9.x, Ubuntu 26.04, vanilla).
 #
 # raidkm.ko is an out-of-tree module that binds to the *builtin* md_mod, so the
 # layout of struct mddev / struct md_rdev it was compiled against (the fork's
@@ -81,7 +81,7 @@ rhel9)
 	exp_bitmap_start_sync=
 	;;
 rhel10)
-	exp_size=2080					# RHEL 10.2 builtin md
+	exp_size=2080					# RHEL 10.2 and 10.3 builtin md (10.3 kept it: kABI)
 	mddev_fields="gendisk=120 dm_gendisk=128 level=264 reshape_position=352 \
 	              sync_io_depth=488 normal_io_events=600 recovery_active=608 \
 	              cluster_ops=2040"

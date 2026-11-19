@@ -71,12 +71,24 @@
 #include "raid_km-log.h"
 #include "../isa-l/isa-l_ec.h"
 
+#ifdef RAIDKM_MD_FLAG_BITS
+/*
+ * md core with fail_last_dev / serialize_policy as mddev->flags bits
+ * (RHEL 10.3): stock raid5 clears them as well.
+ */
+#define UNSUPPORTED_MDDEV_FLAGS			\
+	((1L << MD_FAILFAST_SUPPORTED) |	\
+	 (1L << MD_FAILLAST_DEV) |		\
+	 (1L << MD_SERIALIZE_POLICY))
+#else
 #define UNSUPPORTED_MDDEV_FLAGS	(1L << MD_FAILFAST_SUPPORTED)
+#endif
 
 /*
- * RHEL 10.2 ABI guard.  raidkm.ko is an out-of-tree module but binds to the
+ * RHEL 10 ABI guard.  raidkm.ko is an out-of-tree module but binds to the
  * *builtin* md_mod, so the layout of struct mddev / struct md_rdev in our md.h
- * must stay byte-identical to the running 6.12.0-211 kernel's.  These
+ * must stay byte-identical to the running 6.12.0-211 (10.2) or 6.12.0-264
+ * (10.3, same layout: kABI) kernel's.  These
  * compile-time checks lock the fork's md.h to the offsets verified against
  * vmlinux BTF during the RHEL 10.2 port; an accidental md.h edit that drifts
  * the layout fails the build here instead of corrupting memory at runtime.
@@ -124,7 +136,8 @@ static void __maybe_unused raidkm_mddev_abi_checks(void)
 	BUILD_BUG_ON(offsetof(struct mddev, recovery_active)	!= 584);
 	BUILD_BUG_ON(offsetof(struct mddev, cluster_ops)	!= 2704);
 #elif defined(RAIDKM_TARGET_RHEL10)
-	/* RHEL 10.2 builtin md core (6.12.0-211.x.el10_2). */
+	/* RHEL 10.2 / 10.3 builtin md core (6.12.0-211.x.el10_2, 6.12.0-264.x.el10_3:
+	 * 10.3 keeps the layout, checked against the 264.16.1 vmlinux BTF). */
 	BUILD_BUG_ON(sizeof(struct mddev)			!= 2080);
 	BUILD_BUG_ON(offsetof(struct mddev, gendisk)		!= 120);
 	BUILD_BUG_ON(offsetof(struct mddev, dm_gendisk)		!= 128);
@@ -15721,7 +15734,8 @@ static void raidkm_row_write_go(struct mddev *mddev,
  * All or nothing.  The bio must be made of whole rows, and every one of them
  * must be claimed before any is written.  A bio split between the two paths
  * could be handed back to md for a retry by the stripe cache
- * (STRIPE_WAIT_RESHAPE frees the clone, md_free_cloned_bio) while row writes
+ * (STRIPE_WAIT_RESHAPE ends the clone: md_free_cloned_bio, or on RHEL 10.3
+ * the completion handoff in raid5_make_request) while row writes
  * still hold it.  With 128 KiB chunks at 8+2 a bio is at most one row, so
  * this costs nothing there; with smaller rows it keeps unaligned bios off the
  * row path.
@@ -16633,8 +16647,21 @@ out_release:
 	raid5_release_stripe(sh);
 out:
 	if (ret == STRIPE_SCHEDULE_AND_RETRY && reshape_interrupted(mddev)) {
+#ifdef RAIDKM_MD_DM_SUSPENDING
+		/*
+		 * dm-raid sets MD_DM_SUSPENDING in presuspend: only then is a
+		 * bio handed back (dm requeues it); otherwise it waits for the
+		 * reshape, as stock RHEL 10.3 raid5 does.
+		 */
+		if (!mddev_is_dm(mddev) ||
+		    test_bit(MD_DM_SUSPENDING, &mddev->flags)) {
+			bi->bi_status = BLK_STS_RESOURCE;
+			ret = STRIPE_WAIT_RESHAPE;
+		}
+#else
 		bi->bi_status = BLK_STS_RESOURCE;
 		ret = STRIPE_WAIT_RESHAPE;
+#endif
 		pr_err_ratelimited("dm-raid456: io across reshape position while reshape can't make progress");
 	}
 	return ret;
@@ -16712,7 +16739,8 @@ static sector_t raidkm_bitmap_row(struct r5conf *conf, sector_t logical,
  * for the array write [*offset, *offset + *sectors).  md core counts each
  * write bio once over this range when it arrives (md_clone_bio) and ends
  * the count when the bio completes (md_end_clone_io) -- or is handed back
- * for a retry (md_free_cloned_bio) -- with the range it stored, so the two
+ * for a retry (md_free_cloned_bio; on RHEL 10.3 md_end_clone_io again, with
+ * a completion in bi_private) -- with the range it stored, so the two
  * always match; the stripe path and the row path keep no count of their own,
  * as upstream raid5 since cd5fc6533818.  The 6.12 stable kernels do this
  * only for a personality that sets this hook; RHEL 10.2 does it for all.
@@ -16944,7 +16972,21 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 
 	mempool_free(ctx, conf->ctx_pool);
 	if (res == STRIPE_WAIT_RESHAPE) {
+#ifdef RAIDKM_MD_RESHAPE_COMPLETION
+		/*
+		 * md core without md_free_cloned_bio() (RHEL 10.3): ending
+		 * the clone with a completion in bi_private ends its bitmap
+		 * count and frees it, but leaves the original bio to md for
+		 * the retry, as stock RHEL 10.3 raid5 does.
+		 */
+		DECLARE_COMPLETION_ONSTACK(done);
+
+		WRITE_ONCE(bi->bi_private, &done);
+		bio_endio(bi);
+		wait_for_completion(&done);
+#else
 		md_free_cloned_bio(bi);
+#endif
 		return false;
 	}
 
@@ -24111,6 +24153,15 @@ static int raid5_set_limits(struct mddev *mddev)
 				     data_disks) * (mddev->chunk_sectors << 9));
 
 	md_init_stacking_limits(&lim);
+#ifdef RAIDKM_MD_LBS
+	/*
+	 * md core keeps the logical block size in the 1.x superblock and
+	 * md/logical_block_size (RHEL 10.3); 0 (an array from an older
+	 * kernel) stacks as before.  Stock RHEL 10.3 raid5 sets it the same
+	 * way.
+	 */
+	lim.logical_block_size = mddev->logical_block_size;
+#endif
 	/* the current chunk (conf's: the new one mid chunk-size reshape), as
 	 * the row boundary below uses */
 	lim.io_min = conf->chunk_sectors << 9;
@@ -24294,6 +24345,38 @@ static int raid5_run(struct mddev *mddev)
 			  mdname(mddev));
 		return -EINVAL;
 	}
+
+#ifdef RAIDKM_MD_BITMAP_ID
+	/*
+	 * md core picks the bitmap type (md/bitmap_type, which mdadm sets from
+	 * --bitmap=lockless) before it runs the personality.  raidkm keeps its
+	 * own bitmap holds and row / declustered resync and has not been
+	 * reviewed against the lockless bitmap (llbitmap), which lets stock
+	 * raid5 skip the resync of regions never written.  Refuse it rather
+	 * than leave parity unchecked, and any later bitmap type with it: only
+	 * the classic bitmap and none are allowed.  This gate is at start only.
+	 * On Ubuntu 26.04 (checked on 7.0.0-29) a running array cannot switch
+	 * afterwards: md core gives a bitmap-less array the "none" ops
+	 * (md/bitmap_type then returns -EBUSY), and adding a bitmap at runtime
+	 * creates the classic one.  RHEL 10.3's md core does neither (a
+	 * bitmap-less array keeps bitmap_ops NULL), but 10.3 does not build
+	 * llbitmap, so md/bitmap_type cannot select it (-ENOENT).
+	 * Not covered: on the Ubuntu 26.04 core, md_run() creates the bitmap
+	 * after this, and when the on-disk bitmap superblock is llbitmap its
+	 * version-mismatch fallback switches bitmap_id to it ("bitmap version
+	 * mismatch").  Only a raidkm without this check could have written
+	 * such a superblock, and md ignores pers->start()'s return, so there
+	 * is no later point to refuse.
+	 */
+	if (mddev->bitmap_id != ID_BITMAP &&
+	    mddev->bitmap_id != ID_BITMAP_NONE) {
+		pr_warn("md/raid:%s: raidkm supports only the classic bitmap or none, not %s (bitmap id %d)\n",
+			mdname(mddev),
+			mddev->bitmap_id == ID_LLBITMAP ? "the lockless bitmap (llbitmap)" : "this bitmap type",
+			mddev->bitmap_id);
+		return -EINVAL;
+	}
+#endif
 
 	if (mddev->reshape_position != MaxSector) {
 		/* Check that we can continue the reshape.
